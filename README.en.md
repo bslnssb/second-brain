@@ -11,7 +11,7 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 ---
 
-![Second Brain searching for a term: 7 matches, each showing the exact lines that matched with the keyword highlighted](assets/screenshot-en.png)
+<p align="center"><img src="assets/screenshot-en.png" alt="Second Brain searching for a term: 7 matches, each showing the exact lines that matched with the keyword highlighted"></p>
 
 <p align="center"><sub>Same index, switched to Chinese in the top-right corner — the UI language never changes what gets indexed</sub><br>
 <img src="assets/screenshot-zh.png" width="620" alt="Second Brain Chinese interface"></p>

@@ -11,7 +11,7 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 
 ---
 
-![第二大脑界面：搜索「文档」，命中 7 篇，每条显示命中的那几行并高亮关键词](assets/screenshot-zh.png)
+<p align="center"><img src="assets/screenshot-zh.png" alt="第二大脑界面：搜索「文档」，命中 7 篇，每条显示命中的那几行并高亮关键词"></p>
 
 <p align="center"><sub>同一份索引库，右上角切到 English 就是这样 —— 界面语言不影响索引内容</sub><br>
 <img src="assets/screenshot-en.png" width="620" alt="第二大脑英文界面"></p>
