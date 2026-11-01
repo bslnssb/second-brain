@@ -146,7 +146,7 @@ Example: `http://127.0.0.1:8765/?q=invoice&lang=en`
 
 ## Quality self-test
 
-`eval_report.txt` is a real report from an actual run:
+Output from an actual `python brain.py selftest` run (run it yourself and the full report lands in `eval_report.txt`):
 
 ```
 [PASS] A1 retrieval recall@3 = 5/5 —— recall@1=5/5, MRR=1.000
@@ -205,10 +205,11 @@ second-brain-app.spec   PyInstaller config, full edition (with OCR)
 second-brain-core.spec  PyInstaller config, core edition (no OCR)
 assets/             UI screenshots and app icon used by the READMEs
 README.en.md        this document (README.md is the Chinese version)
+QA_FINDINGS.md      the 7 defects the pre-release QA round turned up, with before/after numbers
 brain.db            (generated) SQLite index — docs = FTS5 table, meta = processed files
 scan_raw.csv        (generated) last scan candidate list
-eval_report.txt     last self-test report
-QA_REPORT.md        last QA suite report
+eval_report.txt     (generated) last self-test report
+QA_REPORT.md        (generated) last QA suite report
 ```
 
 ## License

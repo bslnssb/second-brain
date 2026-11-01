@@ -9,6 +9,10 @@ scan_raw.csv
 update_*.log
 *.log
 
+# 程序跑一遍就会重新生成的报告（里面含本机 Python 版本、库体积等实测数据）
+eval_report.txt
+QA_REPORT.md
+
 # 本机索引范围（含本地绝对路径），请用 scope.example.json 代替
 scope.json
 

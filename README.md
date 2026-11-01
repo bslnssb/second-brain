@@ -82,10 +82,10 @@ python brain.py selftest                               # 质量自检，报告�
 
 ### 桌面窗口版
 
-不想看到命令行窗口，运行 `python app_window.py`（Windows 上也可双击 `start.bat` 或 `启动第二大脑.bat`）：它用 pywebview 起一个**独立桌面窗口**
+不想看到命令行窗口，运行 `python app_window.py`（Windows 上也可双击 `start.bat`）：它用 pywebview 起一个**独立桌面窗口**
 （不是浏览器标签页），背后跑本机的 HTTP 服务。没装 pywebview 时自动退回浏览器打开。
 
-`update.bat`（或 `更新第二大脑.bat`）是日常维护入口，等价于 `python brain.py update`。
+`update.bat` 是日常维护入口，等价于 `python brain.py update`。
 
 ## 索引范围配置
 
@@ -142,7 +142,7 @@ python brain.py selftest                               # 质量自检，报告�
 
 ## 质量自检
 
-`eval_report.txt` 是一份真实跑出来的样例报告：
+下面是 `python brain.py selftest` 真实跑出来的输出（自己跑一次，完整报告会写到同目录的 `eval_report.txt`）：
 
 ```
 [PASS] A1 检索评测 recall@3 = 5/5 —— recall@1=5/5, MRR=1.000
@@ -198,10 +198,11 @@ second-brain-app.spec   完整版打包配置（含 OCR）
 second-brain-core.spec  精简版打包配置（不含 OCR）
 assets/             README 里的界面截图与应用图标
 README.en.md        本文档的英文版
+QA_FINDINGS.md      发布前那轮 QA 查出的 7 个缺陷与前后数据
 brain.db            （运行时生成）SQLite 索引库，docs=FTS5 表，meta=已处理清单
 scan_raw.csv        （运行时生成）最近一次扫描清单
-eval_report.txt     最近一次自检报告
-QA_REPORT.md        最近一次 QA 套件报告
+eval_report.txt     （运行时生成）最近一次自检报告
+QA_REPORT.md        （运行时生成）最近一次 QA 套件报告
 ```
 
 ## 许可证
