@@ -1,20 +1,47 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 第二大脑 打包配置（core 版，不带 OCR，体积小）
-# 用法：python -m PyInstaller --noconfirm second-brain-core.spec
-# 与 full 版的差别：不打包 rapidocr_onnxruntime / pymupdf，
-# 扫描版 PDF 提不出文字（会记「无文本」），普通 PDF 仍用 pypdf 正常解析。
+# 第二大脑 桌面版打包配置（core，不带 OCR，体积小，onedir）
+#
+# 用法：python -m PyInstaller --noconfirm --clean --distpath dist-core \
+#           --workpath build-core second-brain-core.spec
+#
+# 与完整版（second-brain-app.spec）的差别：
+#   - 不打包 rapidocr_onnxruntime / pymupdf / onnxruntime / cv2
+#   - 扫描版 PDF 提不出文字（记为「无文本」），普通文本型 PDF 走 pypdf 正常解析
+#   - 产物体积约为完整版的七分之一
+#
+# 为什么同样是 onedir 而不是 onefile：
+#   索引时每个 PDF 都开一个子进程解析（见 brain.extract_text_safe，防 GIL 死锁）。
+#   打包后子进程用 sys.executable 启动，若是单文件版，每篇 PDF 都要重新解压整个
+#   程序包（实测 2~8 秒），一千篇 PDF 要多花一小时以上。onedir 解包目录常驻，
+#   子进程启动约 0.3 秒。
+#
+# 产物：dist-core/SecondBrain-Core/SecondBrain-Core.exe + _internal/
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
 hiddenimports = []
 
-tmp_ret = collect_all('webview')                # 桌面窗口
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('pythonnet')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('clr_loader')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+for pkg in ('webview',               # 桌面窗口
+            'pythonnet',             # pywebview 的 Windows 后端
+            'clr_loader'):
+    d, b, h = collect_all(pkg)
+    datas += d
+    binaries += b
+    hiddenimports += h
+
+hiddenimports += ['pypdf', 'scan_docs', 'selftest']
+
+# 不打包 OCR 链路，同时挡掉 PyInstaller 顺着本机环境误收的重型包
+EXCLUDES = [
+    'rapidocr_onnxruntime', 'onnxruntime', 'pymupdf', 'fitz',
+    'cv2', 'pyclipper', 'shapely', 'numpy',
+    'torch', 'torchvision', 'torchaudio', 'torchtext',
+    'tensorflow', 'keras', 'jax', 'sklearn', 'scipy', 'pandas',
+    'matplotlib', 'IPython', 'notebook', 'jupyter', 'pytest',
+    'tkinter', 'PySide2', 'PyQt5', 'PyQt6', 'pyqtgraph',
+    'sphinx', 'docutils', 'setuptools._distutils',
+]
 
 a = Analysis(
     ['app_window.py'],
@@ -25,8 +52,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['rapidocr_onnxruntime', 'pymupdf', 'fitz', 'onnxruntime',
-              'cv2', 'pyclipper', 'shapely'],
+    excludes=EXCLUDES,
     noarchive=False,
     optimize=0,
 )
@@ -35,16 +61,13 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name='second-brain-core',
+    exclude_binaries=True,
+    name='SecondBrain-Core',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -52,4 +75,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['assets/icon.ico'],
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='SecondBrain-Core',
 )

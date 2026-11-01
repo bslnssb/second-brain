@@ -141,8 +141,13 @@ def run_all(verbose=True, write_report=True):
             # 加密件必须搜不到
             hits = _search_quiet('门禁配置', 30)
             bad = [p for p, _s in hits if 'e_encrypted' in p]
-            _rec('PASS' if not bad else 'FAIL',
-                 'A3 加密 PDF 不入库不可检索', f'{len(bad)} 条泄漏' if bad else '确认零泄漏')
+            if not mupdf:
+                # 加密样本本身要用 pymupdf 造，core 版没有它 → 没有可验证的对象。
+                # 判 PASS 会让人误以为「查过了」，所以这里如实跳过。
+                _rec('SKIP', 'A3 加密 PDF 不入库不可检索（缺 pymupdf，无加密样本）')
+            else:
+                _rec('PASS' if not bad else 'FAIL',
+                     'A3 加密 PDF 不入库不可检索', f'{len(bad)} 条泄漏' if bad else '确认零泄漏')
         except Exception as e:
             _rec('FAIL', 'A 检索评测', f'{type(e).__name__}: {e}')
 
@@ -260,10 +265,15 @@ def run_all(verbose=True, write_report=True):
         # ══ G. 失败归因 + prune 清理
         try:
             con = brain.init_db()
-            reason = con.execute("SELECT reason FROM meta WHERE path LIKE '%e_encrypted%'") \
-                        .fetchone()
-            _rec('PASS' if (reason and reason[0] == '加密') else 'FAIL',
-                 'G1 失败归因（加密件记为「加密」）', f'reason={reason[0] if reason else None}')
+            if not mupdf:
+                # 同上：加密样本由 pymupdf 生成，core 版里没有这个文件，
+                # 查不到记录不代表归因失败。
+                _rec('SKIP', 'G1 失败归因（缺 pymupdf，无加密样本）')
+            else:
+                reason = con.execute("SELECT reason FROM meta WHERE path LIKE '%e_encrypted%'") \
+                            .fetchone()
+                _rec('PASS' if (reason and reason[0] == '加密') else 'FAIL',
+                     'G1 失败归因（加密件记为「加密」）', f'reason={reason[0] if reason else None}')
             con.close()
             (corpus / 'c.docx').unlink()
             brain.prune()

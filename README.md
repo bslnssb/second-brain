@@ -26,10 +26,16 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 | Way | Who it's for | How to start |
 |---|---|---|
-| **Download the exe** (no install) | You'd rather not touch a terminal | Grab `second-brain.exe` (with OCR, ~350 MB) or `second-brain-core.exe` (no OCR, ~36 MB) from [Releases](../../releases), drop it anywhere, double-click |
+| **Download the exe** (no install) | You'd rather not touch a terminal | From [Releases](https://github.com/bslnssb/second-brain/releases/latest) take `SecondBrain-Windows.zip` (with OCR, 157 MB download / ~320 MB unpacked) or `SecondBrain-Core-Windows.zip` (no OCR, 25 MB / ~52 MB), unzip anywhere, double-click `SecondBrain.exe` |
 | **Run from source** | You want to read or change the code | Follow *Install* below |
 
 The exe and the source version read and write the **same** `brain.db`, so you can mix them — drop the exe next to an existing library and it picks it up automatically.
+
+Both editions are a **folder, not a single file**: `_internal/` next to the exe is part of the program.
+Move the whole folder; pulling the exe out on its own leaves it unable to start.
+
+The core edition gives up OCR and nothing else — image-only PDFs get no text (recorded as “no text” in the
+failure breakdown), while text-based PDFs, Office files, EPUB and the rest behave identically.
 
 ## Install
 
@@ -189,6 +195,9 @@ gen_icon.py         generates the app icon
 scope.example.json  scope configuration template
 start.bat           Windows: open the desktop window
 update.bat          Windows: rescan → index → prune in one click
+build_exe.bat       Windows: build both executables (needs PyInstaller)
+second-brain-app.spec   PyInstaller config, full edition (with OCR)
+second-brain-core.spec  PyInstaller config, core edition (no OCR)
 README.zh-CN.md     Chinese version of this document
 brain.db            (generated) SQLite index — docs = FTS5 table, meta = processed files
 scan_raw.csv        (generated) last scan candidate list

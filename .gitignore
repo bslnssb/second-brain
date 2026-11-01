@@ -22,11 +22,12 @@ __pycache__/
 .venv/
 venv/
 build/
+build-*/
 dist/
+dist-*/
 *.spec
-!second-brain.spec
-!second-brain-core.spec
 !second-brain-app.spec
+!second-brain-core.spec
 
 # 系统
 .DS_Store

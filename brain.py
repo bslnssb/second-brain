@@ -539,7 +539,17 @@ def _fail_reason(path: Path):
         try:
             import pymupdf
         except Exception:
-            return '无文本'
+            pymupdf = None
+        if pymupdf is None:
+            # core 版没打包 pymupdf。退回 pypdf：它同样能分辨「加密」和「损坏」，
+            # 只是不能像 pymupdf 那样先试空密码。少了这一步，加密件会被记成
+            # reason=None，既不算成功也不算失败，统计里凭空消失。
+            try:
+                from pypdf import PdfReader
+                r = PdfReader(str(path))
+            except Exception:
+                return '损坏'
+            return '加密' if r.is_encrypted else '无文本'
         try:
             d = pymupdf.open(str(path))
         except Exception:

@@ -26,10 +26,16 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 
 | 方式 | 适合谁 | 怎么开始 |
 |---|---|---|
-| **下载 exe**（免安装） | 不想碰命令行 | 去 [Releases](../../releases) 下 `second-brain.exe`（带 OCR，约 350MB）或 `second-brain-core.exe`（不带 OCR，约 36MB），放到任意文件夹双击即开窗口 |
+| **下载 exe**（免安装） | 不想碰命令行 | 去 [Releases](https://github.com/bslnssb/second-brain/releases/latest) 下 `SecondBrain-Windows.zip`（带 OCR，下载 157MB，解压后约 320MB）或 `SecondBrain-Core-Windows.zip`（不带 OCR，下载 25MB，解压后约 52MB），解压到任意文件夹，双击 `SecondBrain.exe` 即开窗口 |
 | **从源码跑** | 想改代码 / 想看清每一步 | 按下面「安装」走，装好依赖再启动 |
 
 exe 版和源码版读写**同一个** `brain.db`，两者可以混用；把 exe 丢进已有索引库的目录，它会自动认旁边的库。
+
+两个版本都是**整个文件夹**，不是单个文件：exe 旁边的 `_internal/` 是程序的一部分。
+要移动就整夹移动——只把 exe 单独拎出来会打不开。
+
+精简版只砍了 OCR，别的没动：扫描版 PDF 提不出文字（在失败归因里记为「无文本」），
+文本型 PDF、Office、EPUB 等等表现完全一样。
 
 ## 安装
 
@@ -182,6 +188,9 @@ gen_icon.py         生成应用图标
 scope.example.json  范围配置模板
 start.bat           Windows：打开桌面窗口
 update.bat          Windows：一键完成 重扫 → 索引 → 清理
+build_exe.bat       Windows：打包两个版本的可执行程序（需 PyInstaller）
+second-brain-app.spec   完整版打包配置（含 OCR）
+second-brain-core.spec  精简版打包配置（不含 OCR）
 README.md          本文档的英文版
 brain.db            （运行时生成）SQLite 索引库，docs=FTS5 表，meta=已处理清单
 scan_raw.csv        （运行时生成）最近一次扫描清单
