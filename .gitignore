@@ -1,0 +1,33 @@
+# 索引库与运行产物：内含你自己文档的正文与文件路径，绝对不要提交
+brain.db
+brain.db-shm
+brain.db-wal
+*.db
+*.db-shm
+*.db-wal
+scan_raw.csv
+update_*.log
+*.log
+
+# 本机索引范围（含本地绝对路径），请用 scope.example.json 代替
+scope.json
+
+# 备份、旧打包产物
+backups/
+release/legacy/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+!second-brain.spec
+!second-brain-core.spec
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini

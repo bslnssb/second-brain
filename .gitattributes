@@ -1,0 +1,5 @@
+# 统一换行符，避免 Windows 下 .bat 因 LF 结尾而出错
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ico binary

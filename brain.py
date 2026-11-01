@@ -1,0 +1,1097 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""brain.py — 本地第二大脑（轻量版）：全文索引 + 搜索，全部本地完成
+
+原则：内容不出本机；不想索引的目录写在 scope.json 的 exclude_dirs，小说类目录由 scan_docs.py 关键词双保险零接触。
+
+命令：
+  index   <scope.json>          按范围建索引（SQLite FTS5 trigram，断点续建）
+  update                        增量维护：全盘重扫 → 索引新文件 → 清死条目
+  search  <关键词> [条数]        命令行搜索（中文≥3字走FTS，短词自动降级LIKE）
+  serve   [端口]                 本机网页界面 http://127.0.0.1:8765（仅本机可访问）
+  selftest                      质量自检（合成数据，不碰真实库）
+  无参数                         等价于 serve（桌面窗口版走 app_window.py）
+
+支持格式：txt/md（utf-8/gbk）、pdf（pypdf，纯扫描件自动 OCR 兜底）、docx/pptx/xlsx/epub（zip+XML剥皮）、html
+不支持：.doc 旧二进制格式（跳过并记录）、企业加密文档（假 docx，魔数 sisf…，跳过并记录）
+"""
+import csv
+import json
+import os
+import re
+import scan_docs
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import zipfile
+from html.parser import HTMLParser
+from pathlib import Path
+
+APP_VERSION = 'v6.0'
+
+def app_dir():
+    """脚本所在目录；打包成 exe 后为 exe 所在目录（数据库/配置放在 exe 旁边）"""
+    return Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+
+DB = app_dir() / 'brain.db'
+MAX_BODY = 2 * 1024 * 1024  # 单文档正文上限 2MB
+OCR_PAGES = 15              # OCR 最多识别前 N 页（扫描件整本太慢，前 15 页足够建立搜索特征）
+OCR_DPI = 180               # 渲染清晰度，实测中文识别够用
+
+# 更新进度（网页/桌面窗口轮询展示用）
+# k + a 是给前端的语言无关消息（k 为文案键，a 为插值参数）；msg 保留中文原文作兜底，
+# 命令行直接打印时仍可读，网页按当前语言渲染。
+PROG = {'state': 'idle', 'phase': '', 'done': 0, 'total': 0, 'ok': 0, 'fail': 0,
+        'msg': '', 'err': '', 'k': '', 'a': {}}
+
+def _prog(**kw):
+    """更新进度。传 k='消息键', a={参数} 让前端按当前语言渲染；
+    只传 msg 时前端原样显示（用于异常信息这类无法预翻译的文本）。"""
+    if 'k' in kw:
+        kw.setdefault('a', {})
+    else:
+        kw['k'], kw['a'] = '', {}
+    PROG.update(kw)
+
+# 智能扫描：噪音预判（默认不勾，用户可手动勾上）。按候选目录整条路径匹配。
+NOISE_WORDS = ('steam', 'steamapps', 'epic games', '游戏', '驱动', 'driver', '备份',
+               'backup', '缓存', 'cache', 'vmware', 'virtualbox', '虚拟机', 'recycle',
+               'recovery', '恢复', '安装包', 'ghost', 'windows.old')
+
+# 智能扫描发现结果（供 /api/discover 轮询）
+DISCOVER = {'state': 'idle', 'groups': [], 'err': ''}
+
+def discover_scan(targets=None, home=None):
+    """发现模式：走一遍全盘（或指定根），只记文件名，按顶层候选目录归组统计文档数，
+    并做噪音预判。小说目录零接触（连候选清单里都不出现）。不读任何文件内容。"""
+    global DISCOVER
+    try:
+        if DISCOVER['state'] == 'busy':
+            return
+        DISCOVER = {'state': 'busy', 'groups': [], 'err': ''}
+        home = str(Path.home() if home is None else home)
+        roots = [str(t) for t in targets] if targets is not None else scan_docs.drive_targets()
+        _prog(state='busy', phase='discover', done=0, total=len(roots), ok=0, fail=0,
+              msg='智能扫描中（只记文件名，不读内容）', k='m_discovering', err='')
+        groups, docs_total, novel_dirs = {}, 0, 0
+        for i, root in enumerate(roots):
+            _prog(done=i, msg=f'智能扫描 {root}', k='m_discover_target', a={'p': root})
+            for cur, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d.lower() not in scan_docs.SKIP_DIRS
+                           and not d.startswith('.')]
+                if scan_docs.is_novel_dir(cur):
+                    dirs[:] = []
+                    novel_dirs += 1
+                    continue
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in scan_docs.DOCS:
+                        key, noise = _group_key(os.path.join(cur, f), home)
+                        g = groups.setdefault(key.lower(),
+                                              {'dir': key, 'docs': 0, 'noise': noise})
+                        g['docs'] += 1
+                        docs_total += 1
+        lst = sorted(groups.values(), key=lambda g: -g['docs'])
+        DISCOVER = {'state': 'ready', 'groups': lst, 'err': '', 'novel_dirs': novel_dirs,
+                    'docs_total': docs_total}
+        _prog(state='done', phase='', msg=f'智能扫描完成：{docs_total} 个文档',
+              k='m_discover_done', a={'n': docs_total})
+        print(f'智能扫描完成：{docs_total} 个文档，{len(lst)} 个候选目录（小说目录跳过 {novel_dirs} 个）')
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        DISCOVER = {'state': 'error', 'groups': [], 'err': f'{type(e).__name__}: {e}'}
+
+def _noise_dir(path: str):
+    low = path.lower()
+    return any(w in low for w in NOISE_WORDS)
+
+def _group_key(path: str, home: str):
+    """把文档路径归到顶层候选目录：主目录下取二级目录（桌面/文档/下载等），
+    其他盘取根下一级目录。返回 (候选目录, 是否噪音)"""
+    if path.lower().startswith(home.lower()):
+        rest = path[len(home):].lstrip('\\/')
+        seg = rest.split('\\')[0] if rest else ''
+        d = os.path.join(home, seg) if seg else home
+    else:
+        drive = path[:3]                       # 'D:\\'
+        rest = path[3:]
+        seg = rest.split('\\')[0] if rest else ''
+        d = drive + seg if seg else drive.rstrip('\\/')
+    return d, _noise_dir(d)
+
+# 质量自检（GUI/CLI 共用）；在独立子进程里跑，绝不碰正在服务的真实索引库
+SELFTEST = {'state': 'idle', 'msg': '', 'ok': None, 'k': ''}
+
+def run_selftest_async():
+    def work():
+        SELFTEST.update(state='busy', msg='质量自检进行中（检索评测/OCR 准确率/损坏文件 fuzz…）',
+                        k='m_selftest_busy', ok=None)
+        try:
+            flags = 0x08000000 if os.name == 'nt' else 0  # CREATE_NO_WINDOW
+            env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
+            # 打包成 exe 时 selftest 是子命令；源码运行必须显式带上 brain.py
+            test_cmd = ([sys.executable, 'selftest'] if getattr(sys, 'frozen', False)
+                        else [sys.executable, 'brain.py', 'selftest'])
+            r = subprocess.run(test_cmd, capture_output=True, timeout=1200,
+                               creationflags=flags, cwd=str(app_dir()),
+                               encoding='utf-8', errors='replace', env=env)
+            out = (r.stdout or '') + '\n' + (r.stderr or '')
+            # 摘要优先从报告文件读（UTF-8 落盘，免疫子进程管道编码问题）
+            msg, ok = '', None
+            try:
+                txt = (app_dir() / 'eval_report.txt').read_text(encoding='utf-8')
+                ok = 'OVERALL: PASS' in txt
+                summ = next((ln.strip() for ln in txt.splitlines() if '项通过' in ln), '')
+                over = next((ln.strip() for ln in txt.splitlines() if 'OVERALL' in ln), '')
+                msg = (summ or over)
+            except Exception:
+                pass
+            if not msg:
+                lines = out.splitlines()
+                msg = next((ln.strip() for ln in lines if 'OVERALL' in ln), out[-300:])
+                if ok is None:
+                    ok = 'OVERALL: PASS' in out
+            SELFTEST.update(state='done' if ok else 'error', msg=msg[:300], k='', ok=ok)
+        except Exception as e:
+            SELFTEST.update(state='error', msg=f'{type(e).__name__}: {e}', k='', ok=False)
+    threading.Thread(target=work, daemon=True).start()
+
+_ocr = None
+
+def _get_ocr():
+    """惰性加载 OCR 引擎（首次调用约 1~2 秒）"""
+    global _ocr
+    if _ocr is None:
+        try:
+            # 个别 PDF 有超长页（上亿像素），PIL 默认上限会导致该页 OCR 失败；
+            # 图片全部由本机 PDF 渲染产生，非不可信来源，放心解除限制
+            from PIL import Image
+            Image.MAX_IMAGE_PIXELS = None
+        except Exception:
+            pass
+        from rapidocr_onnxruntime import RapidOCR
+        _ocr = RapidOCR()
+    return _ocr
+
+def ocr_pdf(path: Path):
+    """纯扫描版 PDF：渲染前 OCR_PAGES 页逐页 OCR；失败返回 None"""
+    try:
+        import pymupdf
+        doc = pymupdf.open(str(path))
+        try:
+            if doc.needs_pass and not doc.authenticate(''):
+                return None
+            ocr = _get_ocr()
+            parts = []
+            for i, page in enumerate(doc):
+                if i >= OCR_PAGES:
+                    break
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(OCR_DPI / 72, OCR_DPI / 72))
+                res, _ = ocr(pix.tobytes('png'))
+                if res:
+                    parts.append('\n'.join(line[1] for line in res))
+            return '\n'.join(parts).strip() or None
+        finally:
+            doc.close()
+    except Exception:
+        return None
+
+class _HTML(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+    def handle_data(self, d):
+        if d.strip():
+            self.parts.append(d.strip())
+
+def extract_text(path: Path):
+    ext = path.suffix.lower()
+    if ext in ('.txt', '.md'):
+        raw = path.read_bytes()[:MAX_BODY * 3]
+        for enc in ('utf-8', 'gbk', 'utf-16'):
+            try:
+                return raw.decode(enc)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        try:
+            return raw.decode('gb18030', errors='replace')  # 古怪编码兜底，宁可出乱码也不漏文件
+        except Exception:
+            return None
+    if ext == '.pdf':
+        try:
+            from pypdf import PdfReader
+            r = PdfReader(str(path))
+            text = '\n'.join((p.extract_text() or '') for p in r.pages[:60])[:MAX_BODY]
+        except Exception:
+            text = None
+        if not (text and len(text.strip()) >= 100):
+            # 提不出字或几乎没字 → 纯扫描件，OCR 兜底；OCR 成功则与已有文字合并
+            ocr_t = ocr_pdf(path)
+            if ocr_t:
+                return ((text or '') + '\n' + ocr_t).strip()[:MAX_BODY]
+        return text
+    if ext in ('.docx', '.pptx', '.xlsx', '.epub'):
+        try:
+            texts = []
+            with zipfile.ZipFile(path) as z:
+                for n in z.namelist():
+                    if not n.endswith('.xml'):
+                        continue
+                    if ext != '.epub' and n not in (
+                            'word/document.xml', 'ppt/slides/slide1.xml', 'xl/sharedStrings.xml') \
+                            and not n.startswith('ppt/slides/slide'):
+                        continue
+                    if ext == '.epub' and '.html' not in n:
+                        continue
+                    xml = z.read(n).decode('utf-8', errors='replace')[:MAX_BODY]
+                    texts.append(re.sub(r'<[^>]+>', ' ', xml))
+            return ' '.join(texts)[:MAX_BODY] or None
+        except Exception:
+            return None
+    if ext in ('.html', '.htm'):
+        try:
+            hp = _HTML()
+            hp.feed(path.read_text(encoding='utf-8', errors='replace')[:MAX_BODY])
+            return ' '.join(hp.parts)[:MAX_BODY] or None
+        except Exception:
+            return None
+    return None
+
+def init_db():
+    con = sqlite3.connect(DB)
+    con.execute('PRAGMA journal_mode=WAL')   # 读写并发：建索引时搜索不再被锁死
+    con.execute("CREATE TABLE IF NOT EXISTS meta(path TEXT PRIMARY KEY, indexed_at REAL)")
+    for col, decl in (('size', 'REAL'), ('mtime', 'REAL'), ('reason', 'TEXT')):
+        try:
+            con.execute(f'ALTER TABLE meta ADD COLUMN {col} {decl}')
+        except Exception:
+            pass  # 列已存在
+    con.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
+                   path UNINDEXED, ext UNINDEXED, body, tokenize='trigram')""")
+    return con
+
+def _fail_reason(path: Path):
+    """给无文本文件归因：空文件 / 加密 / 损坏 / 无文本"""
+    try:
+        if path.stat().st_size == 0:
+            return '空文件'
+    except OSError:
+        return '文件消失'
+    if path.suffix.lower() == '.pdf':
+        try:
+            import pymupdf
+        except Exception:
+            return '无文本'
+        try:
+            d = pymupdf.open(str(path))
+        except Exception:
+            return '损坏'
+        try:
+            if d.needs_pass and not d.authenticate(''):
+                return '加密'
+            return '无文本'
+        finally:
+            d.close()
+    return '无文本'
+
+def index(scope_path):
+    try:
+        scope = json.loads(Path(scope_path).read_text(encoding='utf-8'))
+    except Exception as e:
+        print(f'[!] scope 配置文件读不了：{e}\n'
+              f'    请检查格式（对照 scope.example.json；注意路径要写成双反斜杠）')
+        sys.exit(1)
+    if 'scan_csv' not in scope or 'include_dirs' not in scope:
+        print('[!] scope.json 缺少 scan_csv 或 include_dirs 字段（对照 scope.example.json）')
+        sys.exit(1)
+    csvp = Path(scope['scan_csv'])
+    if not csvp.is_absolute():
+        csvp = app_dir() / csvp  # exe 场景：相对路径一律相对 exe 所在目录
+    if not csvp.exists():
+        print(f'[!] 找不到扫描清单 {csvp} —— 先运行全盘扫描（update 命令会自动做）')
+        sys.exit(1)
+    include = tuple(s.lower() for s in scope['include_dirs'])
+    exclude = tuple(s.lower() for s in scope.get('exclude_dirs', []))
+    rows = list(csv.reader(open(csvp, encoding='utf-8-sig')))[1:]
+    con = init_db()
+    meta_info = {r[0]: (r[1], r[2], r[3]) for r in
+                 con.execute('SELECT path, indexed_at, size, mtime FROM meta')}
+
+    def _needs(p, pl, dry=False):
+        """ True=需要(重新)索引：范围外 False；新文件 True；
+        已索引但大小+修改时间都没变 False；旧库条目补登记后 False；索引后改过的 True
+        dry=True 时只判断不写库（用于预算 todo，避免预计算把待办偷偷改掉、进度永远到不了 100%）"""
+        if not any(pl.startswith(d) for d in include) or any(x in pl for x in exclude):
+            return False
+        if p not in meta_info:
+            return True
+        try:
+            st = os.stat(p)
+        except OSError:
+            return False
+        at, sz, mt = meta_info[p]
+        if sz is not None and mt is not None:
+            return not (abs(st.st_size - sz) < 1 and abs(st.st_mtime - mt) < 2)
+        if st.st_mtime <= (at or 0) + 60:      # 旧库条目：补记 size/mtime，不重建
+            if not dry:
+                con.execute('UPDATE meta SET size=?, mtime=? WHERE path=?',
+                            (st.st_size, st.st_mtime, p))
+                meta_info[p] = (at, st.st_size, st.st_mtime)
+            return False
+        return True                             # 索引之后文件改过 → 重建该条
+
+    todo = sum(1 for p, _sz in rows if _needs(p, p.lower(), dry=True))
+    # 预算阶段不写库，正式跑第一遍时这些旧条目会被补登记（返回 False、不算失败），
+    # 所以进度用「已处理条数」而不是「成功+失败」来推进。
+    n_new = n_skip = n_fail = n_done = 0
+    _prog(state='busy', phase='index', done=0, total=todo, ok=0, fail=0, err='',
+          msg='建立索引中', k='m_indexing', a={'n': todo})
+    t0 = time.time()
+    for p, _sz in rows:
+        if not _needs(p, p.lower()):
+            n_skip += 1
+            continue
+        if Path(p).name.startswith('~$'):  # Office 打开文档时的临时锁文件，不是真文档
+            con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, reason) VALUES(?,?,?)',
+                        (p, time.time(), '临时文件'))
+            n_skip += 1
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            n_skip += 1
+            continue
+        text = extract_text(Path(p))
+        if text:
+            # 清洗孤立代理字符（个别破损 PDF 会抽出 \ud800-\udfff，SQLite/FTS 拒收）
+            text = text.encode('utf-8', 'ignore').decode('utf-8')
+        if not text or not text.strip():
+            n_fail += 1
+            n_done += 1
+            _prog(done=n_done, ok=n_new, fail=n_fail)
+            con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
+                        'VALUES(?,?,?,?,?)',
+                        (p, time.time(), st.st_size, st.st_mtime, _fail_reason(Path(p))))
+            continue
+        con.execute('DELETE FROM docs WHERE path=?', (p,))  # 变更重建时先清旧行
+        con.execute('INSERT INTO docs VALUES(?,?,?)', (p, Path(p).suffix.lower(), text))
+        con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
+                    'VALUES(?,?,?,?,?)',
+                    (p, time.time(), st.st_size, st.st_mtime, None))
+        n_new += 1
+        n_done += 1
+        _prog(done=n_done, ok=n_new, fail=n_fail)
+        if n_done % 50 == 0 or n_done == todo:
+            el = time.time() - t0
+            rate = n_done / el if el > 0 else 0
+            eta = (todo - n_done) / rate if rate > 0 else 0
+            print(f'  ...{n_done}/{todo} 已索引, {el:.0f}s, {rate:.0f}篇/s, 预计还需 {eta:.0f}s', flush=True)
+        if n_new % 200 == 0:
+            con.commit()
+    con.commit()
+    try:
+        con.execute("INSERT INTO docs(docs) VALUES('optimize')")  # 收紧 FTS 索引，查询更快
+        con.commit()
+    except Exception:
+        pass
+    total = con.execute('SELECT count(*) FROM docs').fetchone()[0]
+    _prog(state='done', phase='', done=n_done, total=todo, ok=n_new, fail=n_fail,
+          msg=f'完成，库内共 {total} 篇', k='m_index_done', a={'n': f'{total:,}'})
+    print(f'完成：新索引 {n_new}，空/失败 {n_fail}，范围外/重复跳过 {n_skip}；库内共 {total} 篇')
+
+SNIP_OPEN, SNIP_CLOSE = '\x01', '\x02'   # snippet 高亮标记用不可见控制字符
+
+def _fts_tokens(q):
+    return [t for t in re.split(r'\s+', str(q).strip()) if t]
+
+def _fts_query(q):
+    """把用户输入转成安全的 FTS5 查询：每个词整体加双引号，词间 AND。
+    否则 C++ / node.js / a-b / 带引号括号的输入会被当成 FTS 语法直接报错。"""
+    toks = _fts_tokens(q)
+    if not toks:
+        return ''
+    return ' AND '.join('"' + t.replace('"', '""') + '"' for t in toks)
+
+def _need_like(q):
+    """trigram 索引至少要 3 个字符才命中：任一词短于 3 就走 LIKE 降级"""
+    toks = _fts_tokens(q)
+    return (not toks) or any(len(t) < 3 for t in toks)
+
+def _ext_clause(ext):
+    """按扩展名精确过滤（表里 ext 存的就是带点小写形式）。
+    原来用 path LIKE '%.pdf%' 会把 report.pdf.bak、以及路径里含 .pdf 的文件夹也算进来。"""
+    e = str(ext or '').strip().lower().lstrip('.')
+    return (' AND ext = ?', [f'.{e}']) if e else ('', [])
+
+def _search_sql(q, ext=None, pf=None):
+    """返回 (sql, args)，网页与命令行共用同一套检索逻辑"""
+    extra, args = '', []
+    clause, eargs = _ext_clause(ext)
+    extra += clause
+    args += eargs
+    if pf:
+        extra += ' AND path LIKE ?'
+        args.append(f'%{pf}%')
+    toks = _fts_tokens(q)
+    if not _need_like(q):
+        sql = ("SELECT path, snippet(docs,2,char(1),char(2),'…',10) FROM docs "
+               "WHERE docs MATCH ?" + extra + " ORDER BY rank LIMIT ?")
+        return sql, [_fts_query(q), *args]
+    # 短词（含 1~2 字中文、AI、C 这类）：trigram 命中不了，降级 LIKE。
+    # 预览定位到第一个词的命中位置，而不是正文开头。
+    like = ' AND '.join(['body LIKE ?'] * len(toks)) or '1=1'
+    sql = ("SELECT path, substr(body, max(1, instr(body, ?) - 30), 90) FROM docs "
+           "WHERE " + like + extra + " LIMIT ?")
+    return sql, [toks[0] if toks else '', *[f'%{t}%' for t in toks], *args]
+
+def search(q, limit=20, ext=None, path_filter=None):
+    con = init_db()
+    con_row = con.execute('SELECT count(*) FROM docs').fetchone()[0]
+    if con_row == 0:
+        print('索引为空，先运行 index 建库')
+        return
+    sql, args = _search_sql(q, ext, path_filter)
+    hits = con.execute(sql, (*args, limit)).fetchall()
+    for p, snip in hits:
+        print(f'{p}\n    {snip}'.replace('\n', ' '))
+    print(f'-- {len(hits)} 条')
+    return hits
+
+def _drive_root(p):
+    """取路径所在盘的根（'D:\\' / '\\\\server\\share\\'；相对路径返回 ''）"""
+    d = os.path.splitdrive(p)[0]
+    return d + os.sep if d else ''
+
+def prune():
+    """清理已删除文件的索引条目。
+
+    关键保护：整块盘不可达时（移动硬盘没插、网盘/网络盘没挂载），那盘下所有文件
+    都会 exists()=False。按原逻辑会把这盘的全部索引一次性当"已删除"清光。
+    所以先判断盘根可达性，不可达的盘整体跳过，只清理真正消失的文件。"""
+    con = init_db()
+    paths = [p for (p,) in con.execute('SELECT path FROM meta')]
+    alive = {}
+    def _reachable(p):
+        root = _drive_root(p)
+        if not root:
+            return True
+        if root not in alive:
+            alive[root] = os.path.exists(root)
+        return alive[root]
+    gone, skipped = [], 0
+    for p in paths:
+        if not _reachable(p):
+            skipped += 1
+            continue
+        if not os.path.exists(p):
+            gone.append(p)
+    for p in gone:
+        con.execute('DELETE FROM meta WHERE path=?', (p,))
+        con.execute('DELETE FROM docs WHERE path=?', (p,))
+    con.commit()
+    if skipped:
+        print(f'清理失效条目: {len(gone)} 条（另有 {skipped} 条所在磁盘当前不可达，已跳过）')
+    else:
+        print(f'清理失效条目: {len(gone)} 条')
+    return len(gone)
+
+def update(targets=None, scope_path=None):
+    """增量维护一条龙：重扫清单 → 索引新文件 → 清理已删除条目。
+    targets=None 时全盘扫描（命令行老行为）；桌面版传入用户选的文件夹列表。"""
+    import traceback
+    try:
+        if PROG['state'] == 'busy':
+            print('已有更新在进行，忽略本次请求')
+            return
+        _prog(state='busy', phase='scan', err='')
+        scan_docs.run_scan(targets)
+        scope = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+        if not scope.exists():
+            _prog(state='error', err='找不到 scope.json —— 请先在设置里选择要索引的文件夹',
+                  k='e_no_scope')
+            print('[!] 找不到 scope.json')
+            return
+        index(str(scope))
+        _prog(phase='prune', msg='清理失效条目', k='m_pruning')
+        prune()
+        _prog(state='done', phase='', msg='更新完成', k='m_update_done')
+    except Exception as e:
+        _prog(state='error', err=f'{type(e).__name__}: {e}')
+        traceback.print_exc()
+
+def make_server(port=8765):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    PAGE_TPL = r'''<!doctype html><html lang="zh-CN"><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%236b53e8'/%3E%3Ctext y='.92em' x='8' font-size='82'%3E%F0%9F%A7%A0%3C/text%3E%3C/svg%3E">
+<title>第二大脑 · 本地文档搜索</title>
+<style>
+:root{--bg:#f6f7fb;--card:#fff;--ink:#1a2233;--sub:#6b7280;--acc:#4f6ef7;--mark:#fde68a}
+*{box-sizing:border-box;margin:0}
+body{font-family:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);min-height:100vh}
+.hero{max-width:1360px;margin:0 auto;padding:48px 20px 12px;text-align:center;position:relative}
+.hero h1{font-size:30px;font-weight:700;letter-spacing:.5px}
+.hero h1 em{font-style:normal;background:linear-gradient(120deg,#4f6ef7,#9333ea);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{color:var(--sub);margin-top:8px;font-size:14px}
+.tools{position:absolute;top:14px;right:18px;display:flex;gap:8px;align-items:center}
+.gear,.lang{border:1px solid #e3e6ef;background:#fff;border-radius:10px;padding:8px 14px;font-size:13px;color:var(--sub);cursor:pointer;transition:.15s;font-family:inherit}
+.gear:hover,.lang:hover{color:var(--acc);border-color:var(--acc)}
+.lang{font-weight:700;min-width:52px}
+.bar{max-width:1360px;margin:22px auto 0;padding:0 20px;display:flex;gap:10px;flex-wrap:wrap}
+.bar input{border:1px solid #e3e6ef;background:var(--card);border-radius:12px;padding:13px 16px;font-size:15px;outline:none;transition:.15s;font-family:inherit}
+.bar input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(79,110,247,.15)}
+#q{flex:3;min-width:220px}#t{flex:1;min-width:110px}#d{flex:1.4;min-width:140px}
+.bar button{border:none;border-radius:12px;padding:13px 26px;font-size:15px;font-weight:600;color:#fff;background:linear-gradient(120deg,#4f6ef7,#7c3aed);cursor:pointer;transition:.15s;font-family:inherit}
+.bar button:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(79,110,247,.35)}
+.wrap{max-width:1360px;margin:18px auto 60px;padding:0 20px}
+.meta{color:var(--sub);font-size:13px;margin:4px 2px 10px}
+.card{background:var(--card);border:1px solid #eceef4;border-radius:14px;padding:16px 18px;margin-bottom:12px;transition:.15s}
+.card:hover{box-shadow:0 8px 22px rgba(26,34,51,.08);border-color:#dfe3ee}
+.top{display:flex;align-items:center;gap:10px}
+.badge{font-size:11px;font-weight:700;letter-spacing:.5px;padding:3px 8px;border-radius:6px;background:#eef1fd;color:#4f6ef7}
+.name{font-weight:600;font-size:15px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn{border:1px solid #e3e6ef;background:#fff;color:var(--sub);border-radius:8px;padding:5px 12px;font-size:12px;cursor:pointer;transition:.15s;white-space:nowrap;font-family:inherit}
+.btn:hover{color:var(--acc);border-color:var(--acc)}
+.path{color:var(--sub);font-size:12px;margin-top:6px;word-break:break-all}
+.snip{margin-top:10px;font-size:13.5px;line-height:1.75;color:#3a4356;background:#f8f9fc;border-radius:8px;padding:10px 12px;word-break:break-word}
+mark{background:var(--mark);border-radius:3px;padding:0 2px;font-weight:600}
+.empty{text-align:center;color:var(--sub);padding:60px 0;font-size:14px;line-height:2}
+.empty b{color:var(--ink)}
+.panel{max-width:1360px;margin:0 auto;padding:0 20px 8px;display:none}
+.panel.on{display:block}
+.pbox{background:var(--card);border:1px solid #eceef4;border-radius:14px;padding:18px 20px;text-align:left}
+.pbox h3{font-size:15px;margin-bottom:6px}
+.pbox p{font-size:12.5px;color:var(--sub);margin-bottom:10px;line-height:1.7}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.chip{display:flex;align-items:center;gap:6px;background:#eef1fd;color:#3a4fd7;border-radius:8px;padding:6px 10px;font-size:12.5px;word-break:break-all;max-width:100%}
+.chip b{cursor:pointer;font-weight:700;color:#9aa3c0}
+.chip b:hover{color:#e05555}
+.pbtn{border:none;border-radius:10px;padding:10px 22px;font-size:14px;font-weight:600;color:#fff;background:linear-gradient(120deg,#4f6ef7,#7c3aed);cursor:pointer;font-family:inherit}
+.pbtn.gray{background:#eef0f7;color:var(--ink)}
+.pbtn:disabled{opacity:.5;cursor:default}
+.prow{display:flex;gap:10px;flex-wrap:wrap}
+.pmsg{font-size:13px;color:var(--sub);margin-top:10px;line-height:1.7;min-height:18px}
+.pbar{height:8px;background:#e8eaf3;border-radius:6px;overflow:hidden;margin-top:10px}
+.pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4f6ef7,#7c3aed);transition:width .3s}
+.help{margin-top:12px;font-size:12.5px;color:var(--sub)}
+.help summary{cursor:pointer;color:var(--acc);font-weight:600;user-select:none}
+.help summary:hover{text-decoration:underline}
+.help li{margin:5px 0;line-height:1.75}
+.crow{display:flex;align-items:center;gap:8px;background:#f8f9fc;border:1px solid #eceef4;border-radius:8px;padding:7px 10px;margin-bottom:6px;font-size:12.5px;cursor:pointer}
+.crow input{accent-color:#4f6ef7}
+.crow .n{color:var(--sub);margin-left:auto;white-space:nowrap}
+nz{display:inline-block;color:#b45309;font-size:11px;border:1px solid #fde68a;background:#fffbeb;border-radius:5px;padding:1px 6px;white-space:nowrap}
+#toast{position:fixed;left:50%;bottom:36px;transform:translateX(-50%) translateY(20px);background:#1a2233;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.2s;z-index:9;max-width:80vw;text-align:center}
+#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+@media(max-width:680px){.tools{position:static;justify-content:flex-end;margin-bottom:12px}.hero{padding-top:18px}.hero h1{font-size:24px}}
+</style></head><body>
+<div class=hero>
+<div class=tools>
+<button class=lang id=langbtn onclick=toggleLang() title="Switch language / 切换语言">EN</button>
+<button class=gear id=gear onclick=showCfg() data-i18n="settings">⚙ 设置 / 更新</button>
+</div>
+<h1>🧠 <em data-i18n="brand">第二大脑</em></h1>
+<p data-i18n="sub">搜你电脑里文档的「内容」 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳</p>
+</div>
+<div class=bar>
+<input id=q data-i18n-ph="ph_q" placeholder="输入关键词，比如：项目方案 / 课程笔记 / 报销标准" autofocus>
+<input id=t data-i18n-ph="ph_t" placeholder="类型：pdf / docx…">
+<input id=d data-i18n-ph="ph_d" placeholder="路径包含…">
+<button onclick=go() data-i18n="search">搜 索</button></div>
+<div class=panel id=cfg><div class=pbox>
+<h3 data-i18n="scope_h">索引范围与更新</h3>
+<p id=cfgtip data-i18n="scope_tip">下面这些文件夹里的文档会被收入索引。只扫描选定的文件夹，小说类目录永远自动跳过。</p>
+<div class=chips id=dirs></div>
+<div id=cand></div>
+<div class=prow>
+<button class=pbtn id=smartbtn data-i18n="btn_scan" data-i18n-title="tip_scan" onclick=smartScan(this)>🚀 智能扫描全盘（推荐）</button>
+<button class=pbtn gray id=addbtn data-i18n="btn_add" data-i18n-title="tip_add" onclick=addDir()>➕ 手动添加文件夹</button>
+<button class=pbtn id=savebtn data-i18n="btn_save" data-i18n-title="tip_save" onclick=saveUpd(this)>💾 保存并更新索引</button>
+<button class=pbtn gray id=updonly data-i18n="btn_update" data-i18n-title="tip_update" onclick=upd(this)>🔄 按现有范围更新</button>
+<button class=pbtn gray id=stbtn data-i18n="btn_test" data-i18n-title="tip_test" onclick=selfTest(this)>🩺 引擎体检</button>
+</div>
+<div class=pbar id=pw style=display:none><i id=pi></i></div>
+<div class=pmsg id=pm></div>
+<details class=help><summary data-i18n="help_q">❓ 这五个按钮分别是干嘛的？</summary><ul>
+<li data-i18n="help_1"></li><li data-i18n="help_2"></li><li data-i18n="help_3"></li><li data-i18n="help_4"></li><li data-i18n="help_5"></li>
+</ul></details>
+</div></div>
+<div class=wrap><div id=r class=empty>输入关键词开始搜索</div></div>
+<div class=meta style="text-align:center;padding:0 20px 28px" data-i18n="footer">第二大脑 __VER__</div>
+<div id=toast></div>
+<script>
+const DICT={
+zh:{
+title:'第二大脑 · 本地文档搜索',
+brand:'第二大脑',
+sub:'搜你电脑里文档的「内容」 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳',
+settings:'⚙ 设置 / 更新',
+ph_q:'输入关键词，比如：项目方案 / 课程笔记 / 报销标准',
+ph_t:'类型：pdf / docx…',
+ph_d:'路径包含…',
+search:'搜 索',
+scope_h:'索引范围与更新',
+scope_tip:'下面这些文件夹里的文档会被收入索引。只扫描选定的文件夹，小说类目录永远自动跳过。',
+btn_scan:'🚀 智能扫描全盘（推荐）',
+btn_add:'➕ 手动添加文件夹',
+btn_save:'💾 保存并更新索引',
+btn_update:'🔄 按现有范围更新',
+btn_test:'🩺 引擎体检',
+tip_scan:'第一次用点这个：扫一遍电脑（只记文件名，不读内容），列出哪里有多少文档给您勾选，噪音目录自动不勾',
+tip_add:'自己挑要搜索的文件夹，精确控制范围',
+tip_save:'把勾选/添加的文件夹存为索引范围并开始收录（第一次全量较慢，之后增量很快）',
+tip_update:'日常维护：来了新文件点一下，只收新文件，约 1~3 分钟',
+tip_test:'给搜索引擎考试：用内置假图书馆测搜得准不准、OCR 错字率、坏文件崩不崩溃。约 1~2 分钟，不碰真实文档库',
+help_q:'❓ 这五个按钮分别是干嘛的？',
+help_1:'🚀 <b>智能扫描全盘</b>——第一次用点这个：扫一遍电脑（只记文件名、不读内容），列出「哪里有多少文档」给您勾选，疑似噪音自动不勾、小说目录直接排除',
+help_2:'➕ <b>手动添加文件夹</b>——想精确控制搜索范围时用，点一次弹一个目录选择框',
+help_3:'💾 <b>保存并更新索引</b>——把上面勾选/添加的范围生效并开始收录：第一次全量较慢，之后每次只收新文件',
+help_4:'🔄 <b>按现有范围更新</b>——日常维护按钮：电脑里来了新文档点一下，约 1~3 分钟',
+help_5:'🩺 <b>引擎体检</b>——给搜索引擎「考试」：用一份内置的假图书馆测它搜得准不准、排序对不对、OCR 错字率多少、坏文件崩不崩溃，约 1~2 分钟。<b>不碰您的真实文档库</b>，报告在 eval_report.txt',
+empty_hint:'输入关键词开始搜索',
+empty_tip:'<b>小提示</b>：两个过滤框可以留空；点结果里的「打开」直接打开原文件',
+footer:'第二大脑 __VER__ · 结果按相关度(bm25)排序 · 引擎体检：设置里点「🩺 引擎体检」或命令行 selftest，报告在 eval_report.txt',
+open:'打开',copy:'复制路径',copied:'已复制',
+found:'找到 <b>{n}</b> 条 · {ms} ms',
+searching:'搜索中…',
+need_kw:'请先输入关键词',
+no_hit:'没有找到「{q}」',
+no_hit_tip:'试试<b>换个词</b>、<b>少个过滤条件</b>，或先双击「更新第二大脑.bat」收录新文件',
+opened:'已打开',open_fail:'文件不存在或已被移动',
+first_run:'首次使用：推荐点「🚀 智能扫描全盘」，它会列出电脑里哪里有文档给您勾选；也可以手动添加文件夹。',
+no_dir:'（还没有文件夹，点「添加文件夹」）',
+add_prompt:'输入要索引的文件夹完整路径：',
+scan_hint:'🧠 智能扫描全盘中（只记文件名不读内容，约 2~4 分钟）…',
+scan_fail:'❌ 智能扫描失败：',
+cand_msg:'共扫到 <b>{n}</b> 个文档，分布在 {g} 个顶层目录。<b>橙色「疑似噪音」默认不勾</b>；确认后点「💾 保存并更新索引」。',
+noise:'疑似噪音',
+cand_tail:'（小说类目录已自动排除，不会出现在这里）',
+cand_done:'勾选完成后点「💾 保存并更新索引」。',
+test_hint:'🩺 引擎体检进行中（独立子进程，不碰真实索引库）…',
+test_busy:'体检进行中…',
+test_ok:'✅ 体检通过：',test_bad:'❌ 体检未通过：',
+test_report:'（完整报告 eval_report.txt）',
+save_need:'请先至少添加一个文件夹',
+saving:'保存配置…',save_fail:'保存失败',
+upd_need:'请先添加或选择索引文件夹',
+started:'已开始，后台处理中…',
+ph_scan:'📂 扫描文件中',ph_scan_end:'📄 扫描完成，准备入库',ph_index:'🔎 建立索引中',ph_discover:'🧠 智能扫描中',ph_prune:'🧹 清理失效条目',ph_working:'⏳ 处理中',
+prog:'{ph} · 已处理 {d}/{t}，成功 {ok}，失败 {f}',
+done_reload:'✅ {m}，2 秒后自动刷新…',
+err_prefix:'❌ 出错了：',
+m_scanning:'正在扫描 {p}',
+m_scan_end:'发现 {n} 个文档，准备入库',
+m_indexing:'正在建立索引（共 {n} 篇）',
+m_index_done:'完成，库内共 {n} 篇',
+m_pruning:'清理失效条目',
+m_pruned:'清理失效条目 {n} 条',
+m_update_done:'更新完成',
+m_discovering:'智能扫描中（只记文件名，不读内容）',
+m_discover_target:'智能扫描 {p}',
+m_discover_done:'智能扫描完成：{n} 个文档',
+m_selftest_busy:'质量自检进行中（检索评测/OCR 准确率/损坏文件 fuzz…）',
+m_selftest_done:'自检结束',
+e_no_scope:'找不到 scope.json —— 请先在设置里选择要索引的文件夹',
+e_need_dir:'至少要添加一个文件夹',
+e_discover_busy:'智能扫描正在进行',
+e_selftest_busy:'自检已在进行',
+e_update_busy:'已有更新在进行',
+e_query:'查询出错（关键词至少 3 个字符效果最佳）: {e}'
+},
+en:{
+title:'Second Brain · Local Document Search',
+brand:'Second Brain',
+sub:'Search inside your own documents — __TOTAL__ files indexed · 100% local & offline · best with 3+ characters',
+settings:'⚙ Settings',
+ph_q:'Keywords, e.g. project plan / lecture notes / expense policy',
+ph_t:'Type: pdf / docx…',
+ph_d:'Path contains…',
+search:'Search',
+scope_h:'Index scope & maintenance',
+scope_tip:'Documents inside these folders are indexed. Only the folders you pick are scanned; fiction/novel folders are always skipped.',
+btn_scan:'🚀 Smart scan (recommended)',
+btn_add:'➕ Add folder',
+btn_save:'💾 Save & build index',
+btn_update:'🔄 Update index',
+btn_test:'🩺 Health check',
+tip_scan:'First run: scans the whole computer (file names only, never contents), then lists candidate folders with document counts. Noisy folders stay unchecked.',
+tip_add:'Pick the folders you want to search, one by one',
+tip_save:'Save the selected folders as the index scope and start indexing (the first full build is slow, later runs are incremental)',
+tip_update:'Routine maintenance: pick up newly added documents, usually 1-3 minutes',
+tip_test:'Exams for the search engine: measures ranking quality, OCR error rate and crash-resistance on corrupted files. About 1-2 minutes, never touches your real library.',
+help_q:'❓ What do these five buttons do?',
+help_1:'🚀 <b>Smart scan</b> — first run: walks your disks (file names only), lists folder candidates with counts. Likely-noise folders are unchecked, fiction folders are excluded entirely.',
+help_2:'➕ <b>Add folder</b> — use when you want precise control over the search scope; opens a folder picker.',
+help_3:'💾 <b>Save & build index</b> — applies the selected scope and starts indexing. Slow the first time, incremental afterwards.',
+help_4:'🔄 <b>Update index</b> — everyday maintenance: click when new documents arrive, about 1-3 minutes.',
+help_5:'🩺 <b>Health check</b> — runs an exam on a synthetic library: ranking quality, OCR error rate, robustness against corrupted files. Takes 1-2 minutes and <b>never touches your real library</b>. Report saved to eval_report.txt',
+empty_hint:'Type a keyword to start searching',
+empty_tip:'<b>Tip</b>: the two filter boxes are optional; hit “Open” on a result to launch the original file',
+footer:'Second Brain __VER__ · results ranked by relevance (bm25) · health check: “🩺 Health check” in settings, or `selftest` on the command line — report in eval_report.txt',
+open:'Open',copy:'Copy path',copied:'Copied',
+found:'<b>{n}</b> results · {ms} ms',
+searching:'Searching…',
+need_kw:'Please type a keyword first',
+no_hit:'Nothing found for “{q}”',
+no_hit_tip:'Try <b>another keyword</b>, <b>fewer filters</b>, or run the updater to index new files first.',
+opened:'Opened',open_fail:'File no longer exists or has been moved',
+first_run:'First run: click “🚀 Smart scan” to see where your documents live, then tick the folders you want. You can also add folders manually.',
+no_dir:'(no folders yet — click “Add folder”)',
+add_prompt:'Full path of the folder to index:',
+scan_hint:'🧠 Smart scan running (file names only, no contents; about 2-4 minutes)…',
+scan_fail:'❌ Smart scan failed: ',
+cand_msg:'Found <b>{n}</b> documents across {g} top-level folders. Orange “likely noise” ones are unchecked by default; tick what you want and click “💾 Save & build index”.',
+noise:'likely noise',
+cand_tail:'(fiction/novel folders are excluded automatically and never listed here)',
+cand_done:'Tick the folders you want, then click “💾 Save & build index”.',
+test_hint:'🩺 Health check running (separate process, your real library is untouched)…',
+test_busy:'Health check running…',
+test_ok:'✅ Health check passed: ',test_bad:'❌ Health check failed: ',
+test_report:' (full report in eval_report.txt)',
+save_need:'Add at least one folder first',
+saving:'Saving…',save_fail:'Save failed',
+upd_need:'Add or select a folder to index first',
+started:'Started, working in the background…',
+ph_scan:'📂 Scanning files',ph_scan_end:'📄 Scan complete',ph_index:'🔎 Building index',ph_discover:'🧠 Discovering',ph_prune:'🧹 Removing stale entries',ph_working:'⏳ Working',
+prog:'{ph} · {d}/{t} processed, {ok} ok, {f} failed',
+done_reload:'✅ {m} — refreshing in 2 s…',
+err_prefix:'❌ Error: ',
+m_scanning:'scanning {p}',
+m_scan_end:'found {n} documents, indexing…',
+m_indexing:'building index ({n} documents)',
+m_index_done:'done — {n} documents in library',
+m_pruning:'removing stale entries',
+m_pruned:'removed {n} stale entries',
+m_update_done:'update complete',
+m_discovering:'discovering (file names only, no contents)',
+m_discover_target:'discovering {p}',
+m_discover_done:'discovery complete: {n} documents',
+m_selftest_busy:'health check running (retrieval / OCR accuracy / corrupted-file fuzz)…',
+m_selftest_done:'health check finished',
+e_no_scope:'scope.json not found — pick the folders to index in settings first',
+e_need_dir:'At least one folder is required',
+e_discover_busy:'A scan is already running',
+e_selftest_busy:'A health check is already running',
+e_update_busy:'An update is already running',
+e_query:'Query error (3+ characters works best): {e}'
+}};
+const $=id=>document.getElementById(id);
+const qEl=$('q'),tEl=$('t'),dEl=$('d'),rEl=$('r');
+let LANG=(function(){try{const v=localStorage.getItem('sb_lang');if(v==='zh'||v==='en')return v}catch(e){}
+return (navigator.language||'zh').toLowerCase().indexOf('zh')===0?'zh':'en'})();
+const T=k=>{const d=DICT[LANG];return d[k]!==undefined?d[k]:(DICT.zh[k]!==undefined?DICT.zh[k]:k)};
+const F=(s,a)=>String(s).replace(/\{(\w+)\}/g,(m,k)=>a&&a[k]!==undefined?a[k]:m);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let HAS_RESULT=0;
+function applyLang(){
+document.documentElement.lang=(LANG==='zh'?'zh-CN':'en');
+document.title=T('title');
+document.querySelectorAll('[data-i18n]').forEach(el=>{el.innerHTML=T(el.dataset.i18n)});
+document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=T(el.dataset.i18nPh)});
+document.querySelectorAll('[data-i18n-title]').forEach(el=>{el.title=T(el.dataset.i18nTitle)});
+$('langbtn').textContent=(LANG==='zh'?'EN':'中文');
+draw();
+if(HAS_RESULT&&qEl.value.trim())go(); else if(!HAS_RESULT)showEmpty();
+if($('pm').textContent&&DIRS.length)pm.textContent='';
+}
+function toggleLang(){LANG=(LANG==='zh'?'en':'zh');try{localStorage.setItem('sb_lang',LANG)}catch(e){}
+applyLang();try{if(PROG_CACHE)renderProg(PROG_CACHE)}catch(e){}}
+function showEmpty(){rEl.className='empty';rEl.innerHTML=esc(T('empty_hint'))+'<br>'+T('empty_tip')}
+let TOAST_T=0;
+function toast(m){const el=$('toast');el.textContent=m;el.classList.add('on');clearTimeout(TOAST_T);TOAST_T=setTimeout(()=>el.classList.remove('on'),1800)}
+function hl(s,qv){
+const parts=String(s).split(/(\u0001[^\u0002]*\u0002)/);
+const hasMark=parts.length>1;
+return parts.map(p=>{
+if(p.charAt(0)==='\u0001'&&p.charAt(p.length-1)==='\u0002')return '<mark>'+esc(p.slice(1,-1))+'</mark>';
+let t=esc(p);
+if(!hasMark&&qv){const ws=qv.trim().split(/\s+/).filter(x=>x.length>0);
+for(const w of ws){try{t=t.replace(new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi'),m=>'<mark>'+m+'</mark>')}catch(e){}}}
+return t}).join('')}
+async function go(){
+const qv=qEl.value.trim(),tv=tEl.value.trim(),dv=dEl.value.trim();
+if(!qv){HAS_RESULT=0;showEmpty();return}
+rEl.className='empty';rEl.innerHTML=T('searching');
+const t0=performance.now();let x;
+try{x=await(await fetch('/api?q='+encodeURIComponent(qv)+'&t='+encodeURIComponent(tv)+'&d='+encodeURIComponent(dv))).json()}
+catch(e){rEl.innerHTML=esc(String(e));return}
+const ms=(performance.now()-t0).toFixed(0);
+if(x.err){HAS_RESULT=0;rEl.innerHTML=esc(x.k?F(T(x.k),x.a||{e:x.err}):x.err);return}
+HAS_RESULT=1;
+if(!x.hits.length){rEl.className='empty';
+rEl.innerHTML=F(T('no_hit'),{q:esc(qv)})+'<br>'+T('no_hit_tip');return}
+rEl.className='';
+rEl.innerHTML='<div class=meta>'+F(T('found'),{n:x.hits.length,ms:ms})+'</div>'+
+x.hits.map(h=>{const i=h.p.lastIndexOf('\\'),nm=i<0?h.p:h.p.slice(i+1),pt=i<0?'':h.p.slice(0,i),
+e=(h.p.split('.').pop()||'').toUpperCase().slice(0,4);
+return '<div class=card><div class=top><span class=badge>'+esc(e)+'</span><span class=name title="'+esc(h.p)+'">'+esc(nm)+'</span>'+
+'<button class=btn onclick="openF(\''+encodeURIComponent(h.p)+'\')">'+esc(T('open'))+'</button>'+
+'<button class=btn onclick="copyP(this,\''+encodeURIComponent(h.p)+'\')">'+esc(T('copy'))+'</button></div>'+
+'<div class=path>'+esc(pt)+'</div><div class=snip>'+hl(h.s,qv)+'</div></div>'}).join('')}
+async function openF(p){try{const x=await(await fetch('/open?p='+p)).json();toast(x.ok?T('opened'):T('open_fail'))}
+catch(e){toast(T('open_fail'))}}
+async function copyP(b,p){try{await navigator.clipboard.writeText(decodeURIComponent(p));b.textContent=T('copied');setTimeout(()=>{b.textContent=T('copy')},1200)}
+catch(e){toast(decodeURIComponent(p))}}
+qEl.addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+document.addEventListener('keydown',e=>{
+if(e.key==='Escape'){if(document.activeElement===qEl){qEl.value='';HAS_RESULT=0;showEmpty()}}
+if((e.ctrlKey||e.metaKey)&&e.key==='f'){e.preventDefault();qEl.focus();qEl.select()}});
+let DIRS=[],EXC=[],tid=0,PROG_CACHE=null;
+async function cfgLoad(){try{const c=await(await fetch('/api/config')).json();DIRS=c.include_dirs||[];EXC=c.exclude_dirs||[];
+if(!c.exists){showCfg(1);pm.textContent=T('first_run');draw()}}catch(e){}}
+function showCfg(wizard){cfg.classList.add('on');if(wizard)$('gear').style.display='none'}
+function draw(){const el=$('dirs');if(!el)return;
+el.innerHTML=DIRS.map((d,i)=>'<span class=chip>'+esc(d)+' <b onclick=delD('+i+')>✕</b></span>').join('')
+||'<span class=pmsg>'+esc(T('no_dir'))+'</span>'}
+async function addDir(){let p=null;
+// 桌面窗口模式下才有原生文件夹选择器。注意不能用一个全局常量来判断：
+// pywebview 注入 window.pywebview 的时机晚于本脚本执行，那时常量还是 false。
+const api=window.pywebview&&window.pywebview.api;
+if(api&&api.pick_folder){try{p=await api.pick_folder()}catch(e){p=null}}
+if(!p)p=prompt(T('add_prompt'));
+if(p){p=String(p).replace(/[\\/]+$/,'');if(!DIRS.includes(p))DIRS.push(p);draw()}}
+function delD(i){DIRS.splice(i,1);draw()}
+let CAND=[];
+async function smartScan(b){b.disabled=1;$('pw').style.display='';$('pi').style.width='3%';
+pm.textContent=T('scan_hint');
+await fetch('/api/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+clearInterval(tid);tid=setInterval(async()=>{let d;
+try{d=await(await fetch('/api/discover')).json()}catch(e){return}
+if(d.state==='busy'){try{const s=await(await fetch('/api/status')).json();
+const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):10;$('pi').style.width=pc+'%';
+pm.textContent='📂 '+(smsg(s)||T('ph_discover'));}catch(e){}}
+else{clearInterval(tid);b.disabled=0;$('pw').style.display='none';
+if(d.state==='ready')renderCand(d.groups);
+else pm.textContent=T('scan_fail')+d.err}},1000)}
+function renderCand(gs){CAND=gs;cfg.classList.add('on');
+const total=gs.reduce((a,g)=>a+g.docs,0);
+$('cand').innerHTML='<div class=pmsg>'+F(T('cand_msg'),{n:total,g:gs.length})+'</div>'+
+gs.map((g,i)=>'<label class=crow><input type=checkbox '+(g.noise?'':'checked')+' onchange=candPick('+i+',this.checked)><span>'+esc(g.dir)+'</span>'+(g.noise?'<nz>'+esc(T('noise'))+'</nz>':'')+'<span class=n>'+g.docs+'</span></label>').join('')
++'<div class=pmsg>'+esc(T('cand_tail'))+'</div>';
+DIRS=gs.filter(g=>!g.noise).map(g=>g.dir);draw();
+pm.textContent=T('cand_done')}
+function candPick(i,on){const d=CAND[i].dir;
+if(on){if(!DIRS.includes(d))DIRS.push(d)}else{DIRS=DIRS.filter(x=>x!==d)}draw()}
+async function selfTest(b){b.disabled=1;$('pw').style.display='';$('pi').style.width='5%';
+pm.textContent=T('test_hint');
+await fetch('/api/selftest',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+clearInterval(tid);tid=setInterval(async()=>{let s;
+try{s=await(await fetch('/api/selftest')).json()}catch(e){return}
+if(s.state==='busy'){$('pi').style.width='60%';pm.textContent=smsg(s)||T('test_busy')}
+else{clearInterval(tid);b.disabled=0;$('pw').style.display='none';
+pm.textContent=(s.ok?T('test_ok'):T('test_bad'))+(smsg(s)||'')+T('test_report')}},1500)}
+async function saveUpd(b){if(!DIRS.length){pm.textContent=T('save_need');return}
+b.disabled=1;pm.textContent=T('saving');
+const r=await(await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({include_dirs:DIRS,exclude_dirs:EXC})})).json();
+if(!r.ok){pm.textContent=r.k?T(r.k):(r.err||T('save_fail'));b.disabled=0;return}
+upd(null)}
+async function upd(b){if(!DIRS.length){pm.textContent=T('upd_need');return}
+if(b)b.disabled=1;$('savebtn').disabled=1;$('updonly').disabled=1;$('smartbtn').disabled=1;
+$('pw').style.display='';$('pi').style.width='2%';pm.textContent=T('started');
+await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targets:DIRS})});
+poll()}
+function smsg(o){if(!o)return'';
+if(o.k&&DICT[LANG][o.k]!==undefined)return F(T(o.k),o.a||{});
+return o.msg||o.err||''}
+function renderProg(s){
+if(s.state!=='busy')return;
+const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):8;
+$('pi').style.width=pc+'%';
+const ph=T('ph_'+s.phase)||T('ph_working');
+pm.textContent=F(T('prog'),{ph:ph,d:s.done,t:(s.total||'?'),ok:s.ok,f:s.fail})+(smsg(s)?' · '+smsg(s):'')}
+function poll(){clearInterval(tid);tid=setInterval(async()=>{let s;
+try{s=await(await fetch('/api/status')).json()}catch(e){return}
+PROG_CACHE=s;
+if(s.state==='busy'){s.phase&&DICT[LANG]['ph_'+s.phase]?renderProg(s):(()=>{const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):8;
+$('pi').style.width=pc+'%';pm.textContent=T('ph_working')+(smsg(s)?' · '+smsg(s):'')})()}
+else{clearInterval(tid);$('gear').style.display='';
+$('savebtn').disabled=0;$('updonly').disabled=0;$('smartbtn').disabled=0;
+if(s.state==='done'){$('pi').style.width='100%';pm.textContent=F(T('done_reload'),{m:smsg(s)||T('m_update_done')});
+setTimeout(()=>location.reload(),2500)}
+else if(s.state==='error'){$('pw').style.display='none';pm.textContent=T('err_prefix')+(smsg(s)||'')}}},800)}
+cfgLoad();applyLang();
+</script></body></html>'''
+    import os
+    from urllib.parse import urlparse, parse_qs
+
+    def build_page():
+        total = init_db().execute('SELECT count(*) FROM docs').fetchone()[0]
+        return (PAGE_TPL.replace('__TOTAL__', f'{total:,}')
+                        .replace('__VER__', APP_VERSION))
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def _guard(self):
+            """只信本机：Host 必须是 127.0.0.1/localhost，跨站 Origin 拒绝（防恶意网页
+            借浏览器偷打本机接口），POST 只收 application/json"""
+            host = (self.headers.get('Host') or '').lower()
+            if not (host.startswith('127.0.0.1') or host.startswith('localhost')):
+                return False
+            org = self.headers.get('Origin')
+            if org and '127.0.0.1' not in org and 'localhost' not in org:
+                return False
+            return True
+        def do_GET(self):
+            if not self._guard():
+                self.send_response(403)
+                self.end_headers()
+                return
+            if self.path.startswith('/api/selftest'):
+                body = json.dumps(dict(SELFTEST), ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/ping'):
+                # 供桌面启动器确认「这个端口上跑的是不是本应用」，防止端口被别的程序占用时显示错页面
+                body = json.dumps({'app': 'second-brain', 'ver': APP_VERSION},
+                                  ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/config'):
+                sp = app_dir() / 'scope.json'
+                cfg = {'exists': sp.exists(), 'include_dirs': [], 'exclude_dirs': [],
+                       'app_dir': str(app_dir()),
+                       'docs': init_db().execute('SELECT count(*) FROM docs').fetchone()[0]}
+                if sp.exists():
+                    try:
+                        c = json.loads(sp.read_text(encoding='utf-8'))
+                        cfg['include_dirs'] = c.get('include_dirs', [])
+                        cfg['exclude_dirs'] = c.get('exclude_dirs', [])
+                    except Exception:
+                        cfg['broken'] = True
+                body = json.dumps(cfg, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/status'):
+                body = json.dumps(dict(PROG), ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/discover'):
+                body = json.dumps(dict(DISCOVER), ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api?'):
+                qs = parse_qs(urlparse(self.path).query)
+                q = qs.get('q', [''])[0]
+                ext = qs.get('t', [''])[0] or None
+                pf = qs.get('d', [''])[0] or None
+                try:
+                    hits = [{'p': p, 's': s} for p, s in self._search(q, ext, pf)]
+                    body = json.dumps({'hits': hits}, ensure_ascii=False).encode()
+                except Exception as e:
+                    body = json.dumps({'err': f'查询出错: {e}', 'k': 'e_query', 'a': {'e': str(e)}},
+                                      ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/open?'):
+                p = parse_qs(urlparse(self.path).query).get('p', [''])[0]
+                ok = bool(p) and os.path.exists(p)
+                if ok:
+                    try:
+                        os.startfile(p)
+                    except Exception:
+                        ok = False
+                body = json.dumps({'ok': ok}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            else:
+                body = build_page().encode()
+                ctype = 'text/html; charset=utf-8'
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.end_headers()
+            self.wfile.write(body)
+        def do_POST(self):
+            if not self._guard() or 'application/json' not in (self.headers.get('Content-Type') or ''):
+                self.send_response(403)
+                self.end_headers()
+                return
+            n = int(self.headers.get('Content-Length') or 0)
+            try:
+                req = json.loads(self.rfile.read(n).decode('utf-8')) if n else {}
+            except Exception:
+                req = {}
+            if self.path.startswith('/api/config'):
+                dirs = [str(d).strip() for d in req.get('include_dirs', []) if str(d).strip()]
+                exc = [str(d).strip() for d in req.get('exclude_dirs', []) if str(d).strip()]
+                if not dirs:
+                    body = json.dumps({'ok': False, 'err': '至少要添加一个文件夹', 'k': 'e_need_dir'},
+                                      ensure_ascii=False).encode()
+                else:
+                    sp = app_dir() / 'scope.json'
+                    sp.write_text(json.dumps(
+                        {'scan_csv': 'scan_raw.csv', 'include_dirs': dirs, 'exclude_dirs': exc},
+                        ensure_ascii=False, indent=2), encoding='utf-8')
+                    body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/discover'):
+                if DISCOVER['state'] == 'busy':
+                    body = json.dumps({'ok': False, 'err': '智能扫描正在进行', 'k': 'e_discover_busy'}, ensure_ascii=False).encode()
+                else:
+                    targets = req.get('targets')
+                    if targets is not None:
+                        targets = [str(t) for t in targets]
+                    threading.Thread(target=discover_scan, args=(targets,), daemon=True).start()
+                    body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/selftest'):
+                if SELFTEST['state'] == 'busy':
+                    body = json.dumps({'ok': False, 'err': '自检已在进行', 'k': 'e_selftest_busy'}, ensure_ascii=False).encode()
+                else:
+                    run_selftest_async()
+                    body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/update'):
+                if PROG['state'] == 'busy':
+                    body = json.dumps({'ok': False, 'err': '已有更新在进行', 'k': 'e_update_busy'}, ensure_ascii=False).encode()
+                else:
+                    targets = req.get('targets')
+                    if targets is not None:
+                        targets = [str(t) for t in targets]
+                    threading.Thread(target=update, args=(targets,), daemon=True).start()
+                    body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            else:
+                body = json.dumps({'ok': False}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.end_headers()
+            self.wfile.write(body)
+        def _search(self, q, ext=None, pf=None):
+            con = init_db()
+            sql, args = _search_sql(q, ext, pf)
+            return con.execute(sql, (*args, 30)).fetchall()
+    return HTTPServer(('127.0.0.1', port), H)
+
+def serve(port=8765):
+    """浏览器模式：直接跑网页界面；想要独立桌面窗口用 app_window.py"""
+    import webbrowser
+    srv = make_server(port)
+    threading.Timer(1.2, webbrowser.open, args=(f'http://127.0.0.1:{port}',)).start()
+    print(f'第二大脑已启动：http://127.0.0.1:{port}（关闭本窗口即停止服务）')
+    srv.serve_forever()
+
+def cli(argv=None):
+    """命令行入口（python brain.py …；打包后 exe 的同名子命令走同一套逻辑）"""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        serve()
+        return
+    cmd = argv[0]
+    if cmd == 'index':
+        index(argv[1])
+    elif cmd == 'update':
+        update()
+    elif cmd == 'search':
+        search(argv[1], int(argv[2]) if len(argv) > 2 else 20,
+               argv[3] if len(argv) > 3 else None, argv[4] if len(argv) > 4 else None)
+    elif cmd == 'prune':
+        prune()
+    elif cmd == 'serve':
+        serve(int(argv[1]) if len(argv) > 1 else 8765)
+    elif cmd in ('selftest', 'eval'):
+        import selftest
+        ok = selftest.run_all(verbose=True, write_report=True)
+        sys.exit(0 if ok else 1)
+    else:
+        print(__doc__)
+
+if __name__ == '__main__':
+    cli()

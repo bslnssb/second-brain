@@ -1,0 +1,7 @@
+# 核心依赖（必需）
+pypdf>=3.9          # 解析 PDF 正文
+pymupdf>=1.23       # 把扫描版 PDF 渲染成图片，供 OCR 使用
+rapidocr-onnxruntime>=1.2   # 离线中文 OCR（模型内置，装好后零联网）
+
+# 桌面窗口版依赖（可选；不装则用浏览器界面）
+pywebview>=4.4

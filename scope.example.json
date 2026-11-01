@@ -1,0 +1,15 @@
+{
+  "scan_csv": "scan_raw.csv",
+  "include_dirs": [
+    "c:\\users\\你的用户名\\desktop",
+    "c:\\users\\你的用户名\\documents",
+    "c:\\users\\你的用户名\\downloads",
+    "d:\\资料\\电子书"
+  ],
+  "exclude_dirs": [
+    "小说",
+    "steam",
+    "node_modules",
+    "__pycache__"
+  ]
+}
