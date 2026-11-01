@@ -117,6 +117,17 @@ they never trigger an FTS syntax error.
 Filters: the **Type** box takes an extension (`pdf`, `docx`, …), the **Path contains** box filters by
 substring of the full path.
 
+### URL parameters
+
+Handy for bookmarks and shortcuts:
+
+| Parameter | Effect |
+|---|---|
+| `?q=keyword` | Open the page with results already rendered |
+| `?lang=zh` / `?lang=en` | Force the interface language for this link |
+
+Example: `http://127.0.0.1:8765/?q=invoice&lang=en`
+
 ## Quality self-test
 
 `eval_report.txt` is a real report from an actual run:

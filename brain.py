@@ -231,7 +231,11 @@ def _decode_text(raw: bytes):
 def extract_text(path: Path):
     ext = path.suffix.lower()
     if ext in ('.txt', '.md'):
-        return _decode_text(path.read_bytes()[:MAX_BODY * 3])
+        # 只读前几 MB：read_bytes() 会把整个文件读进内存，遇上几百 MB 的密码字典 /
+        # 游戏数据 / 日志会把内存打满并卡住整轮索引（实测 244MB 的 txt 直接让进度停滞）
+        with open(path, 'rb') as f:
+            raw = f.read(MAX_BODY * 3)
+        return _decode_text(raw)
     if ext == '.pdf':
         try:
             from pypdf import PdfReader
@@ -269,8 +273,10 @@ def extract_text(path: Path):
             return None
     if ext in ('.html', '.htm'):
         try:
+            with open(path, 'rb') as f:          # 同上：只读前几 MB，别把整份文件读进内存
+                raw = f.read(MAX_BODY * 3)
             hp = _HTML()
-            hp.feed(path.read_text(encoding='utf-8', errors='replace')[:MAX_BODY])
+            hp.feed(_decode_text(raw)[:MAX_BODY])
             return ' '.join(hp.parts)[:MAX_BODY] or None
         except Exception:
             return None
