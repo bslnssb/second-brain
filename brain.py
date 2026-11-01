@@ -39,6 +39,7 @@ DB = app_dir() / 'brain.db'
 MAX_BODY = 2 * 1024 * 1024  # 单文档正文上限 2MB
 OCR_PAGES = 15              # OCR 最多识别前 N 页（扫描件整本太慢，前 15 页足够建立搜索特征）
 OCR_DPI = 180               # 渲染清晰度，实测中文识别够用
+OCR_BUDGET = 60             # 单篇 OCR 的时间预算（秒），到点就用已识别的部分
 
 # 更新进度（网页/桌面窗口轮询展示用）
 # k + a 是给前端的语言无关消息（k 为文案键，a 为插值参数）；msg 保留中文原文作兜底，
@@ -175,8 +176,12 @@ def _get_ocr():
         _ocr = RapidOCR()
     return _ocr
 
-def ocr_pdf(path: Path):
-    """纯扫描版 PDF：渲染前 OCR_PAGES 页逐页 OCR；失败返回 None"""
+def ocr_pdf(path: Path, budget=OCR_BUDGET):
+    """纯扫描版 PDF：渲染前 OCR_PAGES 页逐页 OCR；失败返回 None。
+
+    budget=单篇 OCR 的总时间预算（秒）。扫描版笔记/教材一本几十页，逐页 OCR 能吃掉
+    好几分钟，一篇就能拖住整轮索引；给个预算，到点就把已识别的部分交出来——
+    建搜索特征用不着整本。"""
     try:
         import pymupdf
         doc = pymupdf.open(str(path))
@@ -185,8 +190,9 @@ def ocr_pdf(path: Path):
                 return None
             ocr = _get_ocr()
             parts = []
+            t0 = time.time()
             for i, page in enumerate(doc):
-                if i >= OCR_PAGES:
+                if i >= OCR_PAGES or time.time() - t0 > budget:
                     break
                 pix = page.get_pixmap(matrix=pymupdf.Matrix(OCR_DPI / 72, OCR_DPI / 72))
                 res, _ = ocr(pix.tobytes('png'))
@@ -282,15 +288,26 @@ def extract_text(path: Path):
             return None
     return None
 
-EXTRACT_TIMEOUT = 90   # 单个文件的解析上限（秒）
+EXTRACT_TIMEOUT = 200        # 单个文件的解析上限（秒）；要给 OCR 预算留出余量
+EXTRACT_MAX_THREADS = 4      # 允许同时残留在后台的超时线程数
+
+_live_extracts = []
 
 def extract_text_safe(path: Path):
     """带超时的提取，返回 (text, reason)。
 
     个别文件会让解析库卡死十几分钟：实测一个 9MB 的矢量「思维导图」PDF 能让 pypdf
-    吃到 2.5GB 内存还不返回，整轮索引就此停滞（进度条几十分钟不动）。索引不能被
-    单个文件拖住，所以超时就跳过并记下原因，回头能查是哪个文件。
-    注意：超时后那个线程仍会在后台跑完（Python 无法强杀线程），只是不再阻塞主流程。"""
+    吃到 2.5GB 内存还不返回，整轮索引就此停滞（进度条几十分钟不动）。
+    索引不能被单个文件拖住，超时就跳过并记下原因。
+
+    Python 无法强杀线程，超时的线程会自己跑完，所以还要限流：后台残留线程达到上限时
+    主流程先等一等，否则几十个线程一起抢 CPU，反而把整轮索引拖死（实测堆到 59 个）。"""
+    global _live_extracts
+    _live_extracts = [t for t in _live_extracts if t.is_alive()]
+    while len(_live_extracts) >= EXTRACT_MAX_THREADS:
+        time.sleep(0.5)
+        _live_extracts = [t for t in _live_extracts if t.is_alive()]
+
     box = {}
 
     def work():
@@ -303,6 +320,7 @@ def extract_text_safe(path: Path):
     th.start()
     th.join(EXTRACT_TIMEOUT)
     if th.is_alive():
+        _live_extracts.append(th)
         return None, f'解析超时（>{EXTRACT_TIMEOUT}s）'
     if 'e' in box:
         return None, f'解析异常（{type(box["e"]).__name__}）'
