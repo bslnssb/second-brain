@@ -301,13 +301,15 @@ def extract_text(path: Path):
             return None
     return None
 
-EXTRACT_TIMEOUT = 120        # 单个 PDF 的解析上限（秒）；要给 OCR 预算留出余量
+EXTRACT_TIMEOUT = 60         # 单个 PDF 的解析上限（秒）；要给 OCR 预算留出余量
 
-def _extract_cmd(path_str):
+def _extract_cmd(path_str, out_path):
     """构造「提取子进程」的命令行；源码运行和打包成 exe 都适用"""
     if getattr(sys, 'frozen', False):
-        return [sys.executable, '_extract', path_str]
-    return [sys.executable, str(Path(__file__).resolve()), '_extract', path_str]
+        return [sys.executable, '_extract', path_str, out_path]
+    return [sys.executable, str(Path(__file__).resolve()), '_extract', path_str, out_path]
+
+_extract_seq = 0
 
 def extract_text_safe(path: Path):
     """提取文本，返回 (text, reason)。
@@ -317,26 +319,43 @@ def extract_text_safe(path: Path):
     threading.join(timeout) 都返回不了，线程超时方案形同虚设——整轮索引会卡死十几
     分钟不动。子进程可以被真正 kill，是目前唯一可靠的中断手段。
 
+    结果用**临时文件**回传，不走 stdout 管道：管道一旦被子进程留着不关，
+    communicate() 收尾时 join 读取线程会永久阻塞，连超时都救不回来（实测卡 5 分钟）。
+    这里母进程只做纯 p.wait(timeout)，kill 之后立刻返回。
+
     其余格式（txt/md/docx/pptx/xlsx/epub/html）都在毫秒级，直接在进程内做，
     省掉每次启动进程的开销。"""
+    global _extract_seq
     if path.suffix.lower() == '.pdf':
+        _extract_seq += 1
+        tmp = app_dir() / f'.extract-{os.getpid()}-{_extract_seq}.json'
         flags = 0x08000000 if os.name == 'nt' else 0    # CREATE_NO_WINDOW
         env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
         try:
-            r = subprocess.run(_extract_cmd(str(path)), capture_output=True,
-                               timeout=EXTRACT_TIMEOUT, creationflags=flags, env=env)
-        except subprocess.TimeoutExpired:
-            return None, f'解析超时（>{EXTRACT_TIMEOUT}s）'
+            proc = subprocess.Popen(_extract_cmd(str(path), str(tmp)),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=flags, env=env)
         except Exception as e:
             return None, f'解析异常（{type(e).__name__}）'
-        for line in (r.stdout or b'').decode('utf-8', 'replace').splitlines():
-            if line.startswith('@@R@@'):
-                try:
-                    data = json.loads(line[5:])
-                except Exception:
-                    return None, '解析失败'
-                return data.get('t'), data.get('w')
-        return None, '解析失败'
+        try:
+            proc.wait(timeout=EXTRACT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return None, f'解析超时（>{EXTRACT_TIMEOUT}s）'
+        try:
+            data = json.loads(tmp.read_text(encoding='utf-8'))
+            return data.get('t'), data.get('w')
+        except Exception:
+            return None, '解析失败'
+        finally:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
     try:
         return extract_text(path), None
@@ -1189,13 +1208,13 @@ def cli(argv=None):
     elif cmd == 'prune':
         prune()
     elif cmd == '_extract':
-        # 内部子命令：由 extract_text_safe() 以子进程方式调用，母进程超时可强杀。
-        # 结果加 @@R@@ 前缀输出到 stdout，避免混进 pypdf / pymupdf 的警告文本。
+        # 内部子命令：由 extract_text_safe() 以子进程方式调用，结果写到临时文件。
+        # 不走 stdout 管道——管道会让母进程在超时收尾时永久阻塞。
         try:
             payload = {'t': extract_text(Path(argv[1])), 'w': None}
         except Exception as e:
             payload = {'t': None, 'w': f'解析异常（{type(e).__name__}）'}
-        sys.stdout.write('@@R@@' + json.dumps(payload, ensure_ascii=False) + '\n')
+        Path(argv[2]).write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
     elif cmd == 'serve':
         serve(int(argv[1]) if len(argv) > 1 else 8765)
     elif cmd in ('selftest', 'eval'):
