@@ -301,47 +301,47 @@ def extract_text(path: Path):
             return None
     return None
 
-EXTRACT_TIMEOUT = 90         # 单个文件的解析上限（秒）；要给 OCR 预算留出余量
-EXTRACT_MAX_THREADS = 4      # 允许同时残留在后台的超时线程数
+EXTRACT_TIMEOUT = 120        # 单个 PDF 的解析上限（秒）；要给 OCR 预算留出余量
 
-_live_extracts = []
+def _extract_cmd(path_str):
+    """构造「提取子进程」的命令行；源码运行和打包成 exe 都适用"""
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, '_extract', path_str]
+    return [sys.executable, str(Path(__file__).resolve()), '_extract', path_str]
 
 def extract_text_safe(path: Path):
-    """带超时的提取，返回 (text, reason)。
+    """提取文本，返回 (text, reason)。
 
-    个别文件会让解析库卡死十几分钟：实测一个 9MB 的矢量「思维导图」PDF 能让 pypdf
-    吃到 2.5GB 内存还不返回，整轮索引就此停滞（进度条几十分钟不动）。
-    索引不能被单个文件拖住，超时就跳过并记下原因。
+    **PDF 一律放到子进程里解析**。pypdf / pymupdf / onnxruntime 这些 C 扩展在某些
+    文件上会长时间持着 GIL（实测：超长扫描图渲染、onnxruntime 文本检测），此时连
+    threading.join(timeout) 都返回不了，线程超时方案形同虚设——整轮索引会卡死十几
+    分钟不动。子进程可以被真正 kill，是目前唯一可靠的中断手段。
 
-    Python 无法强杀线程，超时的线程会自己跑完，所以还要限流：后台残留线程达到上限时
-    主流程先等一等，否则几十个线程一起抢 CPU，反而把整轮索引拖死（实测堆到 59 个）。"""
-    global _live_extracts
-    _live_extracts = [t for t in _live_extracts if t.is_alive()]
-    # 最多等 10 秒：某些 PDF 会让 pypdf 跑上十几分钟，若在这里死等，
-    # 主流程就被这几个线程一起锁死了（实测卡住 5 分钟不动）。宁可让线程多堆几个。
-    waited = 0.0
-    while len(_live_extracts) >= EXTRACT_MAX_THREADS and waited < 10:
-        time.sleep(0.5)
-        waited += 0.5
-        _live_extracts = [t for t in _live_extracts if t.is_alive()]
-
-    box = {}
-
-    def work():
+    其余格式（txt/md/docx/pptx/xlsx/epub/html）都在毫秒级，直接在进程内做，
+    省掉每次启动进程的开销。"""
+    if path.suffix.lower() == '.pdf':
+        flags = 0x08000000 if os.name == 'nt' else 0    # CREATE_NO_WINDOW
+        env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
         try:
-            box['t'] = extract_text(path)
+            r = subprocess.run(_extract_cmd(str(path)), capture_output=True,
+                               timeout=EXTRACT_TIMEOUT, creationflags=flags, env=env)
+        except subprocess.TimeoutExpired:
+            return None, f'解析超时（>{EXTRACT_TIMEOUT}s）'
         except Exception as e:
-            box['e'] = e
+            return None, f'解析异常（{type(e).__name__}）'
+        for line in (r.stdout or b'').decode('utf-8', 'replace').splitlines():
+            if line.startswith('@@R@@'):
+                try:
+                    data = json.loads(line[5:])
+                except Exception:
+                    return None, '解析失败'
+                return data.get('t'), data.get('w')
+        return None, '解析失败'
 
-    th = threading.Thread(target=work, daemon=True)
-    th.start()
-    th.join(EXTRACT_TIMEOUT)
-    if th.is_alive():
-        _live_extracts.append(th)
-        return None, f'解析超时（>{EXTRACT_TIMEOUT}s）'
-    if 'e' in box:
-        return None, f'解析异常（{type(box["e"]).__name__}）'
-    return box.get('t'), None
+    try:
+        return extract_text(path), None
+    except Exception as e:
+        return None, f'解析异常（{type(e).__name__}）'
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -1188,6 +1188,14 @@ def cli(argv=None):
                argv[3] if len(argv) > 3 else None, argv[4] if len(argv) > 4 else None)
     elif cmd == 'prune':
         prune()
+    elif cmd == '_extract':
+        # 内部子命令：由 extract_text_safe() 以子进程方式调用，母进程超时可强杀。
+        # 结果加 @@R@@ 前缀输出到 stdout，避免混进 pypdf / pymupdf 的警告文本。
+        try:
+            payload = {'t': extract_text(Path(argv[1])), 'w': None}
+        except Exception as e:
+            payload = {'t': None, 'w': f'解析异常（{type(e).__name__}）'}
+        sys.stdout.write('@@R@@' + json.dumps(payload, ensure_ascii=False) + '\n')
     elif cmd == 'serve':
         serve(int(argv[1]) if len(argv) > 1 else 8765)
     elif cmd in ('selftest', 'eval'):
