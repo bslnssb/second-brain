@@ -152,6 +152,23 @@ OVERALL: PASS
 
 The whole run uses synthetic data in a temporary directory — **your real index is never touched**.
 
+### QA suite (before release)
+
+`selftest.py` answers "does it work". `qa_test.py` answers "does it hold up":
+boundary inputs (FTS syntax, wildcards, SQL-injection shapes, 5 000-character queries),
+latency on a real library, concurrent requests, resource leaks, the `/open` endpoint,
+and whether the English UI leaks Chinese. It runs read-only against your own index and
+writes `QA_REPORT.md`.
+
+```
+python qa_test.py            # full run
+python qa_test.py --quick    # skip concurrency / leak sections
+```
+
+Last run on an 8,626-document / 2.37 GB library: **98 pass, 0 fail, 1 warning**.
+The seven defects it caught — and the numbers behind the fixes — are in
+[QA_FINDINGS.md](QA_FINDINGS.md).
+
 ## Privacy
 
 - Parsing, OCR and indexing all happen locally; no network requests are made
@@ -166,6 +183,7 @@ brain.py            core: indexing / search / web server / pruning / self-test d
 scan_docs.py        disk scanner (exclusion rules, fiction-folder safety net)
 app_window.py       desktop window launcher (pywebview)
 selftest.py         quality self-test (synthetic data)
+qa_test.py          QA suite: boundaries / latency / concurrency / leaks
 ocr_backfill.py     re-run indexing for files that previously yielded no text
 gen_icon.py         generates the app icon
 scope.example.json  scope configuration template
@@ -175,6 +193,7 @@ README.zh-CN.md     Chinese version of this document
 brain.db            (generated) SQLite index — docs = FTS5 table, meta = processed files
 scan_raw.csv        (generated) last scan candidate list
 eval_report.txt     last self-test report
+QA_REPORT.md        last QA suite report
 ```
 
 ## License

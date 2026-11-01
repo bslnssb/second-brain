@@ -306,21 +306,28 @@ def _rtf_text(raw: bytes) -> str:
             out.append(part.decode(enc, errors='replace'))
     return re.sub(r'[ \t]{2,}', ' ', ''.join(out))[:MAX_BODY]
 
-def _clean_text(t):
-    """清掉无法编码的字符，否则整篇文档会废掉。
+_CTRL = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
-    pymupdf 遇到字体映射损坏的 PDF 会吐出孤立代理项（U+D800~U+DFFF 区间里落单的那种），
-    它们不是合法 Unicode，一旦写 JSON（子进程回传）或存进 SQLite 就抛
-    UnicodeEncodeError —— 表现为「解析失败」，整篇正文白读了。
-    这里统一替换成 U+FFFD：宁可少几个畸形字，也不要丢掉整篇。
+def _clean_text(t):
+    """清掉会让整篇文档报废、或者让检索失明的字符。
+
+    1) 孤立代理项：pymupdf 遇到字体映射损坏的 PDF 会吐出 U+D800~U+DFFF 区间里落单的
+       码位，它们不是合法 Unicode，一写 JSON（子进程回传）或存进 SQLite 就抛
+       UnicodeEncodeError —— 表现为「解析失败」，整篇正文白读了。替换成 U+FFFD。
+    2) NUL 等控制字符：SQLite 的 LIKE 是按 C 字符串实现的，**遇到 \\x00 就截断**，
+       于是短词检索（1~2 个字走 LIKE）看不见 NUL 之后的所有内容。实测库里 24 篇 PDF
+       正文带 NUL，那些文档的后半截等于搜不到。换成空格，位置信息也还保留着。
+       （保留 \\t \\n \\r）
     """
     if not t:
         return t
     try:
         t.encode('utf-8')
-        return t              # 绝大多数文本走这条，零开销
     except UnicodeEncodeError:
-        return t.encode('utf-8', 'replace').decode('utf-8')
+        t = t.encode('utf-8', 'replace').decode('utf-8')
+    if '\x00' in t or _CTRL.search(t):
+        t = _CTRL.sub(' ', t)
+    return t
 
 
 def extract_text(path: Path):
@@ -483,7 +490,8 @@ def _doc_del(con, rids, path):
         con.execute('DELETE FROM docs WHERE path=?', (path,))
 
 def init_db():
-    con = sqlite3.connect(DB)
+    # check_same_thread=False：HTTP 层共用一条连接，由 con_lock 保证不并发使用
+    con = sqlite3.connect(DB, check_same_thread=False)
     con.execute('PRAGMA journal_mode=WAL')   # 读写并发：建索引时搜索不再被锁死
     con.execute("CREATE TABLE IF NOT EXISTS meta(path TEXT PRIMARY KEY, indexed_at REAL)")
     for col, decl in (('size', 'REAL'), ('mtime', 'REAL'), ('reason', 'TEXT')):
@@ -494,6 +502,21 @@ def init_db():
     con.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
                    path UNINDEXED, ext UNINDEXED, body, tokenize='trigram')""")
     return con
+
+def _count_docs(con):
+    """库内文档数。
+
+    **别用 `count(*) FROM docs`**：docs 是 FTS5 虚表，count 会把每一行（含整段正文）
+    都物化出来，2.4 GB 的库实测 288ms —— 而页面每次加载都要这个数字。meta 的
+    `reason IS NULL` 恰好就是成功入库的集合（索引和 prune 同步维护），同样的事 0.6ms。"""
+    try:
+        n = con.execute('SELECT count(*) FROM meta WHERE reason IS NULL').fetchone()[0]
+        if n:
+            return n
+    except sqlite3.Error:
+        pass
+    return con.execute('SELECT count(*) FROM docs').fetchone()[0]
+
 
 def _fail_reason(path: Path):
     """给无文本文件归因：空文件 / 加密 / 损坏 / 无文本 / 格式不支持"""
@@ -660,7 +683,7 @@ def index(scope_path):
         con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
     except Exception:
         pass
-    total = con.execute('SELECT count(*) FROM docs').fetchone()[0]
+    total = _count_docs(con)
     _prog(state='done', phase='', done=n_done, total=todo, ok=n_new, fail=n_fail,
           msg=f'完成，库内共 {total} 篇', k='m_index_done', a={'n': f'{total:,}'})
     print(f'完成：新索引 {n_new}，空/失败 {n_fail}，范围外/重复跳过 {n_skip}；库内共 {total} 篇')
@@ -697,6 +720,14 @@ def _ext_clause(ext):
     e = str(ext or '').strip().lower().lstrip('.')
     return (' AND ext = ?', [f'.{e}']) if e else ('', [])
 
+def _like_esc(t):
+    """把 LIKE 的通配符转义掉。
+
+    `_` 和 `%` 在 LIKE 里是通配符：搜「_」会匹配任何一个字符、搜「a_」会匹配所有
+    含 a 的文档——等于把单字查询变成全库 dump。转义后才是字面匹配。"""
+    return t.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
 def _search_sql(q, ext=None, pf=None):
     """返回 (sql, args)，网页与命令行共用同一套检索逻辑"""
     extra, args = '', []
@@ -716,10 +747,10 @@ def _search_sql(q, ext=None, pf=None):
         return sql, [_fts_query(q), *args]
     # 短词（含 1~2 字中文、AI、C 这类）：trigram 命中不了，降级 LIKE。
     # 预览定位到第一个词的命中位置，而不是正文开头。
-    like = ' AND '.join(['body LIKE ?'] * len(toks)) or '1=1'
+    like = ' AND '.join(["body LIKE ? ESCAPE '\\'"] * len(toks)) or '1=1'
     sql = ("SELECT path, substr(body, max(1, instr(body, ?) - 30), 90) FROM docs "
            "WHERE " + like + extra + " LIMIT ?")
-    return sql, [toks[0] if toks else '', *[f'%{t}%' for t in toks], *args]
+    return sql, [toks[0] if toks else '', *[f'%{_like_esc(t)}%' for t in toks], *args]
 
 def _mark_name(p, toks):
     """给「文件名命中」的结果做片段：取文件名，把命中的词打上高亮标记。
@@ -761,13 +792,20 @@ def search_rows(con, q, limit=20, ext=None, path_filter=None):
     toks = _fts_tokens(q)
     if not toks:
         return hits
-    clause, eargs = _ext_clause(ext)
-    sql2 = ('SELECT path FROM docs WHERE '
-            + ' AND '.join(['instr(lower(path), lower(?)) > 0'] * len(toks)) + clause
-            + (' AND instr(lower(path), lower(?)) > 0' if path_filter else '') + ' LIMIT ?')
-    a2 = list(toks) + list(eargs)
+    # 扫「meta」而不是「docs」：docs 是 FTS5 虚表，取 path 也要把整行（含正文）读出来，
+    # 2.4 GB 的库实测 280ms；meta 是普通表且有 path 主键，同一件事只要 4ms（65 倍）。
+    # meta 里 reason IS NULL 就是成功入库的集合，索引与 prune 都同步维护它。
+    sql2 = ('SELECT path FROM meta WHERE reason IS NULL AND '
+            + ' AND '.join(['instr(lower(path), lower(?)) > 0'] * len(toks)))
+    a2 = list(toks)
+    e = str(ext or '').strip().lower().lstrip('.')
+    if e:
+        sql2 += ' AND lower(path) LIKE ?'
+        a2.append(f'%.{_like_esc(e)}')
     if path_filter:
+        sql2 += ' AND instr(lower(path), lower(?)) > 0'
         a2.append(path_filter)
+    sql2 += ' LIMIT ?'
     a2.append(limit + len(hits))
     seen = {p for p, _ in hits}
     for (p,) in con.execute(sql2, a2):
@@ -781,7 +819,7 @@ def search_rows(con, q, limit=20, ext=None, path_filter=None):
 
 def search(q, limit=20, ext=None, path_filter=None):
     con = init_db()
-    con_row = con.execute('SELECT count(*) FROM docs').fetchone()[0]
+    con_row = _count_docs(con)
     if con_row == 0:
         print('索引为空，先运行 index 建库')
         return
@@ -854,8 +892,26 @@ def update(targets=None, scope_path=None):
         _prog(state='error', err=f'{type(e).__name__}: {e}')
         traceback.print_exc()
 
+_con = None
+con_lock = threading.RLock()
+
+def conn():
+    """HTTP 层共用的只读连接（配合 con_lock 使用）。
+
+    原来是「每个请求 init_db() 新建一个、从不关闭」：连接靠 GC 兜底，文件句柄和 WAL
+    读者先堆着；而且每次都要重跑一遍 PRAGMA 和 3 个必然失败的 ALTER TABLE。改成一条
+    共享连接后，页面和接口的数据库开销从毫秒级降到微秒级。
+    多线程下 sqlite3 连接不能裸用，所以所有访问都套 con_lock（RLock，可重入）。"""
+    global _con
+    if _con is None:
+        with con_lock:
+            if _con is None:
+                _con = init_db()
+    return _con
+
+
 def make_server(port=8765):
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     PAGE_TPL = r'''<!doctype html><html lang="zh-CN"><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%236b53e8'/%3E%3Ctext y='.92em' x='8' font-size='82'%3E%F0%9F%A7%A0%3C/text%3E%3C/svg%3E">
@@ -1031,6 +1087,7 @@ e_need_dir:'至少要添加一个文件夹',
 e_discover_busy:'智能扫描正在进行',
 e_selftest_busy:'自检已在进行',
 e_update_busy:'已有更新在进行',
+e_bad_body:'请求格式不正确',
 e_query:'查询出错（关键词至少 3 个字符效果最佳）: {e}'
 },
 en:{
@@ -1108,6 +1165,7 @@ e_need_dir:'At least one folder is required',
 e_discover_busy:'A scan is already running',
 e_selftest_busy:'A health check is already running',
 e_update_busy:'An update is already running',
+e_bad_body:'Malformed request body',
 e_query:'Query error (3+ characters works best): {e}'
 }};
 const $=id=>document.getElementById(id);
@@ -1257,11 +1315,17 @@ if(Q0){qEl.value=Q0;go()}
     from urllib.parse import urlparse, parse_qs
 
     def build_page():
-        total = init_db().execute('SELECT count(*) FROM docs').fetchone()[0]
+        with con_lock:
+            total = _count_docs(conn())
         return (PAGE_TPL.replace('__TOTAL__', f'{total:,}')
                         .replace('__VER__', APP_VERSION))
 
     class H(BaseHTTPRequestHandler):
+        # 单线程 HTTPServer + 默认无超时：一个连上来却不把请求发完的客户端（页面刷新时
+        # 被中断的请求、被占用的端口探测）会让后续请求全部排在这一条连接后面，
+        # 界面表现就是「点了没反应」。给它一个读超时，并在下面换成多线程服务器。
+        timeout = 15
+
         def log_message(self, *a):
             pass
         def _guard(self):
@@ -1289,9 +1353,11 @@ if(Q0){qEl.value=Q0;go()}
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/config'):
                 sp = app_dir() / 'scope.json'
+                with con_lock:
+                    n_docs = _count_docs(conn())
                 cfg = {'exists': sp.exists(), 'include_dirs': [], 'exclude_dirs': [],
                        'app_dir': str(app_dir()),
-                       'docs': init_db().execute('SELECT count(*) FROM docs').fetchone()[0]}
+                       'docs': n_docs}
                 if sp.exists():
                     try:
                         c = json.loads(sp.read_text(encoding='utf-8'))
@@ -1320,13 +1386,25 @@ if(Q0){qEl.value=Q0;go()}
                                       ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/open?'):
+                # 只允许打开**索引里的文件**，并且拒绝跨站发起。
+                # 光靠 Host/Origin 校验不够：浏览器用 <img src> / <a ping> 这类简单 GET
+                # 打本机接口时并不发 Origin，于是任意网页都能让这里执行 os.startfile，
+                # 而 startfile 对 .exe 就是「运行」——等于给了一个远程执行入口。
                 p = parse_qs(urlparse(self.path).query).get('p', [''])[0]
-                ok = bool(p) and os.path.exists(p)
-                if ok:
+                site = (self.headers.get('Sec-Fetch-Site') or '').lower()
+                ok = False
+                if p and site not in ('cross-site', 'same-site', 'none'):
                     try:
-                        os.startfile(p)
-                    except Exception:
+                        with con_lock:
+                            ok = bool(conn().execute(
+                                'SELECT 1 FROM meta WHERE path=? LIMIT 1', (p,)).fetchone())
+                    except sqlite3.Error:
                         ok = False
+                    if ok:
+                        try:
+                            os.startfile(p)
+                        except Exception:
+                            ok = False
                 body = json.dumps({'ok': ok}, ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             else:
@@ -1341,11 +1419,24 @@ if(Q0){qEl.value=Q0;go()}
                 self.send_response(403)
                 self.end_headers()
                 return
-            n = int(self.headers.get('Content-Length') or 0)
+            try:
+                n = int(self.headers.get('Content-Length') or 0)
+            except ValueError:
+                n = 0                       # Content-Length 是垃圾时当空 body 处理
             try:
                 req = json.loads(self.rfile.read(n).decode('utf-8')) if n else {}
             except Exception:
                 req = {}
+            if not isinstance(req, dict):
+                # 请求体是数组/字符串时 req.get() 会抛 AttributeError，连接被直接掐断，
+                # 前端只看到「Failed to fetch」。统一回一个 400。
+                body = json.dumps({'ok': False, 'err': '请求体必须是 JSON 对象',
+                                   'k': 'e_bad_body'}, ensure_ascii=False).encode()
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith('/api/config'):
                 dirs = [str(d).strip() for d in req.get('include_dirs', []) if str(d).strip()]
                 exc = [str(d).strip() for d in req.get('exclude_dirs', []) if str(d).strip()]
@@ -1394,8 +1485,20 @@ if(Q0){qEl.value=Q0;go()}
             self.end_headers()
             self.wfile.write(body)
         def _search(self, q, ext=None, pf=None):
-            return search_rows(init_db(), q, 30, ext, pf)
-    return HTTPServer(('127.0.0.1', port), H)
+            with con_lock:
+                return search_rows(conn(), q, 30, ext, pf)
+    class QuietServer(ThreadingHTTPServer):
+        """多线程 + 安静：单线程时一个不发完请求的连接会把界面卡住（见 H.timeout）。
+        连接被对端中断（关窗口、刷新、探测端口）是常态，不该往控制台吐 traceback。"""
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            et = sys.exc_info()[0]
+            if et in (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                return
+            super().handle_error(request, client_address)
+
+    return QuietServer(('127.0.0.1', port), H)
 
 def serve(port=8765):
     """浏览器模式：直接跑网页界面；想要独立桌面窗口用 app_window.py"""

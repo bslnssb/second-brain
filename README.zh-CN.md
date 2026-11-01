@@ -148,6 +148,20 @@ OVERALL: PASS
 
 自检全程使用合成数据，在临时目录建库，**不碰你的真实索引**。
 
+### QA 套件（发布前跑）
+
+`selftest.py` 回答「功能对不对」，`qa_test.py` 回答「扛不扛得住」：边界输入
+（FTS 语法、通配符、SQL 注入形状、5000 字长查询）、真实库上的延迟、并发请求、
+资源泄漏、`/open` 接口的越权、以及英文界面有没有漏中文。只读，跑完写 `QA_REPORT.md`。
+
+```
+python qa_test.py            # 全量
+python qa_test.py --quick    # 跳过并发与泄漏两节
+```
+
+最近一次在 8,626 篇 / 2.37 GB 的库上：**98 通过 / 0 失败 / 1 警告**。
+抓到的 7 个缺陷连同修复前后的数字见 [QA_FINDINGS.md](QA_FINDINGS.md)。
+
 ## 隐私
 
 - 正文解析、OCR、索引全部在本机完成，不发起任何网络请求
@@ -162,6 +176,7 @@ brain.py            核心：建索引 / 搜索 / 网页服务 / 清理 / 自检
 scan_docs.py        磁盘扫描器（排除规则、小说关键词保险）
 app_window.py       桌面窗口启动器（pywebview）
 selftest.py         质量自检（合成数据）
+qa_test.py          QA 套件：边界 / 延迟 / 并发 / 泄漏
 ocr_backfill.py     把历史「提不出文本」的文件重走一遍索引
 gen_icon.py         生成应用图标
 scope.example.json  范围配置模板
@@ -171,6 +186,7 @@ README.md          本文档的英文版
 brain.db            （运行时生成）SQLite 索引库，docs=FTS5 表，meta=已处理清单
 scan_raw.csv        （运行时生成）最近一次扫描清单
 eval_report.txt     最近一次自检报告
+QA_REPORT.md        最近一次 QA 套件报告
 ```
 
 ## 许可证
