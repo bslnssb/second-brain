@@ -18,7 +18,25 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import brain  # noqa: E402
+
+
+def _die(msg):
+    """pythonw 启动时没有控制台：报错必须弹窗，否则用户看到的就是「双击没反应」。
+    最常见的就是依赖没装全（pypdf / pymupdf / rapidocr）。"""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, msg, 'Second Brain · 第二大脑', 0x10)
+    except Exception:
+        print(msg)
+    sys.exit(1)
+
+
+try:
+    import brain  # noqa: E402
+except Exception as e:
+    _die(f'启动失败：{type(e).__name__}: {e}\n\n'
+         f'Startup failed — a dependency is missing.\n'
+         f'请在本目录命令行执行：\n  pip install -r requirements.txt')
 
 try:
     import webview  # 必须模块级导入：Api.pick_folder 在别的线程里调用它

@@ -443,6 +443,23 @@ def extract_text_safe(path: Path):
     except Exception as e:
         return None, f'解析异常（{type(e).__name__}）'
 
+def _doc_rids(con):
+    """path → rowid 映射。
+
+    docs 是 FTS5 虚表，path 又是 UNINDEXED 列，所以任何 `WHERE path=?` 的删除/更新
+    都会退化成整表扫描：实测 3.4GB 的库上删一行要 1.4 秒，而按 rowid 删是 1 毫秒。
+    重索引上千篇文件就白扔二十多分钟。先花一次（约 1.5 秒）把映射取到内存，
+    之后全按 rowid 操作。只读 path 列，不用把正文也读出来。"""
+    return {p: r for r, p in con.execute('SELECT rowid, path FROM docs')}
+
+def _doc_del(con, rids, path):
+    """按路径删索引行（走 rowid，必要时才回退到慢路径）"""
+    rid = rids.pop(path, None)
+    if rid is not None:
+        con.execute('DELETE FROM docs WHERE rowid=?', (rid,))
+    else:
+        con.execute('DELETE FROM docs WHERE path=?', (path,))
+
 def init_db():
     con = sqlite3.connect(DB)
     con.execute('PRAGMA journal_mode=WAL')   # 读写并发：建索引时搜索不再被锁死
@@ -524,6 +541,7 @@ def index(scope_path):
         pass
     meta_info = {r[0]: (r[1], r[2], r[3]) for r in
                  con.execute('SELECT path, indexed_at, size, mtime FROM meta')}
+    rids = _doc_rids(con)
 
     def _needs(p, pl, dry=False):
         """ True=需要(重新)索引：范围外 False；新文件 True；
@@ -590,8 +608,10 @@ def index(scope_path):
                         'VALUES(?,?,?,?,?)',
                         (p, time.time(), st.st_size, st.st_mtime, why or _fail_reason(Path(p))))
         else:
-            con.execute('DELETE FROM docs WHERE path=?', (p,))  # 变更重建时先清旧行
-            con.execute('INSERT INTO docs VALUES(?,?,?)', (p, Path(p).suffix.lower(), text))
+            _doc_del(con, rids, p)      # 变更重建时先清旧行（按 rowid，别用慢的 path 扫描）
+            cur = con.execute('INSERT INTO docs VALUES(?,?,?)',
+                              (p, Path(p).suffix.lower(), text))
+            rids[p] = cur.lastrowid
             con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
                         'VALUES(?,?,?,?,?)',
                         (p, time.time(), st.st_size, st.st_mtime, None))
@@ -777,9 +797,10 @@ def prune():
             continue
         if not os.path.exists(p):
             gone.append(p)
+    rids = _doc_rids(con)
     for p in gone:
         con.execute('DELETE FROM meta WHERE path=?', (p,))
-        con.execute('DELETE FROM docs WHERE path=?', (p,))
+        _doc_del(con, rids, p)
     con.commit()
     if skipped:
         print(f'清理失效条目: {len(gone)} 条（另有 {skipped} 条所在磁盘当前不可达，已跳过）')
