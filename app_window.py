@@ -124,8 +124,48 @@ def main():
     webview.start()
 
 
+def _attach_console():
+    """打包后的 exe 是窗口程序（console=False）。从 cmd 里调用 index/update 这类子命令时，
+    输出无处可去，进度一条都看不到。这里把标准输出接回父控制台；
+    双击启动（没有父控制台）时 AttachConsole 失败，静默跳过即可。"""
+    if getattr(sys, 'frozen', False) is False or sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        if not ctypes.windll.kernel32.AttachConsole(-1):
+            return
+        # 已经有 stdout（重定向到文件/管道）就别抢，只在真的没有时接回控制台
+        for name in ('stdout', 'stderr'):
+            if getattr(sys, name, None) is None:
+                try:
+                    setattr(sys, name,
+                            open('CONOUT$', 'w', encoding='utf-8', errors='replace',
+                                 buffering=1))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 if __name__ == '__main__':
     if len(sys.argv) > 1:
-        brain.cli(sys.argv[1:])
+        _attach_console()
+        try:
+            brain.cli(sys.argv[1:])
+        except SystemExit:
+            raise
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _die(f'命令执行失败：{type(e).__name__}: {e}\n\n'
+                 f'Command failed. Run it from a terminal to see the full traceback.')
     else:
-        main()
+        try:
+            main()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _die(f'窗口启动失败：{type(e).__name__}: {e}\n\n'
+                 f'Window failed to start.\n'
+                 f'通常是缺少 WebView2 运行时，可从以下地址安装：\n'
+                 f'https://developer.microsoft.com/microsoft-edge/webview2/')

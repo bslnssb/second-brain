@@ -287,6 +287,19 @@ def run_all(verbose=True, write_report=True):
             _rec('PASS' if (n_hit > 0 and n_miss == 0) else 'FAIL', 'H2 路径过滤生效',
                  f'命中 {n_hit} 条 / 不存在的路径 {n_miss} 条')
             con.close()
+
+            # 孤立代理项（pymupdf 对字体映射损坏的 PDF 会吐出这种字符）曾经让整篇
+            # 文档在写 JSON / 存库时抛 UnicodeEncodeError，表现为「解析失败」。
+            bad = 'abc' + chr(0xD800) + 'def' + chr(0xDC80)
+            fixed = brain._clean_text(bad)
+            ok = True
+            try:
+                json.dumps(fixed).encode('utf-8')
+            except UnicodeEncodeError:
+                ok = False
+            _rec('PASS' if ok else 'FAIL', 'H3 畸形字符净化',
+                 '孤立代理项已替换为 U+FFFD，整篇不会因此报废' if ok
+                 else f'仍含不可编码字符：{fixed!r}')
         except Exception as e:
             _rec('FAIL', 'H 文件名检索与路径过滤', f'{type(e).__name__}: {e}')
     finally:

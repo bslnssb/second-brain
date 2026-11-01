@@ -306,7 +306,29 @@ def _rtf_text(raw: bytes) -> str:
             out.append(part.decode(enc, errors='replace'))
     return re.sub(r'[ \t]{2,}', ' ', ''.join(out))[:MAX_BODY]
 
+def _clean_text(t):
+    """清掉无法编码的字符，否则整篇文档会废掉。
+
+    pymupdf 遇到字体映射损坏的 PDF 会吐出孤立代理项（U+D800~U+DFFF 区间里落单的那种），
+    它们不是合法 Unicode，一旦写 JSON（子进程回传）或存进 SQLite 就抛
+    UnicodeEncodeError —— 表现为「解析失败」，整篇正文白读了。
+    这里统一替换成 U+FFFD：宁可少几个畸形字，也不要丢掉整篇。
+    """
+    if not t:
+        return t
+    try:
+        t.encode('utf-8')
+        return t              # 绝大多数文本走这条，零开销
+    except UnicodeEncodeError:
+        return t.encode('utf-8', 'replace').decode('utf-8')
+
+
 def extract_text(path: Path):
+    """对外统一入口：先按格式提取，再净化一次（见 _clean_text）。"""
+    return _clean_text(_extract_text_impl(path))
+
+
+def _extract_text_impl(path: Path):
     ext = path.suffix.lower()
     if ext == '.rtf':
         try:

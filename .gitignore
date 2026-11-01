@@ -26,6 +26,7 @@ dist/
 *.spec
 !second-brain.spec
 !second-brain-core.spec
+!second-brain-app.spec
 
 # 系统
 .DS_Store
