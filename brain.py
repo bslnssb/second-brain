@@ -39,7 +39,7 @@ DB = app_dir() / 'brain.db'
 MAX_BODY = 2 * 1024 * 1024  # 单文档正文上限 2MB
 OCR_PAGES = 6               # OCR 最多识别前 N 页：建搜索特征用不着整本，页数越多单篇越慢
 OCR_DPI = 180               # 渲染清晰度，实测中文识别够用
-OCR_BUDGET = 45             # 单篇 OCR 的时间预算（秒），到点就用已识别的部分
+OCR_BUDGET = 20             # 单篇 OCR 的时间预算（秒），到点就用已识别的部分
 PDF_MAX_SIZE = 80 * 1024 * 1024   # 超过这个体积的 PDF 直接跳过（整本扫描图集）
 
 # 更新进度（网页/桌面窗口轮询展示用）
@@ -301,7 +301,7 @@ def extract_text(path: Path):
             return None
     return None
 
-EXTRACT_TIMEOUT = 60         # 单个 PDF 的解析上限（秒）；要给 OCR 预算留出余量
+EXTRACT_TIMEOUT = 30         # 单个 PDF 的解析上限（秒）；要给 OCR 预算留出余量
 
 def _extract_cmd(path_str, out_path):
     """构造「提取子进程」的命令行；源码运行和打包成 exe 都适用"""
@@ -478,30 +478,32 @@ def index(scope_path):
         if text and not why:
             # 清洗孤立代理字符（个别破损 PDF 会抽出 \ud800-\udfff，SQLite/FTS 拒收）
             text = text.encode('utf-8', 'ignore').decode('utf-8')
+        n_done += 1
         if not text or not text.strip():
             n_fail += 1
-            n_done += 1
             _prog(done=n_done, ok=n_new, fail=n_fail)
             # 超时/异常的别再调 _fail_reason 二次打开文件（那本身也可能是卡点）
             con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
                         'VALUES(?,?,?,?,?)',
                         (p, time.time(), st.st_size, st.st_mtime, why or _fail_reason(Path(p))))
-            continue
-        con.execute('DELETE FROM docs WHERE path=?', (p,))  # 变更重建时先清旧行
-        con.execute('INSERT INTO docs VALUES(?,?,?)', (p, Path(p).suffix.lower(), text))
-        con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
-                    'VALUES(?,?,?,?,?)',
-                    (p, time.time(), st.st_size, st.st_mtime, None))
-        n_new += 1
-        n_done += 1
-        _prog(done=n_done, ok=n_new, fail=n_fail)
+        else:
+            con.execute('DELETE FROM docs WHERE path=?', (p,))  # 变更重建时先清旧行
+            con.execute('INSERT INTO docs VALUES(?,?,?)', (p, Path(p).suffix.lower(), text))
+            con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
+                        'VALUES(?,?,?,?,?)',
+                        (p, time.time(), st.st_size, st.st_mtime, None))
+            n_new += 1
+            _prog(done=n_done, ok=n_new, fail=n_fail)
+        # 失败项也要定期落盘。原来只有「成功满 200 篇」才 commit，而扫描件是成片失败的，
+        # 于是事务一直悬着：外部只读连接看不到任何写入，看上去像卡死，中途被杀还全白跑。
+        if n_done % 20 == 0 or n_done == todo:
+            con.commit()
         if n_done % 50 == 0 or n_done == todo:
             el = time.time() - t0
             rate = n_done / el if el > 0 else 0
             eta = (todo - n_done) / rate if rate > 0 else 0
-            print(f'  ...{n_done}/{todo} 已索引, {el:.0f}s, {rate:.0f}篇/s, 预计还需 {eta:.0f}s', flush=True)
-        if n_new % 200 == 0:
-            con.commit()
+            print(f'  ...{n_done}/{todo} 已处理（成功 {n_new}、失败 {n_fail}）, {el:.0f}s, '
+                  f'{rate:.1f}篇/s, 预计还需 {eta:.0f}s', flush=True)
     con.commit()
     try:
         con.execute("INSERT INTO docs(docs) VALUES('optimize')")  # 收紧 FTS 索引，查询更快
