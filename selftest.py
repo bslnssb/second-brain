@@ -79,6 +79,9 @@ def run_all(verbose=True, write_report=True):
     (corpus / 'b.txt').write_text('评测语料第二号：生鲜冷链运输的温控标准与应急预案。', encoding='utf-8')
     (corpus / 'f.txt').write_text('应急预案专项汇总。' + '应急预案。' * 6 +
                                   '本篇重复应急预案以检验相关度排序。', encoding='utf-8')
+    # 正文刻意不含标题里的词：专供 H1「文件名参与检索」用
+    (corpus / '蓝图评审会议纪要.txt').write_text(
+        '本文件正文只写一句无关的话，标题里的关键词一个都不出现。', encoding='utf-8')
     _mk_docx(corpus / 'c.docx', '评测语料第三号：SQL注入漏洞的应急响应流程与修复建议。')
     enc_made = False
     if mupdf:
@@ -233,7 +236,7 @@ def run_all(verbose=True, write_report=True):
             assert con.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
             con.execute("INSERT INTO docs(docs) VALUES('integrity-check')")
             total = con.execute('SELECT count(*) FROM docs').fetchone()[0]
-            expect = 5 if mupdf else 4
+            expect = 6 if mupdf else 5   # 5(或4)+蓝图评审会议纪要.txt
             _rec('PASS' if total == expect else 'FAIL',
                  f'E SQLite/FTS5 完整性检查，库内 {total} 篇（预期 {expect}）',
                  'integrity_check + FTS5 integrity-check 双检通过')
@@ -270,6 +273,22 @@ def run_all(verbose=True, write_report=True):
                  'G2 prune 清理已删除文件', '删除文件后索引同步清理' if not left else '仍残留')
         except Exception as e:
             _rec('FAIL', 'G 失败归因与清理', f'{type(e).__name__}: {e}')
+
+        # ══ H. 文件名检索 + 路径过滤（两个曾经静默失效的点，留回归测试钉住）
+        try:
+            con = brain.init_db()
+            hits = brain.search_rows(con, '蓝图评审会议纪要', 20)
+            got = any(p.endswith('蓝图评审会议纪要.txt') for p, _s in hits)
+            _rec('PASS' if got else 'FAIL', 'H1 文件名参与检索',
+                 '正文里没有、文件名有的文档可以搜到' if got else '只能搜正文，文件名命不中')
+            # 用 ≥3 字符的 ASCII 过滤条件：这正是过去被 FTS5 trigram 接管、悄悄返回 0 条的形态
+            n_hit = len(brain.search_rows(con, '巡检', 20, None, tmp.name))
+            n_miss = len(brain.search_rows(con, '巡检', 20, None, 'zz-no-such-dir-zz'))
+            _rec('PASS' if (n_hit > 0 and n_miss == 0) else 'FAIL', 'H2 路径过滤生效',
+                 f'命中 {n_hit} 条 / 不存在的路径 {n_miss} 条')
+            con.close()
+        except Exception as e:
+            _rec('FAIL', 'H 文件名检索与路径过滤', f'{type(e).__name__}: {e}')
     finally:
         brain.DB = old_db
         brain._prog(state='idle')

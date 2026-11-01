@@ -245,8 +245,79 @@ def _decode_text(raw: bytes):
     except UnicodeDecodeError:
         return raw.decode('gb18030', errors='replace')
 
+_RTF_ENC = {936: 'gbk', 950: 'big5', 932: 'shift_jis', 1252: 'cp1252', 65001: 'utf-8'}
+# RTF 的「目标组」：内容不是正文（字体表/颜色表/图片/文档属性…），整组丢弃。
+# 不丢的话字体名、十六进制图片数据会混进正文，搜「Arial」能命中几百个不相干的文件。
+_RTF_DEST = {b'fonttbl', b'colortbl', b'stylesheet', b'info', b'generator', b'pict',
+             b'shppict', b'nonshppict', b'object', b'header', b'headerl', b'headerr',
+             b'headerf', b'footer', b'footerl', b'footerr', b'footerf', b'footnote',
+             b'annotation', b'listtable', b'listoverridetable', b'rsidtbl', b'filetbl',
+             b'revtbl', b'pgptbl', b'latentstyles', b'themebegin', b'datastore',
+             b'xmlnstbl', b'fldinst', b'thematicbreak', b'pn'}
+
+def _rtf_no_groups(s: bytes) -> bytes:
+    """剔除目标组（{\\*...} 和 {\\fonttbl...} 这类）。它们在 RTF 里可以嵌套，
+    正则的非贪婪匹配会在第一个 } 就收手、留下一地垃圾，所以按花括号深度配平来跳。"""
+    out, i, n, skip = bytearray(), 0, len(s), 0
+    while i < n:
+        c = s[i:i + 1]
+        if c == b'\\' and i + 1 < n:            # \{ \} \\ 是转义，别当结构符号
+            if not skip:
+                out += s[i:i + 2]
+            i += 2
+            continue
+        if c == b'{':
+            if skip:
+                skip += 1
+            else:
+                m = re.match(rb'\\\*|\\([a-zA-Z]+)', s[i + 1:i + 32])
+                if m and (m.group(1) is None or m.group(1) in _RTF_DEST):
+                    skip = 1
+                else:
+                    out += c
+        elif c == b'}':
+            if skip:
+                skip -= 1
+            else:
+                out += c
+        elif not skip:
+            out += c
+        i += 1
+    return bytes(out)
+
+def _rtf_text(raw: bytes) -> str:
+    """RTF → 纯文本。中文在 RTF 里多半是 \\'b1\\'a3 这样按代码页转义的单字节，
+    直接丢给 _decode_text 会解成乱码，所以先在字节层面还原再按 \\ansicpg 解码。"""
+    m = re.search(rb'\\ansicpg(\d+)', raw[:4096])
+    enc = _RTF_ENC.get(int(m.group(1)) if m else 936, 'gb18030')
+    s = _rtf_no_groups(raw)
+    # \uN 是 Unicode 转义（Windows 版 Word 存中文常走这条），先换占位符免得被控制字清理吃掉
+    s = re.sub(rb'\\u(-?\d+)\s?\??', lambda m: b'\x01U%d\x01' % (int(m.group(1)) % 65536), s)
+    s = re.sub(rb"\\'([0-9a-fA-F]{2})", lambda m: bytes([int(m.group(1), 16)]), s)
+    s = re.sub(rb'\\par\b', b'\n', s)
+    s = re.sub(rb'\\[a-zA-Z]+-?\d*\s?', b'', s)          # 其余控制字
+    s = re.sub(rb'\\([\\{}])', rb'\1', s)                # 还原转义的花括号/反斜杠
+    s = re.sub(rb'[{}]', b'', s)
+    out = []
+    for i, part in enumerate(re.split(rb'\x01U(\d+)\x01', s)):
+        if i % 2:
+            out.append(chr(int(part)))
+        elif part:
+            out.append(part.decode(enc, errors='replace'))
+    return re.sub(r'[ \t]{2,}', ' ', ''.join(out))[:MAX_BODY]
+
 def extract_text(path: Path):
     ext = path.suffix.lower()
+    if ext == '.rtf':
+        try:
+            with open(path, 'rb') as f:
+                raw = f.read(MAX_BODY * 6)   # RTF 的控制字比正文还多，多留点余量
+        except OSError:
+            return None
+        try:
+            return _rtf_text(raw) or None
+        except Exception:
+            return None
     if ext in ('.txt', '.md'):
         # 只读前几 MB：read_bytes() 会把整个文件读进内存，遇上几百 MB 的密码字典 /
         # 游戏数据 / 日志会把内存打满并卡住整轮索引（实测 244MB 的 txt 直接让进度停滞）
@@ -309,7 +380,17 @@ def _extract_cmd(path_str, out_path):
         return [sys.executable, '_extract', path_str, out_path]
     return [sys.executable, str(Path(__file__).resolve()), '_extract', path_str, out_path]
 
-_extract_seq = 0
+_EXTRACT_TMP = None
+
+def _extract_tmp() -> Path:
+    """子进程回传结果的临时文件，全进程复用一个；退出时删掉。
+    一进一出，不在用户目录里留一地 .extract-*.json。"""
+    global _EXTRACT_TMP
+    if _EXTRACT_TMP is None:
+        _EXTRACT_TMP = app_dir() / f'.extract-{os.getpid()}.json'
+        import atexit
+        atexit.register(lambda: _EXTRACT_TMP.unlink(missing_ok=True))
+    return _EXTRACT_TMP
 
 def extract_text_safe(path: Path):
     """提取文本，返回 (text, reason)。
@@ -323,12 +404,15 @@ def extract_text_safe(path: Path):
     communicate() 收尾时 join 读取线程会永久阻塞，连超时都救不回来（实测卡 5 分钟）。
     这里母进程只做纯 p.wait(timeout)，kill 之后立刻返回。
 
-    其余格式（txt/md/docx/pptx/xlsx/epub/html）都在毫秒级，直接在进程内做，
+    临时文件**全进程复用同一个**：一个文件建一次、退出删一次。原来每篇一个文件，
+    几百篇下来会攒一堆（还会被同步盘/安全软件当成异常批量删除反复拦），既脏又慢。
+    复用就得防「读到上一篇的残留」——子进程把请求路径一起写进 JSON，父进程核对，
+    对不上就当作失败，绝不把别人的正文算到这篇头上。
+
+    其余格式（txt/md/rtf/docx/pptx/xlsx/epub/html）都在毫秒级，直接在进程内做，
     省掉每次启动进程的开销。"""
-    global _extract_seq
     if path.suffix.lower() == '.pdf':
-        _extract_seq += 1
-        tmp = app_dir() / f'.extract-{os.getpid()}-{_extract_seq}.json'
+        tmp = _extract_tmp()
         flags = 0x08000000 if os.name == 'nt' else 0    # CREATE_NO_WINDOW
         env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
         try:
@@ -348,14 +432,11 @@ def extract_text_safe(path: Path):
             return None, f'解析超时（>{EXTRACT_TIMEOUT}s）'
         try:
             data = json.loads(tmp.read_text(encoding='utf-8'))
-            return data.get('t'), data.get('w')
         except Exception:
             return None, '解析失败'
-        finally:
-            try:
-                tmp.unlink()
-            except Exception:
-                pass
+        if str(data.get('p') or '') != str(path):     # 复用的临时文件，残留不能当真
+            return None, '解析失败'
+        return data.get('t'), data.get('w')
 
     try:
         return extract_text(path), None
@@ -376,13 +457,23 @@ def init_db():
     return con
 
 def _fail_reason(path: Path):
-    """给无文本文件归因：空文件 / 加密 / 损坏 / 无文本"""
+    """给无文本文件归因：空文件 / 加密 / 损坏 / 无文本 / 格式不支持"""
     try:
-        if path.stat().st_size == 0:
+        sz = path.stat().st_size
+        if sz == 0:
             return '空文件'
     except OSError:
         return '文件消失'
-    if path.suffix.lower() == '.pdf':
+    ext = path.suffix.lower()
+    # 这些是 2007 之前的二进制 Office / 电子书格式，纯 Python 读不动。归因写清楚，
+    # 免得和「扫描件提不出字」混在一起看不出问题（改存 docx/xlsx 就能进索引）。
+    if ext in ('.doc', '.xls', '.ppt', '.wps', '.et', '.dps', '.mobi', '.azw3'):
+        return f'{ext[1:]} 旧版格式，需另存为 docx/xlsx/pptx'
+    if ext == '.pdf':
+        # 只对较小的 PDF 做归因。pymupdf.open() 打开病态大文件同样会卡死，而这里是
+        # 在主线程里同步执行的，没有任何超时手段——为了一个归因标签不值得再冒一次险。
+        if sz > 3 * 1024 * 1024:
+            return '无文本'
         try:
             import pymupdf
         except Exception:
@@ -419,6 +510,18 @@ def index(scope_path):
     exclude = tuple(s.lower() for s in scope.get('exclude_dirs', []))
     rows = list(csv.reader(open(csvp, encoding='utf-8-sig')))[1:]
     con = init_db()
+    # 自愈：历史上有些 meta 条目 reason 为 NULL（记成「已索引成功」）却根本没有正文行——
+    # 旧版不支持的格式、库表迁移、或旧代码在插入正文前就写 meta 都会留下这种残迹。
+    # 它们永远命中 _needs() 的「不必重建」分支，于是永久隐身：文件明明在，就是搜不到。
+    # 删掉这些 meta 行，让本轮按正常流程重解一遍并写上真实原因。
+    try:
+        fixed = con.execute('DELETE FROM meta WHERE reason IS NULL AND path NOT IN '
+                            '(SELECT path FROM docs)').rowcount
+        if fixed:
+            con.commit()
+            print(f'  自愈 {fixed} 条「标为成功但无正文」的历史记录，本轮重新解析', flush=True)
+    except Exception:
+        pass
     meta_info = {r[0]: (r[1], r[2], r[3]) for r in
                  con.execute('SELECT path, indexed_at, size, mtime FROM meta')}
 
@@ -519,6 +622,14 @@ def index(scope_path):
     _prog(state='done', phase='', done=n_done, total=todo, ok=n_new, fail=n_fail,
           msg=f'完成，库内共 {total} 篇', k='m_index_done', a={'n': f'{total:,}'})
     print(f'完成：新索引 {n_new}，空/失败 {n_fail}，范围外/重复跳过 {n_skip}；库内共 {total} 篇')
+    # 归因汇总：一眼看出失败是「该补 OCR」还是「该转格式」，不用去翻数据库
+    try:
+        why = con.execute("SELECT COALESCE(reason,'?'), COUNT(*) FROM meta "
+                          "WHERE reason IS NOT NULL GROUP BY 1 ORDER BY 2 DESC").fetchall()
+        if why:
+            print('未入库归因：' + '、'.join(f'{r} {n}' for r, n in why))
+    except Exception:
+        pass
 
 SNIP_OPEN, SNIP_CLOSE = '\x01', '\x02'   # snippet 高亮标记用不可见控制字符
 
@@ -551,8 +662,11 @@ def _search_sql(q, ext=None, pf=None):
     extra += clause
     args += eargs
     if pf:
-        extra += ' AND path LIKE ?'
-        args.append(f'%{pf}%')
+        # 只能用 instr，不能用 path LIKE：docs 是 trigram 分词的 FTS5 虚表，LIKE 会被
+        # FTS5 的 trigram 优化接管，而 path 是 UNINDEXED 列、没有三元组可查，
+        # 于是「3 个字符以上的路径过滤」会静默返回 0 条（2 个字符走不到优化，反而正常）。
+        extra += ' AND instr(lower(path), lower(?)) > 0'
+        args.append(pf)
     toks = _fts_tokens(q)
     if not _need_like(q):
         sql = ("SELECT path, snippet(docs,2,char(1),char(2),'…',10) FROM docs "
@@ -565,14 +679,71 @@ def _search_sql(q, ext=None, pf=None):
            "WHERE " + like + extra + " LIMIT ?")
     return sql, [toks[0] if toks else '', *[f'%{t}%' for t in toks], *args]
 
+def _mark_name(p, toks):
+    """给「文件名命中」的结果做片段：取文件名，把命中的词打上高亮标记。
+    标记用控制字符而不是 <b>，前端统一交给 hl() 处理，避免双重转义。"""
+    name = os.path.basename(p)
+    low, spans = name.lower(), []
+    for t in toks:
+        tl, start = t.lower(), 0
+        while tl:
+            i = low.find(tl, start)
+            if i < 0:
+                break
+            spans.append((i, i + len(tl)))
+            start = i + len(tl)
+    if not spans:
+        return name                      # 命中的是路径里的文件夹名，文件名本身没有，原样返回
+    spans.sort()
+    out, pos = [], 0
+    for a, b in spans:
+        if b <= pos:
+            continue
+        a = max(a, pos)
+        out.append(name[pos:a])
+        out.append(SNIP_OPEN + name[a:b] + SNIP_CLOSE)
+        pos = b
+    out.append(name[pos:])
+    return ''.join(out)
+
+def search_rows(con, q, limit=20, ext=None, path_filter=None):
+    """正文检索 + 文件名补充检索。
+
+    docs 里 path 是 UNINDEXED 列，FTS 根本看不到文件名，于是「文件名里有、正文里没有」
+    的文档搜不出来（实际用起来这正是最常见的抱怨点）。正文命中不够时再扫一遍路径：
+    万级路径的 LIKE 是毫秒级，不用为它加索引列——那会逼着所有人重建整个索引。"""
+    sql, args = _search_sql(q, ext, path_filter)
+    hits = con.execute(sql, (*args, limit)).fetchall()
+    if len(hits) >= limit:
+        return hits
+    toks = _fts_tokens(q)
+    if not toks:
+        return hits
+    clause, eargs = _ext_clause(ext)
+    sql2 = ('SELECT path FROM docs WHERE '
+            + ' AND '.join(['instr(lower(path), lower(?)) > 0'] * len(toks)) + clause
+            + (' AND instr(lower(path), lower(?)) > 0' if path_filter else '') + ' LIMIT ?')
+    a2 = list(toks) + list(eargs)
+    if path_filter:
+        a2.append(path_filter)
+    a2.append(limit + len(hits))
+    seen = {p for p, _ in hits}
+    for (p,) in con.execute(sql2, a2):
+        if p in seen:
+            continue
+        seen.add(p)
+        hits.append((p, _mark_name(p, toks)))
+        if len(hits) >= limit:
+            break
+    return hits
+
 def search(q, limit=20, ext=None, path_filter=None):
     con = init_db()
     con_row = con.execute('SELECT count(*) FROM docs').fetchone()[0]
     if con_row == 0:
         print('索引为空，先运行 index 建库')
         return
-    sql, args = _search_sql(q, ext, path_filter)
-    hits = con.execute(sql, (*args, limit)).fetchall()
+    hits = search_rows(con, q, limit, ext, path_filter)
     for p, snip in hits:
         print(f'{p}\n    {snip}'.replace('\n', ' '))
     print(f'-- {len(hits)} 条')
@@ -1180,15 +1351,25 @@ if(Q0){qEl.value=Q0;go()}
             self.end_headers()
             self.wfile.write(body)
         def _search(self, q, ext=None, pf=None):
-            con = init_db()
-            sql, args = _search_sql(q, ext, pf)
-            return con.execute(sql, (*args, 30)).fetchall()
+            return search_rows(init_db(), q, 30, ext, pf)
     return HTTPServer(('127.0.0.1', port), H)
 
 def serve(port=8765):
     """浏览器模式：直接跑网页界面；想要独立桌面窗口用 app_window.py"""
     import webbrowser
-    srv = make_server(port)
+    try:
+        srv = make_server(port)
+    except OSError:
+        # 端口被占（常见：上次的窗口没关干净）。往上找几个空位，别直接甩一段报错出来
+        for p in range(port + 1, port + 12):
+            try:
+                srv, port = make_server(p), p
+                break
+            except OSError:
+                continue
+        else:
+            print(f'[!] {port}-{port + 11} 都被占用，请关掉占用端口的程序后重试')
+            sys.exit(1)
     threading.Timer(1.2, webbrowser.open, args=(f'http://127.0.0.1:{port}',)).start()
     print(f'第二大脑已启动：http://127.0.0.1:{port}（关闭本窗口即停止服务）')
     srv.serve_forever()
@@ -1201,10 +1382,17 @@ def cli(argv=None):
         return
     cmd = argv[0]
     if cmd == 'index':
+        if len(argv) < 2:
+            print('用法：python brain.py index scope.json\n'
+                  '      （没有 scope.json 就用 python brain.py 打开界面，点「智能扫描」自动生成）')
+            sys.exit(1)
         index(argv[1])
     elif cmd == 'update':
         update()
     elif cmd == 'search':
+        if len(argv) < 2:
+            print('用法：python brain.py search 关键词 [条数] [扩展名] [路径过滤]')
+            sys.exit(1)
         search(argv[1], int(argv[2]) if len(argv) > 2 else 20,
                argv[3] if len(argv) > 3 else None, argv[4] if len(argv) > 4 else None)
     elif cmd == 'prune':
@@ -1213,9 +1401,10 @@ def cli(argv=None):
         # 内部子命令：由 extract_text_safe() 以子进程方式调用，结果写到临时文件。
         # 不走 stdout 管道——管道会让母进程在超时收尾时永久阻塞。
         try:
-            payload = {'t': extract_text(Path(argv[1])), 'w': None}
+            # 'p' 是请求的路径：回传文件是全进程复用的，父进程靠它确认这份结果没串篇
+            payload = {'p': argv[1], 't': extract_text(Path(argv[1])), 'w': None}
         except Exception as e:
-            payload = {'t': None, 'w': f'解析异常（{type(e).__name__}）'}
+            payload = {'p': argv[1], 't': None, 'w': f'解析异常（{type(e).__name__}）'}
         Path(argv[2]).write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
     elif cmd == 'serve':
         serve(int(argv[1]) if len(argv) > 1 else 8765)

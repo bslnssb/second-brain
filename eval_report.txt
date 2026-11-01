@@ -1,17 +1,19 @@
 第二大脑 v6.0 质量自检与评测报告
-时间: 2026-11-01 19:20:48
-Python 3.12.10 | SQLite 3.49.1 | pymupdf 有 | rapidocr 有
+时间: 2026-11-01 20:16:41
+Python 3.13.14 | SQLite 3.53.1 | pymupdf 有 | rapidocr 有
 ------------------------------------------------------------
 [PASS] A1 检索评测 recall@3 = 5/5 —— recall@1=5/5, MRR=1.000
 [PASS] A2 相关度排序（重复关键词多的文档排前） —— bm25 排序生效
 [PASS] A3 加密 PDF 不入库不可检索 —— 确认零泄漏
 [PASS] B 双抽取器一致性 pypdf vs pymupdf = 1.00 —— 两个独立实现对同一基准页给出的文本一致
-[PASS] C OCR 字符错误率 CER = 7.3% —— 标准答案 21 字，识别 20 字
+[PASS] C OCR 字符错误率 CER = 4.8% —— 标准答案 21 字，识别 21 字
 [PASS] D 畸形文件 fuzz：9 例 —— 全部安全返回，零崩溃
-[PASS] E SQLite/FTS5 完整性检查，库内 5 篇（预期 5） —— integrity_check + FTS5 integrity-check 双检通过
+[PASS] E SQLite/FTS5 完整性检查，库内 6 篇（预期 6） —— integrity_check + FTS5 integrity-check 双检通过
 [PASS] F 文件变更自动重索引 —— 改过的文件新内容立即可搜
 [PASS] G1 失败归因（加密件记为「加密」） —— reason=加密
 [PASS] G2 prune 清理已删除文件 —— 删除文件后索引同步清理
+[PASS] H1 文件名参与检索 —— 正文里没有、文件名有的文档可以搜到
+[PASS] H2 路径过滤生效 —— 命中 1 条 / 不存在的路径 0 条
 ------------------------------------------------------------
-10 项通过 / 0 失败 / 0 跳过
+12 项通过 / 0 失败 / 0 跳过
 OVERALL: PASS

@@ -15,7 +15,7 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 - **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
 - **Automatic OCR for scans** — image-only PDFs get their first 15 pages recognised offline (RapidOCR); no network after install
-- **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / HTML / TXT / MD
+- **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
 - **Incremental maintenance** — modified files are re-indexed, deleted files are pruned, unchanged files are skipped instantly
 - **Resumable indexing** — interrupt a 50k-file build and restart it; it continues where it stopped
 - **Bilingual UI** — the web interface has a 中 / EN switch in the top-right corner; it follows your browser language by default and remembers your choice
@@ -100,13 +100,14 @@ own scan root automatically (since v6.0), so nothing is missed.
 | .pdf | Yes | pypdf reads the first 20 pages; image-only files get OCR on the first 15 (60 s budget) |
 | .docx / .pptx / .xlsx / .epub | Yes | zip + XML unpacking, no external dependencies |
 | .html / .htm | Yes | Tags stripped, body text kept |
-| .doc (legacy binary) | No | OLE2 compound format; pure-Python parsing is unreliable. Convert to .docx with WPS/LibreOffice first |
-| .rtf | No | Not implemented |
+| .rtf | Yes | Control words stripped; Chinese is decoded with the document's own `\ansicpg` codepage, so `\'b1\'a3`-style GBK and `\uNNNN` escapes both survive |
+| .doc / .xls / .ppt / .wps / .et / .dps / .mobi | No | Legacy binary Office / ebook formats; pure-Python parsing is unreliable. Convert to .docx / .xlsx / .pptx with WPS or LibreOffice first |
 | Vendor-encrypted documents | No | Files with an abnormal header are recorded as “encrypted” and skipped; they never pollute the index |
 | Body length | 2 MB cap | Longer text is truncated so one giant file can't stall the index |
 
 Files that fail to yield text are recorded with a reason in the `meta` table (encrypted / corrupted /
-empty / temp file) and can be inspected in the UI or the `update` log — nothing disappears silently.
+empty / temp file / legacy format). The end of an index run prints a breakdown by reason, so you can
+tell at a glance whether you need OCR or a format conversion — nothing disappears silently.
 
 ## Search syntax
 
@@ -114,8 +115,12 @@ Plain keywords work. Multiple space-separated words are combined with AND, and e
 as a literal phrase, so `C++`, `node.js`, `a-b`, `"quoted"` and `(parens)` are all safe to type —
 they never trigger an FTS syntax error.
 
+**File names are searched too.** If a keyword appears in a file's name but not in its body, the
+document is still returned, with the name highlighted — so searching “2026 budget” finds
+`2026-budget-draft.xlsx` even when the sheet itself never spells it out.
+
 Filters: the **Type** box takes an extension (`pdf`, `docx`, …), the **Path contains** box filters by
-substring of the full path.
+substring of the full path (case-insensitive).
 
 ### URL parameters
 
