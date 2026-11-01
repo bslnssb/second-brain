@@ -97,7 +97,7 @@ own scan root automatically (since v6.0), so nothing is missed.
 | Format | Supported | Notes |
 |---|---|---|
 | .txt / .md | Yes | Detects utf-8 / gbk / utf-16, gb18030 as a fallback |
-| .pdf | Yes | pypdf reads the first 60 pages; image-only files get OCR on the first 15 |
+| .pdf | Yes | pypdf reads the first 20 pages; image-only files get OCR on the first 15 (60 s budget) |
 | .docx / .pptx / .xlsx / .epub | Yes | zip + XML unpacking, no external dependencies |
 | .html / .htm | Yes | Tags stripped, body text kept |
 | .doc (legacy binary) | No | OLE2 compound format; pure-Python parsing is unreliable. Convert to .docx with WPS/LibreOffice first |

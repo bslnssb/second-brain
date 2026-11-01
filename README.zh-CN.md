@@ -96,7 +96,7 @@ python brain.py selftest                               # 质量自检，报告�
 | 格式 | 支持 | 说明 |
 |---|---|---|
 | .txt / .md | 是 | 自动识别 utf-8 / gbk / utf-16，另有 gb18030 兜底 |
-| .pdf | 是 | pypdf 抽前 60 页；纯扫描件自动 OCR 前 15 页 |
+| .pdf | 是 | pypdf 抽前 20 页；纯扫描件自动 OCR 前 15 页（单篇 60 秒预算） |
 | .docx / .pptx / .xlsx / .epub | 是 | zip + XML 解包取文本，无外部依赖 |
 | .html / .htm | 是 | 去标签取正文 |
 | .doc（旧二进制） | 否 | OLE2 复合格式，纯 Python 解析不可靠；建议先用 WPS/LibreOffice 批量转 .docx |

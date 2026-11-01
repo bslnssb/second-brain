@@ -37,9 +37,10 @@ def app_dir():
 
 DB = app_dir() / 'brain.db'
 MAX_BODY = 2 * 1024 * 1024  # 单文档正文上限 2MB
-OCR_PAGES = 15              # OCR 最多识别前 N 页（扫描件整本太慢，前 15 页足够建立搜索特征）
+OCR_PAGES = 6               # OCR 最多识别前 N 页：建搜索特征用不着整本，页数越多单篇越慢
 OCR_DPI = 180               # 渲染清晰度，实测中文识别够用
-OCR_BUDGET = 60             # 单篇 OCR 的时间预算（秒），到点就用已识别的部分
+OCR_BUDGET = 45             # 单篇 OCR 的时间预算（秒），到点就用已识别的部分
+PDF_MAX_SIZE = 80 * 1024 * 1024   # 超过这个体积的 PDF 直接跳过（整本扫描图集）
 
 # 更新进度（网页/桌面窗口轮询展示用）
 # k + a 是给前端的语言无关消息（k 为文案键，a 为插值参数）；msg 保留中文原文作兜底，
@@ -194,7 +195,17 @@ def ocr_pdf(path: Path, budget=OCR_BUDGET):
             for i, page in enumerate(doc):
                 if i >= OCR_PAGES or time.time() - t0 > budget:
                     break
-                pix = page.get_pixmap(matrix=pymupdf.Matrix(OCR_DPI / 72, OCR_DPI / 72))
+                r = page.rect
+                if r.width < 1 or r.height < 1:
+                    continue
+                # 限制输出像素：有的扫描件是超长拼接图（几十万像素高），按固定 DPI 渲染
+                # 会生成上亿像素的位图，pymupdf 在 C 层算好几分钟且**不释放 GIL**——
+                # 此时连上一层的 threading.join(timeout) 都返回不了，整轮索引直接卡死
+                # （实测卡 13 分钟不止）。这里把长边压到 2200px，足够 OCR 认字。
+                z = min(OCR_DPI / 72, 2200 / max(r.width, r.height))
+                if z < 0.05:
+                    continue
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
                 res, _ = ocr(pix.tobytes('png'))
                 if res:
                     parts.append('\n'.join(line[1] for line in res))
@@ -246,7 +257,9 @@ def extract_text(path: Path):
         try:
             from pypdf import PdfReader
             r = PdfReader(str(path))
-            text = '\n'.join((p.extract_text() or '') for p in r.pages[:60])[:MAX_BODY]
+            # 只读前 20 页：扫描版教材/笔记每页都要解码大图，60 页能跑上好几分钟，
+            # 而判断「有没有文本层」20 页足够了
+            text = '\n'.join((p.extract_text() or '') for p in r.pages[:20])[:MAX_BODY]
         except Exception:
             text = None
         if not (text and len(text.strip()) >= 100):
@@ -288,7 +301,7 @@ def extract_text(path: Path):
             return None
     return None
 
-EXTRACT_TIMEOUT = 200        # 单个文件的解析上限（秒）；要给 OCR 预算留出余量
+EXTRACT_TIMEOUT = 90         # 单个文件的解析上限（秒）；要给 OCR 预算留出余量
 EXTRACT_MAX_THREADS = 4      # 允许同时残留在后台的超时线程数
 
 _live_extracts = []
@@ -304,8 +317,12 @@ def extract_text_safe(path: Path):
     主流程先等一等，否则几十个线程一起抢 CPU，反而把整轮索引拖死（实测堆到 59 个）。"""
     global _live_extracts
     _live_extracts = [t for t in _live_extracts if t.is_alive()]
-    while len(_live_extracts) >= EXTRACT_MAX_THREADS:
+    # 最多等 10 秒：某些 PDF 会让 pypdf 跑上十几分钟，若在这里死等，
+    # 主流程就被这几个线程一起锁死了（实测卡住 5 分钟不动）。宁可让线程多堆几个。
+    waited = 0.0
+    while len(_live_extracts) >= EXTRACT_MAX_THREADS and waited < 10:
         time.sleep(0.5)
+        waited += 0.5
         _live_extracts = [t for t in _live_extracts if t.is_alive()]
 
     box = {}
@@ -429,6 +446,14 @@ def index(scope_path):
             st = os.stat(p)
         except OSError:
             n_skip += 1
+            continue
+        if p.lower().endswith('.pdf') and st.st_size > PDF_MAX_SIZE:
+            # 几百 MB 的 PDF 基本是整本书的图像扫描/图集，解析要几分钟且几乎提不出文本
+            n_fail += 1
+            n_done += 1
+            con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
+                        'VALUES(?,?,?,?,?)',
+                        (p, time.time(), st.st_size, st.st_mtime, '文件过大（PDF）'))
             continue
         text, why = extract_text_safe(Path(p))
         if text and not why:
