@@ -796,7 +796,10 @@ e_query:'Query error (3+ characters works best): {e}'
 }};
 const $=id=>document.getElementById(id);
 const qEl=$('q'),tEl=$('t'),dEl=$('d'),rEl=$('r');
-let LANG=(function(){try{const v=localStorage.getItem('sb_lang');if(v==='zh'||v==='en')return v}catch(e){}
+let LANG=(function(){
+const q=(new URLSearchParams(location.search)).get('lang');   // ?lang=en 可强制指定语言
+if(q==='zh'||q==='en')return q;
+try{const v=localStorage.getItem('sb_lang');if(v==='zh'||v==='en')return v}catch(e){}
 return (navigator.language||'zh').toLowerCase().indexOf('zh')===0?'zh':'en'})();
 const T=k=>{const d=DICT[LANG];return d[k]!==undefined?d[k]:(DICT.zh[k]!==undefined?DICT.zh[k]:k)};
 const F=(s,a)=>String(s).replace(/\{(\w+)\}/g,(m,k)=>a&&a[k]!==undefined?a[k]:m);
@@ -930,6 +933,9 @@ if(s.state==='done'){$('pi').style.width='100%';pm.textContent=F(T('done_reload'
 setTimeout(()=>location.reload(),2500)}
 else if(s.state==='error'){$('pw').style.display='none';pm.textContent=T('err_prefix')+(smsg(s)||'')}}},800)}
 cfgLoad();applyLang();
+// ?q=关键词 直接出结果：方便收藏常用搜索，或从命令行直接打开结果页
+const Q0=(new URLSearchParams(location.search)).get('q');
+if(Q0){qEl.value=Q0;go()}
 </script></body></html>'''
     import os
     from urllib.parse import urlparse, parse_qs
