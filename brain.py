@@ -282,6 +282,32 @@ def extract_text(path: Path):
             return None
     return None
 
+EXTRACT_TIMEOUT = 90   # 单个文件的解析上限（秒）
+
+def extract_text_safe(path: Path):
+    """带超时的提取，返回 (text, reason)。
+
+    个别文件会让解析库卡死十几分钟：实测一个 9MB 的矢量「思维导图」PDF 能让 pypdf
+    吃到 2.5GB 内存还不返回，整轮索引就此停滞（进度条几十分钟不动）。索引不能被
+    单个文件拖住，所以超时就跳过并记下原因，回头能查是哪个文件。
+    注意：超时后那个线程仍会在后台跑完（Python 无法强杀线程），只是不再阻塞主流程。"""
+    box = {}
+
+    def work():
+        try:
+            box['t'] = extract_text(path)
+        except Exception as e:
+            box['e'] = e
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(EXTRACT_TIMEOUT)
+    if th.is_alive():
+        return None, f'解析超时（>{EXTRACT_TIMEOUT}s）'
+    if 'e' in box:
+        return None, f'解析异常（{type(box["e"]).__name__}）'
+    return box.get('t'), None
+
 def init_db():
     con = sqlite3.connect(DB)
     con.execute('PRAGMA journal_mode=WAL')   # 读写并发：建索引时搜索不再被锁死
@@ -386,17 +412,18 @@ def index(scope_path):
         except OSError:
             n_skip += 1
             continue
-        text = extract_text(Path(p))
-        if text:
+        text, why = extract_text_safe(Path(p))
+        if text and not why:
             # 清洗孤立代理字符（个别破损 PDF 会抽出 \ud800-\udfff，SQLite/FTS 拒收）
             text = text.encode('utf-8', 'ignore').decode('utf-8')
         if not text or not text.strip():
             n_fail += 1
             n_done += 1
             _prog(done=n_done, ok=n_new, fail=n_fail)
+            # 超时/异常的别再调 _fail_reason 二次打开文件（那本身也可能是卡点）
             con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
                         'VALUES(?,?,?,?,?)',
-                        (p, time.time(), st.st_size, st.st_mtime, _fail_reason(Path(p))))
+                        (p, time.time(), st.st_size, st.st_mtime, why or _fail_reason(Path(p))))
             continue
         con.execute('DELETE FROM docs WHERE path=?', (p,))  # 变更重建时先清旧行
         con.execute('INSERT INTO docs VALUES(?,?,?)', (p, Path(p).suffix.lower(), text))
@@ -417,6 +444,11 @@ def index(scope_path):
     try:
         con.execute("INSERT INTO docs(docs) VALUES('optimize')")  # 收紧 FTS 索引，查询更快
         con.commit()
+    except Exception:
+        pass
+    try:
+        # 索引期间 WAL 会一路长到接近 1GB（实测 895MB），结束时收回去
+        con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
     except Exception:
         pass
     total = con.execute('SELECT count(*) FROM docs').fetchone()[0]
