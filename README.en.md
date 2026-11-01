@@ -11,6 +11,11 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 ---
 
+![Second Brain searching for a term: 7 matches, each showing the exact lines that matched with the keyword highlighted](assets/screenshot-en.png)
+
+<p align="center"><sub>Same index, switched to Chinese in the top-right corner — the UI language never changes what gets indexed</sub><br>
+<img src="assets/screenshot-zh.png" width="620" alt="Second Brain Chinese interface"></p>
+
 ## Features
 
 - **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
@@ -198,6 +203,7 @@ update.bat          Windows: rescan → index → prune in one click
 build_exe.bat       Windows: build both executables (needs PyInstaller)
 second-brain-app.spec   PyInstaller config, full edition (with OCR)
 second-brain-core.spec  PyInstaller config, core edition (no OCR)
+assets/             UI screenshots and app icon used by the READMEs
 README.en.md        this document (README.md is the Chinese version)
 brain.db            (generated) SQLite index — docs = FTS5 table, meta = processed files
 scan_raw.csv        (generated) last scan candidate list

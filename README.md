@@ -11,6 +11,11 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 
 ---
 
+![第二大脑界面：搜索「文档」，命中 7 篇，每条显示命中的那几行并高亮关键词](assets/screenshot-zh.png)
+
+<p align="center"><sub>同一份索引库，右上角切到 English 就是这样 —— 界面语言不影响索引内容</sub><br>
+<img src="assets/screenshot-en.png" width="620" alt="第二大脑英文界面"></p>
+
 ## 特性
 
 - **中文全文搜索**：≥3 字走 FTS5 trigram 倒排（快且带高亮），1~2 字自动降级 LIKE 兜底
@@ -191,6 +196,7 @@ update.bat          Windows：一键完成 重扫 → 索引 → 清理
 build_exe.bat       Windows：打包两个版本的可执行程序（需 PyInstaller）
 second-brain-app.spec   完整版打包配置（含 OCR）
 second-brain-core.spec  精简版打包配置（不含 OCR）
+assets/             README 里的界面截图与应用图标
 README.en.md        本文档的英文版
 brain.db            （运行时生成）SQLite 索引库，docs=FTS5 表，meta=已处理清单
 scan_raw.csv        （运行时生成）最近一次扫描清单
