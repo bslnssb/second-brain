@@ -206,19 +206,32 @@ class _HTML(HTMLParser):
         if d.strip():
             self.parts.append(d.strip())
 
+def _decode_text(raw: bytes):
+    """猜文本编码。顺序很重要：GBK 几乎能"成功"解码任意字节序列，
+    所以必须先认 BOM、再严格试 UTF-8，最后才轮到 GBK/GB18030。
+    原实现按 utf-8 → gbk → utf-16 排，UTF-16 文件会被 GBK 抢先解成乱码，
+    utf-16 那一档永远走不到（Windows 记事本存"Unicode"就是 UTF-16，很常见）。"""
+    if raw.startswith(b'\xef\xbb\xbf'):
+        return raw.decode('utf-8-sig', errors='ignore')
+    if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+        try:
+            return raw.decode('utf-16', errors='ignore')
+        except Exception:
+            pass
+    for cut in range(4):                    # 截断可能切在多字节字符中间，回退几个字节再试
+        try:
+            return raw[:len(raw) - cut].decode('utf-8') if cut else raw.decode('utf-8')
+        except UnicodeDecodeError:
+            continue
+    try:
+        return raw.decode('gbk')
+    except UnicodeDecodeError:
+        return raw.decode('gb18030', errors='replace')
+
 def extract_text(path: Path):
     ext = path.suffix.lower()
     if ext in ('.txt', '.md'):
-        raw = path.read_bytes()[:MAX_BODY * 3]
-        for enc in ('utf-8', 'gbk', 'utf-16'):
-            try:
-                return raw.decode(enc)
-            except (UnicodeDecodeError, UnicodeError):
-                continue
-        try:
-            return raw.decode('gb18030', errors='replace')  # 古怪编码兜底，宁可出乱码也不漏文件
-        except Exception:
-            return None
+        return _decode_text(path.read_bytes()[:MAX_BODY * 3])
     if ext == '.pdf':
         try:
             from pypdf import PdfReader
@@ -237,13 +250,17 @@ def extract_text(path: Path):
             texts = []
             with zipfile.ZipFile(path) as z:
                 for n in z.namelist():
-                    if not n.endswith('.xml'):
-                        continue
-                    if ext != '.epub' and n not in (
-                            'word/document.xml', 'ppt/slides/slide1.xml', 'xl/sharedStrings.xml') \
-                            and not n.startswith('ppt/slides/slide'):
-                        continue
-                    if ext == '.epub' and '.html' not in n:
+                    low = n.lower()
+                    if ext == '.docx':
+                        keep = low == 'word/document.xml'
+                    elif ext == '.pptx':
+                        keep = low.startswith(('ppt/slides/slide', 'ppt/notesslides/'))
+                    elif ext == '.xlsx':
+                        # 单元格文本多数进 sharedStrings；用内联字符串(inlineStr)存的则只在 sheet 里
+                        keep = low == 'xl/sharedstrings.xml' or low.startswith('xl/worksheets/sheet')
+                    else:  # .epub：正文是 .xhtml，之前只认 .xml 导致一个文件都读不到
+                        keep = low.endswith(('.xhtml', '.html', '.htm', '.xml'))
+                    if not keep:
                         continue
                     xml = z.read(n).decode('utf-8', errors='replace')[:MAX_BODY]
                     texts.append(re.sub(r'<[^>]+>', ' ', xml))
