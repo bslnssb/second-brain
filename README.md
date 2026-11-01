@@ -1,210 +1,203 @@
-# Second Brain
+# 第二大脑 · Local Second Brain
 
-**English** | [简体中文](README.zh-CN.md)
+**简体中文** | [English](README.en.md)
 
-Turn the documents scattered across your hard drive into a local knowledge base you can actually search. **Full-text search, CJK-friendly, completely offline** — no cloud, no indexing service, no account.
+把你硬盘上散落多年的文档，变成一个能搜的本地知识库。**全文搜索、中文友好、全程离线**，不传云端、不建索引服务、不依赖任何账号。
 
-Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it works with the network cable unplugged.
+Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可用。
 
-> Why not Everything? Everything searches file *names*. This searches what's written *inside* the files.
-> Why not an online note app? Your contracts, medical records and internal training material don't belong on someone else's server.
+> 为什么不是 Everything？Everything 只搜文件名。这里搜的是**文件里写了什么**。
+> 为什么不用在线笔记？你的合同、病例、内部培训资料不该上传到别人服务器。
 
 ---
 
-## Features
+## 特性
 
-- **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
-- **Automatic OCR for scans** — image-only PDFs get their first 15 pages recognised offline (RapidOCR); no network after install
-- **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
-- **Incremental maintenance** — modified files are re-indexed, deleted files are pruned, unchanged files are skipped instantly
-- **Resumable indexing** — interrupt a 50k-file build and restart it; it continues where it stopped
-- **Bilingual UI** — the web interface has a 中 / EN switch in the top-right corner; it follows your browser language by default and remembers your choice
-- **Quality self-test (rare, but it matters)** — `python brain.py selftest` validates retrieval accuracy, cross-checks two PDF extractors, measures OCR character error rate, fuzzes 9 kinds of malformed files and checks database integrity. The report is reproducible by anyone
-- **Zero upload** — every parser runs locally; the HTTP server binds to `127.0.0.1` only
+- **中文全文搜索**：≥3 字走 FTS5 trigram 倒排（快且带高亮），1~2 字自动降级 LIKE 兜底
+- **扫描件自动 OCR**：纯图片 PDF 自动识别前 15 页，离线中文识别（RapidOCR），装好后零联网
+- **格式覆盖广**：PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
+- **增量维护**：改过的文件自动重索引，删掉的自动清理，已索引的秒跳过
+- **断点续建**：索引几万篇时中断也不要紧，重跑从断点继续
+- **中英双语界面**：网页右上角有 中 / EN 切换，默认跟随浏览器语言，选择会记住
+- **质量自检（少见但重要）**：`python brain.py selftest` 用合成数据独立验证检索准确率、双 PDF 引擎交叉比对、OCR 字符错误率、9 类畸形文件 fuzz、数据库完整性，报告可任何人重跑复核
+- **零上传**：所有解析在本机完成，服务只绑 `127.0.0.1`
 
-## Two ways to run it
+## 两种用法
 
-| Way | Who it's for | How to start |
+| 方式 | 适合谁 | 怎么开始 |
 |---|---|---|
-| **Download the exe** (no install) | You'd rather not touch a terminal | From [Releases](https://github.com/bslnssb/second-brain/releases/latest) take `SecondBrain-Windows.zip` (with OCR, 157 MB download / ~320 MB unpacked) or `SecondBrain-Core-Windows.zip` (no OCR, 25 MB / ~52 MB), unzip anywhere, double-click `SecondBrain.exe` |
-| **Run from source** | You want to read or change the code | Follow *Install* below |
+| **下载 exe**（免安装） | 不想碰命令行 | 去 [Releases](https://github.com/bslnssb/second-brain/releases/latest) 下 `SecondBrain-Windows.zip`（带 OCR，下载 157MB，解压后约 320MB）或 `SecondBrain-Core-Windows.zip`（不带 OCR，下载 25MB，解压后约 52MB），解压到任意文件夹，双击 `SecondBrain.exe` 即开窗口 |
+| **从源码跑** | 想改代码 / 想看清每一步 | 按下面「安装」走，装好依赖再启动 |
 
-The exe and the source version read and write the **same** `brain.db`, so you can mix them — drop the exe next to an existing library and it picks it up automatically.
+exe 版和源码版读写**同一个** `brain.db`，两者可以混用；把 exe 丢进已有索引库的目录，它会自动认旁边的库。
 
-Both editions are a **folder, not a single file**: `_internal/` next to the exe is part of the program.
-Move the whole folder; pulling the exe out on its own leaves it unable to start.
+两个版本都是**整个文件夹**，不是单个文件：exe 旁边的 `_internal/` 是程序的一部分。
+要移动就整夹移动——只把 exe 单独拎出来会打不开。
 
-The core edition gives up OCR and nothing else — image-only PDFs get no text (recorded as “no text” in the
-failure breakdown), while text-based PDFs, Office files, EPUB and the rest behave identically.
+精简版只砍了 OCR，别的没动：扫描版 PDF 提不出文字（在失败归因里记为「无文本」），
+文本型 PDF、Office、EPUB 等等表现完全一样。
 
-## Install
+## 安装
 
-Python 3.10+ required (3.12 recommended).
+需要 Python 3.10+（推荐 3.12）。
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Create your scope configuration:
+首次使用把范围配置准备好：
 
 ```bash
 cp scope.example.json scope.json    # Windows: copy scope.example.json scope.json
 ```
 
-Edit `scope.json` and put your folders in `include_dirs` (lowercase paths; backslashes must be doubled).
+编辑 `scope.json`，把你自己的目录写进 `include_dirs`（路径全小写，反斜杠要写成 `\\`）。
 
-## Usage
+## 用法
 
 ```bash
-python scan_docs.py                 # 1. scan disks, write the candidate list (paths only, contents untouched)
-python brain.py index scope.json    # 2. build the index (resumable, shows count / rate / ETA)
-python brain.py serve               # 3. open the web UI at http://127.0.0.1:8765
+python scan_docs.py                 # 1. 扫描磁盘，生成待索引进清单（只记路径，不读内容）
+python brain.py index scope.json    # 2. 建索引（断点续建，实时显示 篇数/速率/ETA）
+python brain.py serve               # 3. 打开网页界面 http://127.0.0.1:8765
 ```
 
-Routine maintenance is one command (rescan → incremental index → prune stale entries):
+日常维护一条命令搞定（重扫 → 增量索引 → 清理失效条目）：
 
 ```bash
 python brain.py update
 ```
 
-Other commands:
+其他：
 
 ```bash
-python brain.py search <keywords> [limit] [ext] [path-contains]   # search from the terminal
-python brain.py prune                                            # only remove entries for vanished files
-python brain.py selftest                                         # quality self-test → eval_report.txt
+python brain.py search 关键词 [条数] [扩展名] [路径含]   # 命令行搜索
+python brain.py prune                                  # 只清理已删除文件的条目
+python brain.py selftest                               # 质量自检，报告写入 eval_report.txt
 ```
 
-### Desktop window
+### 桌面窗口版
 
-Don't want a console window? Run `python app_window.py` (or double-click `start.bat` on Windows): it opens a
-**standalone desktop window** via pywebview — not a browser tab — backed by the local HTTP server.
-If pywebview isn't installed it falls back to your default browser.
+不想看到命令行窗口，运行 `python app_window.py`（Windows 上也可双击 `start.bat` 或 `启动第二大脑.bat`）：它用 pywebview 起一个**独立桌面窗口**
+（不是浏览器标签页），背后跑本机的 HTTP 服务。没装 pywebview 时自动退回浏览器打开。
 
-`update.bat` is the routine maintenance entry point — it's the same as `python brain.py update`.
+`update.bat`（或 `更新第二大脑.bat`）是日常维护入口，等价于 `python brain.py update`。
 
-## Configuring the index scope
+## 索引范围配置
 
-Two fields matter in `scope.json`:
+`scope.json` 两个关键字段：
 
-| Field | Meaning |
+| 字段 | 说明 |
 |---|---|
-| `include_dirs` | Folders to index, matched by path prefix. Lowercase, doubled backslashes on Windows |
-| `exclude_dirs` | Keywords; any path containing one is skipped |
+| `include_dirs` | 要索引的目录，前缀匹配。路径写小写，Windows 反斜杠要双写 |
+| `exclude_dirs` | 排除的关键词，命中路径任意片段即跳过 |
 
-`scan_docs.py` adds a second safety net: any directory whose name contains 「小说 / 书城 / 书架 / novel / fiction / 轻小说」 is never touched — it doesn't even appear in the candidate list.
+`scan_docs.py` 另有一层保险：目录名含「小说 / 书城 / 书架 / novel / fiction / 轻小说」等关键词的整棵子树零接触，连扫描清单里都不会出现。
 
-**If your documents live under a system folder such as `C:\Program Files`** (portable installs, for example):
-those folders are on the scanner's skip list. List them in `include_dirs` and each one is added as its
-own scan root automatically (since v6.0), so nothing is missed.
+**如果你的资料放在 `C:\Program Files` 这类系统目录下**（比如便携式部署），注意 `scan_docs.py`
+的跳过名单里有这些目录。把该目录写进 `include_dirs` 后，它会自动作为独立扫描根加入
+（v6.0 起支持），不会漏扫。
 
-## Supported formats and known limits
+## 支持的格式与已知限制
 
-| Format | Supported | Notes |
+| 格式 | 支持 | 说明 |
 |---|---|---|
-| .txt / .md | Yes | Detects utf-8 / gbk / utf-16, gb18030 as a fallback |
-| .pdf | Yes | pypdf reads the first 20 pages; image-only files get OCR on the first 15 (60 s budget) |
-| .docx / .pptx / .xlsx / .epub | Yes | zip + XML unpacking, no external dependencies |
-| .html / .htm | Yes | Tags stripped, body text kept |
-| .rtf | Yes | Control words stripped; Chinese is decoded with the document's own `\ansicpg` codepage, so `\'b1\'a3`-style GBK and `\uNNNN` escapes both survive |
-| .doc / .xls / .ppt / .wps / .et / .dps / .mobi | No | Legacy binary Office / ebook formats; pure-Python parsing is unreliable. Convert to .docx / .xlsx / .pptx with WPS or LibreOffice first |
-| Vendor-encrypted documents | No | Files with an abnormal header are recorded as “encrypted” and skipped; they never pollute the index |
-| Body length | 2 MB cap | Longer text is truncated so one giant file can't stall the index |
+| .txt / .md | 是 | 自动识别 utf-8 / gbk / utf-16，另有 gb18030 兜底 |
+| .pdf | 是 | pypdf 抽前 20 页；纯扫描件自动 OCR 前 15 页（单篇 60 秒预算） |
+| .docx / .pptx / .xlsx / .epub | 是 | zip + XML 解包取文本，无外部依赖 |
+| .html / .htm | 是 | 去标签取正文 |
+| .rtf | 是 | 去控制字取正文；中文按文档自带的 `\ansicpg` 代码页解码，`\'b1\'a3` 这类 GBK 字节转义和 `\uNNNN` 都能正确还原 |
+| .doc / .xls / .ppt / .wps / .et / .dps / .mobi | 否 | 旧版二进制 Office / 电子书格式，纯 Python 解析不可靠；建议先用 WPS 或 LibreOffice 批量转 .docx / .xlsx / .pptx |
+| 企业加密文档 | 否 | 文件头异常的加密件会记为「加密」并跳过，不会污染索引 |
+| 单文档正文 | 2MB 上限 | 超长部分截断，避免个别巨型文件拖垮索引 |
 
-Files that fail to yield text are recorded with a reason in the `meta` table (encrypted / corrupted /
-empty / temp file / legacy format). The end of an index run prints a breakdown by reason, so you can
-tell at a glance whether you need OCR or a format conversion — nothing disappears silently.
+索引失败的文件会在 `meta` 表里记原因（加密 / 损坏 / 空文件 / 临时文件 / 旧版格式），
+每轮索引结束会按原因汇总打印一行，一眼看出是该补 OCR 还是该转格式，不会静默丢失。
 
-## Search syntax
+## 搜索语法
 
-Plain keywords work. Multiple space-separated words are combined with AND, and every word is treated
-as a literal phrase, so `C++`, `node.js`, `a-b`, `"quoted"` and `(parens)` are all safe to type —
-they never trigger an FTS syntax error.
+直接输入关键词即可。多个词用空格分隔，按 AND 组合；每个词都当字面短语处理，
+所以 `C++`、`node.js`、`a-b`、`"引号"`、`(括号)` 都能直接搜，不会触发 FTS 语法错误。
 
-**File names are searched too.** If a keyword appears in a file's name but not in its body, the
-document is still returned, with the name highlighted — so searching “2026 budget” finds
-`2026-budget-draft.xlsx` even when the sheet itself never spells it out.
+**文件名也参与检索。** 关键词只出现在文件名里、正文里完全没有的文档照样能搜到，
+并且会把文件名里的命中处高亮出来——搜「2026 预算」能找到 `2026预算草案.xlsx`，
+哪怕表格里面一次都没写过这个词。
 
-Filters: the **Type** box takes an extension (`pdf`, `docx`, …), the **Path contains** box filters by
-substring of the full path (case-insensitive).
+两个过滤框：**类型**填扩展名（`pdf`、`docx`…），**路径包含**按完整路径的子串过滤（不区分大小写）。
 
-### URL parameters
+### URL 参数
 
-Handy for bookmarks and shortcuts:
+收藏常用搜索、做快捷方式时好用：
 
-| Parameter | Effect |
+| 参数 | 作用 |
 |---|---|
-| `?q=keyword` | Open the page with results already rendered |
-| `?lang=zh` / `?lang=en` | Force the interface language for this link |
+| `?q=关键词` | 打开就直接出结果 |
+| `?lang=zh` / `?lang=en` | 这条链接强制用指定语言 |
 
-Example: `http://127.0.0.1:8765/?q=invoice&lang=en`
+例：`http://127.0.0.1:8765/?q=报销标准&lang=zh`
 
-## Quality self-test
+## 质量自检
 
-`eval_report.txt` is a real report from an actual run:
+`eval_report.txt` 是一份真实跑出来的样例报告：
 
 ```
-[PASS] A1 retrieval recall@3 = 5/5 —— recall@1=5/5, MRR=1.000
-[PASS] A2 relevance ranking —— bm25 ordering effective
-[PASS] A3 encrypted PDF excluded —— zero leakage confirmed
-[PASS] B  dual extractor agreement pypdf vs pymupdf = 1.00
-[PASS] C  OCR character error rate CER = 7.3%
-[PASS] D  malformed-file fuzz: 9 cases —— zero crashes
-[PASS] E  SQLite/FTS5 integrity check
-[PASS] F  file-change auto re-index
-[PASS] G1 failure attribution / G2 prune
+[PASS] A1 检索评测 recall@3 = 5/5 —— recall@1=5/5, MRR=1.000
+[PASS] A2 相关度排序 —— bm25 排序生效
+[PASS] A3 加密 PDF 不入库不可检索 —— 确认零泄漏
+[PASS] B  双抽取器一致性 pypdf vs pymupdf = 1.00
+[PASS] C  OCR 字符错误率 CER = 7.3%
+[PASS] D  畸形文件 fuzz：9 例 —— 零崩溃
+[PASS] E  SQLite/FTS5 完整性检查
+[PASS] F  文件变更自动重索引
+[PASS] G1 失败归因 / G2 prune 清理
 OVERALL: PASS
 ```
 
-The whole run uses synthetic data in a temporary directory — **your real index is never touched**.
+自检全程使用合成数据，在临时目录建库，**不碰你的真实索引**。
 
-### QA suite (before release)
+### QA 套件（发布前跑）
 
-`selftest.py` answers "does it work". `qa_test.py` answers "does it hold up":
-boundary inputs (FTS syntax, wildcards, SQL-injection shapes, 5 000-character queries),
-latency on a real library, concurrent requests, resource leaks, the `/open` endpoint,
-and whether the English UI leaks Chinese. It runs read-only against your own index and
-writes `QA_REPORT.md`.
+`selftest.py` 回答「功能对不对」，`qa_test.py` 回答「扛不扛得住」：边界输入
+（FTS 语法、通配符、SQL 注入形状、5000 字长查询）、真实库上的延迟、并发请求、
+资源泄漏、`/open` 接口的越权、以及英文界面有没有漏中文。只读，跑完写 `QA_REPORT.md`。
 
 ```
-python qa_test.py            # full run
-python qa_test.py --quick    # skip concurrency / leak sections
+python qa_test.py            # 全量
+python qa_test.py --quick    # 跳过并发与泄漏两节
 ```
 
-Last run on an 8,626-document / 2.37 GB library: **98 pass, 0 fail, 1 warning**.
-The seven defects it caught — and the numbers behind the fixes — are in
-[QA_FINDINGS.md](QA_FINDINGS.md).
+最近一次在 8,626 篇 / 2.37 GB 的库上：**98 通过 / 0 失败 / 1 警告**。
+抓到的 7 个缺陷连同修复前后的数字见 [QA_FINDINGS.md](QA_FINDINGS.md)。
 
-## Privacy
+## 隐私
 
-- Parsing, OCR and indexing all happen locally; no network requests are made
-- The HTTP server binds to `127.0.0.1` only, validates Host/Origin, and accepts `application/json` POSTs only
-- The index is just `brain.db` next to the executable — delete it and everything is gone
-- `.gitignore` excludes `brain.db`, `scan_raw.csv` and `scope.json`: they contain document text and local paths
+- 正文解析、OCR、索引全部在本机完成，不发起任何网络请求
+- HTTP 服务只绑 `127.0.0.1`，并校验 Host/Origin，POST 只接受 `application/json`
+- 索引库就是同目录下的 `brain.db`，删掉即彻底清除
+- 仓库里 `.gitignore` 已排除 `brain.db`、`scan_raw.csv`、`scope.json`——它们含你的文档正文和本机路径
 
-## Project layout
+## 目录结构
 
 ```
-brain.py            core: indexing / search / web server / pruning / self-test dispatch
-scan_docs.py        disk scanner (exclusion rules, fiction-folder safety net)
-app_window.py       desktop window launcher (pywebview)
-selftest.py         quality self-test (synthetic data)
-qa_test.py          QA suite: boundaries / latency / concurrency / leaks
-ocr_backfill.py     re-run indexing for files that previously yielded no text
-gen_icon.py         generates the app icon
-scope.example.json  scope configuration template
-start.bat           Windows: open the desktop window
-update.bat          Windows: rescan → index → prune in one click
-build_exe.bat       Windows: build both executables (needs PyInstaller)
-second-brain-app.spec   PyInstaller config, full edition (with OCR)
-second-brain-core.spec  PyInstaller config, core edition (no OCR)
-README.zh-CN.md     Chinese version of this document
-brain.db            (generated) SQLite index — docs = FTS5 table, meta = processed files
-scan_raw.csv        (generated) last scan candidate list
-eval_report.txt     last self-test report
-QA_REPORT.md        last QA suite report
+brain.py            核心：建索引 / 搜索 / 网页服务 / 清理 / 自检调度
+scan_docs.py        磁盘扫描器（排除规则、小说关键词保险）
+app_window.py       桌面窗口启动器（pywebview）
+selftest.py         质量自检（合成数据）
+qa_test.py          QA 套件：边界 / 延迟 / 并发 / 泄漏
+ocr_backfill.py     把历史「提不出文本」的文件重走一遍索引
+gen_icon.py         生成应用图标
+scope.example.json  范围配置模板
+start.bat           Windows：打开桌面窗口
+update.bat          Windows：一键完成 重扫 → 索引 → 清理
+build_exe.bat       Windows：打包两个版本的可执行程序（需 PyInstaller）
+second-brain-app.spec   完整版打包配置（含 OCR）
+second-brain-core.spec  精简版打包配置（不含 OCR）
+README.en.md        本文档的英文版
+brain.db            （运行时生成）SQLite 索引库，docs=FTS5 表，meta=已处理清单
+scan_raw.csv        （运行时生成）最近一次扫描清单
+eval_report.txt     最近一次自检报告
+QA_REPORT.md        最近一次 QA 套件报告
 ```
 
-## License
+## 许可证
 
 MIT
