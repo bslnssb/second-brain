@@ -53,6 +53,25 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# 裁掉运行期用不到的大块文件（合计约 37MB）：
+#   pymupdf/mupdf-devel —— C 开发头文件（6.7MB），运行期无用
+#   opencv_videoio_ffmpeg*.dll —— OpenCV 的视频解码后端（30MB），
+#                          这里只拿 cv2 做图像预处理，从不读视频
+#
+# 注意：pymupdf/layout（51MB）**不能删**。看着像可选模块，但它的 __init__.py
+# 在被导入时就调 activate() 并把 49MB 版面模型载进内存，缺了它 `import pymupdf`
+# 直接失败，扫描版 PDF 全部退化成「无文本」。实测删掉后自检 B/C/E 直接跳过。
+DROP = ('pymupdf/mupdf-devel/', 'opencv_videoio_ffmpeg')
+
+
+def _keep(entry):
+    name = entry[0].replace('\\', '/').lower()
+    return not any(k in name for k in DROP)
+
+
+a.datas = [d for d in a.datas if _keep(d)]
+a.binaries = [b for b in a.binaries if _keep(b)]
+
 exe = EXE(
     pyz,
     a.scripts,
