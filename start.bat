@@ -1,10 +1,15 @@
 @echo off
 chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
 
-rem 1) 打包版优先：目录里若有 SecondBrain.exe 就直接开它，不依赖本机 Python。
-if exist "%~dp0SecondBrain.exe" (
-  start "" "%~dp0SecondBrain.exe"
+rem 1) 打包版优先：目录里若有 SecondBrain.exe（或精简版 SecondBrain-Core.exe）
+rem    就直接开它，不依赖本机 Python。
+set EXE=
+if exist "%~dp0SecondBrain.exe" set EXE=%~dp0SecondBrain.exe
+if not defined EXE if exist "%~dp0SecondBrain-Core.exe" set EXE=%~dp0SecondBrain-Core.exe
+if defined EXE (
+  start "" "%EXE%"
   exit /b 0
 )
 

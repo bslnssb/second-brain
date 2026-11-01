@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
@@ -13,8 +14,12 @@ if not exist scope.json (
 
 rem 打包版优先：exe 里已自带扫描器、索引器和 OCR，不需要本机 Python
 rem update 一条命令走完三件事：重扫清单 → 索引新增/变更 → 清理失效条目
-if exist "%~dp0SecondBrain.exe" (
-  "%~dp0SecondBrain.exe" update
+rem 完整版和精简版的 exe 名字不同，两个都认一下
+set EXE=
+if exist "%~dp0SecondBrain.exe" set EXE=%~dp0SecondBrain.exe
+if not defined EXE if exist "%~dp0SecondBrain-Core.exe" set EXE=%~dp0SecondBrain-Core.exe
+if defined EXE (
+  "%EXE%" update
   echo.
   echo 全部完成，可以关闭本窗口。
   pause
@@ -23,7 +28,7 @@ if exist "%~dp0SecondBrain.exe" (
 
 where python >nul 2>nul
 if not %errorlevel%==0 (
-  echo [!] 未找到 Python，也没有 SecondBrain.exe。
+  echo [!] 未找到 Python，也没有 SecondBrain.exe / SecondBrain-Core.exe。
   echo     更新需要 Python 3.12（只做搜索则不需要）。
   pause
   exit /b 1
