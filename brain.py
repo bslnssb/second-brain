@@ -25,6 +25,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
@@ -578,9 +580,16 @@ def index(scope_path):
     if not csvp.exists():
         print(f'[!] 找不到扫描清单 {csvp} —— 先运行全盘扫描（update 命令会自动做）')
         sys.exit(1)
-    include = tuple(s.lower() for s in scope['include_dirs'])
-    exclude = tuple(s.lower() for s in scope.get('exclude_dirs', []))
-    rows = list(csv.reader(open(csvp, encoding='utf-8-sig')))[1:]
+    # 路径比较前必须统一分隔符和大小写：scan_docs 写出的清单长这样
+    # C:/Users/Public/Documents/Library\Q2.md（盘符用 /、后面用 \），
+    # 而 include_dirs 是全反斜杠。直接 startswith 的话整批都会被判成「范围外」，
+    # 一篇都索引不进去，界面上还只显示「跳过 N 篇」，极难看出来。
+    include = tuple(os.path.normcase(os.path.normpath(s)) for s in scope['include_dirs'])
+    exclude = tuple(os.path.normcase(os.path.normpath(s)) for s in scope.get('exclude_dirs', []))
+    # 统一成 Windows 标准写法再入库：清单里是 C:/a\b 这种混排，不归一化就会和库里
+    # 已有的 C:\a\b 被当成两个文件，同一篇索引两遍（meta 的 path 是主键，重复了也不会报错）
+    rows = [(os.path.normpath(r[0]), *r[1:])
+            for r in list(csv.reader(open(csvp, encoding='utf-8-sig')))[1:] if r]
     con = init_db()
     # 自愈：历史上有些 meta 条目 reason 为 NULL（记成「已索引成功」）却根本没有正文行——
     # 旧版不支持的格式、库表迁移、或旧代码在插入正文前就写 meta 都会留下这种残迹。
@@ -602,6 +611,7 @@ def index(scope_path):
         """ True=需要(重新)索引：范围外 False；新文件 True；
         已索引但大小+修改时间都没变 False；旧库条目补登记后 False；索引后改过的 True
         dry=True 时只判断不写库（用于预算 todo，避免预计算把待办偷偷改掉、进度永远到不了 100%）"""
+        pl = os.path.normcase(os.path.normpath(pl))
         if not any(pl.startswith(d) for d in include) or any(x in pl for x in exclude):
             return False
         if p not in meta_info:
@@ -789,7 +799,19 @@ def _mark_name(p, toks):
     out.append(name[pos:])
     return ''.join(out)
 
-def search_rows(con, q, limit=20, ext=None, path_filter=None):
+def name_rows(con, q, limit=15):
+    """只按「文件名 / 目录名」找，不碰正文。
+    和 search_rows 里那段补充检索是同一套 SQL，但它的用途相反：
+    那边是「正文命中不够时垫底」，这里是给界面单独开一栏，让文件名命中不被正文结果挤掉。"""
+    toks = _fts_tokens(q)
+    if not toks:
+        return []
+    sql = ('SELECT path FROM meta WHERE reason IS NULL AND '
+           + ' AND '.join(['instr(lower(path), lower(?)) > 0'] * len(toks))
+           + ' LIMIT ?')
+    return [r[0] for r in con.execute(sql, (*toks, limit))]
+
+def search_rows(con, q, limit=20, ext=None, path_filter=None, with_name=True):
     """正文检索 + 文件名补充检索。
 
     docs 里 path 是 UNINDEXED 列，FTS 根本看不到文件名，于是「文件名里有、正文里没有」
@@ -797,7 +819,7 @@ def search_rows(con, q, limit=20, ext=None, path_filter=None):
     万级路径的 LIKE 是毫秒级，不用为它加索引列——那会逼着所有人重建整个索引。"""
     sql, args = _search_sql(q, ext, path_filter)
     hits = con.execute(sql, (*args, limit)).fetchall()
-    if len(hits) >= limit:
+    if len(hits) >= limit or not with_name:
         return hits
     toks = _fts_tokens(q)
     if not toks:
@@ -838,6 +860,112 @@ def search(q, limit=20, ext=None, path_filter=None):
         print(f'{p}\n    {snip}'.replace('\n', ' '))
     print(f'-- {len(hits)} 条')
     return hits
+
+# ---------------------------------------------------------------- Everything 联动（可选）
+# 第二大脑只能搜「索引里那几千篇文档」的正文和文件名；Everything 知道整台机器上每个文件名。
+# 两者合起来才完整：一个答「哪份文件里提过这句」，一个答「这个文件到底在哪」。
+# 通道用 Everything 自带的 HTTP 服务（不需要 SDK、不需要插件，跨进程最稳）。
+EV_LOCK = threading.Lock()
+EV_LAST = {}                      # 路径 -> 时间戳：只允许打开本次搜索真的返回过的文件
+EV_CACHE = {'port': -1, 'tried': 0.0}
+EV_TTL = 300                      # 一次搜索的结果在 5 分钟内可点「打开」
+
+def _ev_ini():
+    """Everything 的配置文件（勾了 app_data 时在 %APPDATA%，否则在安装目录）"""
+    out = []
+    a = os.environ.get('APPDATA')
+    if a:
+        out.append(os.path.join(a, 'Everything', 'Everything.ini'))
+    for base in (r'C:\Program Files\Everything', r'C:\Program Files (x86)\Everything'):
+        out.append(os.path.join(base, 'Everything.ini'))
+    return [p for p in out if os.path.exists(p)]
+
+def _ev_get(port, qs, timeout=1.5):
+    # 必须绕开系统代理：走代理时 127.0.0.1 也会被转发出去，直接连不上
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with op.open(f'http://127.0.0.1:{port}/?{qs}', timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8', 'replace'))
+
+def _ev_alive(port):
+    """这根端口上跑的到底是不是「有货的」Everything。
+    光能返回 JSON 不够——服务开着但索引是空的时候照样返回 {"totalResults":0}，
+    那样界面会写着「含 Everything」却永远补不出东西。用 * 通配探一次，有结果才认。"""
+    try:
+        d = _ev_get(port, 'search=%2A&json=1&count=1', 0.8)
+        return (isinstance(d, dict) and 'results' in d
+                and int(d.get('totalResults') or 0) > 0)
+    except Exception:
+        return False
+
+def ev_port():
+    """探测 Everything HTTP 端口；0 = 没开或没装。结果缓存一分钟，避免每次搜索都探。"""
+    now = time.time()
+    with EV_LOCK:
+        if now - EV_CACHE['tried'] < 60:
+            return max(EV_CACHE['port'], 0)
+    cand = []
+    for p in _ev_ini():
+        try:
+            for line in open(p, encoding='utf-8', errors='replace'):
+                s = line.strip()
+                if s.startswith('http_server_enabled=') and s.split('=', 1)[1].strip() == '0':
+                    cand = None                      # 明确关着，不用探了
+                    break
+                if s.startswith('http_server_port='):
+                    v = s.split('=', 1)[1].strip()
+                    if v.isdigit():
+                        cand.append(int(v))
+        except Exception:
+            pass
+        if cand is None:
+            break
+    if cand:
+        cand += [p for p in (8199, 80, 8080) if p not in cand]
+        port = next((c for c in cand if _ev_alive(c)), 0)
+    else:
+        port = 0
+    with EV_LOCK:
+        EV_CACHE['port'] = port
+        EV_CACHE['tried'] = now
+    return port
+
+def ev_search(q, limit=20):
+    """查全盘文件名。返回 (items, status)，status 为 ok / off / err。"""
+    port = ev_port()
+    if not port:
+        return [], 'off'
+    try:
+        d = _ev_get(port, 'search=%s&json=1&path_column=1&size_column=1'
+                          '&date_modified_column=1&count=%d&sort=name&ascending=1'
+                    % (urllib.parse.quote(q), limit))
+    except Exception:
+        with EV_LOCK:
+            EV_CACHE['port'], EV_CACHE['tried'] = -1, 0.0   # 服务可能刚关，下次重探
+        return [], 'err'
+    items = []
+    for r in (d.get('results') or [])[:limit]:
+        name = str(r.get('name') or '')
+        parent = str(r.get('path') or '')
+        # path 列给的是父目录；但个别版本给完整路径，靠 basename 是否等于 name 判断
+        if parent and os.path.basename(parent) == name:
+            full, show = parent, os.path.dirname(parent)
+        else:
+            full = os.path.join(parent, name) if parent else name
+            show = parent
+        items.append({'n': name, 'p': full, 'd': show,
+                      't': str(r.get('type') or 'file')})
+    with EV_LOCK:
+        now = time.time()
+        EV_LAST.clear()
+        for it in items:
+            EV_LAST[it['p']] = now
+    return items, 'ok'
+
+def ev_recent(p):
+    """这个路径是不是刚搜出来的（决定能不能点「打开」）"""
+    with EV_LOCK:
+        t = EV_LAST.get(p)
+    return bool(t) and time.time() - t < EV_TTL
 
 def _drive_root(p):
     """取路径所在盘的根（'D:\\' / '\\\\server\\share\\'；相对路径返回 ''）"""
@@ -955,6 +1083,16 @@ body{font-family:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif
 .btn:hover{color:var(--acc);border-color:var(--acc)}
 .path{color:var(--sub);font-size:12px;margin-top:6px;word-break:break-all}
 .snip{margin-top:10px;font-size:13.5px;line-height:1.75;color:#3a4356;background:#f8f9fc;border-radius:8px;padding:10px 12px;word-break:break-word}
+.evblock{background:linear-gradient(180deg,#fbfcff,#f6f8ff);border:1px solid #e1e7fa;border-radius:14px;padding:12px 16px 8px;margin-bottom:16px}
+.evhead{font-size:12.5px;font-weight:700;color:#3a4fd7;display:flex;align-items:baseline;gap:8px;margin-bottom:6px}
+.evhead em{font-weight:400;font-style:normal;color:var(--sub);font-size:11.5px}
+.evitem{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid #ebeffb}
+.evitem:first-of-type{border-top:none}
+.evitem .badge{background:#e6ebff}
+.evname{font-size:13px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.evpath{font-size:11.5px;color:var(--sub);flex:0 1 auto;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+.evtag{font-size:10.5px;color:#7c3aed;border:1px solid #dfd3fb;border-radius:5px;padding:1px 5px;white-space:nowrap;flex:0 0 auto}
+.evmore{font-size:11.5px;color:var(--sub);padding:7px 0 3px;border-top:1px solid #ebeffb}
 mark{background:var(--mark);border-radius:3px;padding:0 2px;font-weight:600}
 .empty{text-align:center;color:var(--sub);padding:60px 0;font-size:14px;line-height:2}
 .empty b{color:var(--ink)}
@@ -1057,6 +1195,9 @@ found:'找到 <b>{n}</b> 条 · {ms} ms',
 searching:'搜索中…',
 need_kw:'请先输入关键词',
 no_hit:'没有找到「{q}」',
+ev_h:'📁 文件名命中',ev_sub:'全盘任意文件 · 含 Everything',ev_sub_off:'索引内已收录的文件',ev_tag:'全盘',
+ev_more:'还有更多 —— 再加一个关键词缩小范围',
+ev_only:'索引的内容里没有命中，但文件名有 <b>{n}</b> 条匹配：',
 no_hit_tip:'试试<b>换个词</b>、<b>少个过滤条件</b>，或先点「🔄 按现有范围更新」把新文件收进来',
 opened:'已打开',open_fail:'文件不存在或已被移动',
 first_run:'首次使用：推荐点「🚀 智能扫描全盘」，它会列出电脑里哪里有文档给您勾选；也可以手动添加文件夹。',
@@ -1135,6 +1276,9 @@ found:'<b>{n}</b> results · {ms} ms',
 searching:'Searching…',
 need_kw:'Please type a keyword first',
 no_hit:'Nothing found for “{q}”',
+ev_h:'📁 Filename matches',ev_sub:'any file on disk · incl. Everything',ev_sub_off:'files already in the index',ev_tag:'disk',
+ev_more:'more matches — add a keyword to narrow it down',
+ev_only:'Nothing in the index matched, but <b>{n}</b> filenames do:',
 no_hit_tip:'Try <b>another keyword</b>, <b>fewer filters</b>, or run the updater to index new files first.',
 opened:'Opened',open_fail:'File no longer exists or has been moved',
 first_run:'First run: click “🚀 Smart scan” to see where your documents live, then tick the folders you want. You can also add folders manually.',
@@ -1214,26 +1358,45 @@ let t=esc(p);
 if(!hasMark&&qv){const ws=qv.trim().split(/\s+/).filter(x=>x.length>0);
 for(const w of ws){try{t=t.replace(new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi'),m=>'<mark>'+m+'</mark>')}catch(e){}}}
 return t}).join('')}
+function enc(p){return encodeURIComponent(p).replace(/'/g,'%27')}
 async function go(){
 const qv=qEl.value.trim(),tv=tEl.value.trim(),dv=dEl.value.trim();
 if(!qv){HAS_RESULT=0;showEmpty();return}
 rEl.className='empty';rEl.innerHTML=T('searching');
-const t0=performance.now();let x;
-try{x=await(await fetch('/api?q='+encodeURIComponent(qv)+'&t='+encodeURIComponent(tv)+'&d='+encodeURIComponent(dv))).json()}
-catch(e){rEl.innerHTML=esc(String(e));return}
+const t0=performance.now();let x,fx;
+try{[x,fx]=await Promise.all([
+fetch('/api?q='+encodeURIComponent(qv)+'&t='+encodeURIComponent(tv)+'&d='+encodeURIComponent(dv)+'&name=0').then(r=>r.json()),
+fetch('/api/files?q='+encodeURIComponent(qv)).then(r=>r.json()).catch(()=>({items:[],st:'off'}))
+])}catch(e){rEl.innerHTML=esc(String(e));return}
 const ms=(performance.now()-t0).toFixed(0);
 if(x.err){HAS_RESULT=0;rEl.innerHTML=esc(x.k?F(T(x.k),x.a||{e:x.err}):x.err);return}
 HAS_RESULT=1;
-if(!x.hits.length){rEl.className='empty';
-rEl.innerHTML=F(T('no_hit'),{q:esc(qv)})+'<br>'+T('no_hit_tip');return}
+// 正文里已经列出的文件不再重复出现在文件名区：两栏互补，不是两份清单
+const hp=new Set(x.hits.map(h=>String(h.p).toLowerCase()));
+const files=(fx&&fx.items)?fx.items.filter(f=>!hp.has(String(f.p).toLowerCase())):[];
+if(!x.hits.length){rEl.className='';
+if(!files.length){rEl.className='empty';rEl.innerHTML=F(T('no_hit'),{q:esc(qv)})+'<br>'+T('no_hit_tip');return}
+rEl.innerHTML='<div class=meta style="text-align:center">'+F(T('ev_only'),{n:files.length})+'</div>'+evBlock(files,fx.st,fx.more);return}
 rEl.className='';
 rEl.innerHTML='<div class=meta>'+F(T('found'),{n:x.hits.length,ms:ms})+'</div>'+
+(files.length?evBlock(files,fx.st,fx.more):'')+
 x.hits.map(h=>{const i=h.p.lastIndexOf('\\'),nm=i<0?h.p:h.p.slice(i+1),pt=i<0?'':h.p.slice(0,i),
 e=(h.p.split('.').pop()||'').toUpperCase().slice(0,4);
 return '<div class=card><div class=top><span class=badge>'+esc(e)+'</span><span class=name title="'+esc(h.p)+'">'+esc(nm)+'</span>'+
-'<button class=btn onclick="openF(\''+encodeURIComponent(h.p)+'\')">'+esc(T('open'))+'</button>'+
-'<button class=btn onclick="copyP(this,\''+encodeURIComponent(h.p)+'\')">'+esc(T('copy'))+'</button></div>'+
+'<button class=btn onclick="openF(\''+enc(h.p)+'\')">'+esc(T('open'))+'</button>'+
+'<button class=btn onclick="copyP(this,\''+enc(h.p)+'\')">'+esc(T('copy'))+'</button></div>'+
 '<div class=path>'+esc(pt)+'</div><div class=snip>'+hl(h.s,qv)+'</div></div>'}).join('')}
+function evBlock(items,st,more){
+return '<div class=evblock><div class=evhead>'+esc(T('ev_h'))+'<em>'+esc(T(st==='ok'?'ev_sub':'ev_sub_off'))+'</em></div>'+
+items.map(f=>{const e=f.t==='folder'?'DIR':((f.n.split('.').pop()||'').toUpperCase().slice(0,4)||'FILE');
+return '<div class=evitem><span class=badge>'+esc(e)+'</span>'+
+'<span class=evname title="'+esc(f.p)+'">'+esc(f.n)+'</span>'+
+(f.src==='ev'?'<span class=evtag>'+esc(T('ev_tag'))+'</span>':'')+
+'<span class=evpath title="'+esc(f.d)+'">'+esc(f.d)+'</span>'+
+'<button class=btn onclick="openF(\''+enc(f.p)+'\')">'+esc(T('open'))+'</button>'+
+'<button class=btn onclick="copyP(this,\''+enc(f.p)+'\')">'+esc(T('copy'))+'</button></div>'}).join('')+
+(more?'<div class=evmore>'+esc(T('ev_more'))+'</div>':'')+
+'</div>'}
 async function openF(p){try{const x=await(await fetch('/open?p='+p)).json();toast(x.ok?T('opened'):T('open_fail'))}
 catch(e){toast(T('open_fail'))}}
 async function copyP(b,p){try{await navigator.clipboard.writeText(decodeURIComponent(p));b.textContent=T('copied');setTimeout(()=>{b.textContent=T('copy')},1200)}
@@ -1385,13 +1548,43 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
             elif self.path.startswith('/api/discover'):
                 body = json.dumps(dict(DISCOVER), ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/files'):
+                # 第二路结果：文件名。索引内的一律能查；装了 Everything 且开着网页服务时再补全盘。
+                # 拿不到 Everything 就返回 st=off，界面照样显示索引内的那几条。
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get('q', [''])[0] or '').strip()
+                items, st, more = [], 'off', False
+                if q:
+                    try:
+                        with con_lock:
+                            local = name_rows(conn(), q, 7)
+                    except sqlite3.Error:
+                        local = []
+                    for p in local:
+                        items.append({'n': os.path.basename(p), 'p': p,
+                                      'd': os.path.dirname(p), 't': 'file', 'src': 'idx'})
+                    ev, st = ev_search(q, 7)
+                    seen = {os.path.normcase(x['p']) for x in items}
+                    for x in ev:
+                        if os.path.normcase(x['p']) not in seen:
+                            x['src'] = 'ev'
+                            items.append(x)
+                            seen.add(os.path.normcase(x['p']))
+                    # 这一栏是「先告诉你有没有」，不是列表页：多了会把正文结果挤到屏幕外
+                    more = len(items) > 6
+                    items = items[:6]
+                body = json.dumps({'items': items, 'st': st, 'more': more},
+                                  ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api?'):
                 qs = parse_qs(urlparse(self.path).query)
                 q = qs.get('q', [''])[0]
                 ext = qs.get('t', [''])[0] or None
                 pf = qs.get('d', [''])[0] or None
+                # 界面上文件名另有独立一栏，这里传 name=0 关掉垫底补位，免得同一条出现两次
+                wn = qs.get('name', ['1'])[0] != '0'
                 try:
-                    hits = [{'p': p, 's': s} for p, s in self._search(q, ext, pf)]
+                    hits = [{'p': p, 's': s} for p, s in self._search(q, ext, pf, wn)]
                     body = json.dumps({'hits': hits}, ensure_ascii=False).encode()
                 except Exception as e:
                     body = json.dumps({'err': f'查询出错: {e}', 'k': 'e_query', 'a': {'e': str(e)}},
@@ -1412,6 +1605,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                                 'SELECT 1 FROM meta WHERE path=? LIMIT 1', (p,)).fetchone())
                     except sqlite3.Error:
                         ok = False
+                    # Everything 那一列多半是索引外的文件；放行条件收紧成「本次搜索真的返回过」，
+                    # 否则这里就成了任意路径的 startfile 入口（对 .exe 等于运行）
+                    ok = ok or ev_recent(p)
                     if ok:
                         try:
                             os.startfile(p)
@@ -1496,9 +1692,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
             self.send_header('Content-Type', ctype)
             self.end_headers()
             self.wfile.write(body)
-        def _search(self, q, ext=None, pf=None):
+        def _search(self, q, ext=None, pf=None, with_name=True):
             with con_lock:
-                return search_rows(conn(), q, 30, ext, pf)
+                return search_rows(conn(), q, 30, ext, pf, with_name)
     class QuietServer(ThreadingHTTPServer):
         """多线程 + 安静：单线程时一个不发完请求的连接会把界面卡住（见 H.timeout）。
         连接被对端中断（关窗口、刷新、探测端口）是常态，不该往控制台吐 traceback。"""

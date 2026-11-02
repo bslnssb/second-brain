@@ -78,32 +78,45 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 
 ### 和 Listary / Everything 一起用（一个搜名字，一个搜内容）
 
-Everything、Listary 强在**毫秒级找到「文件叫什么」**，但对文件里写了什么一无所知；
-第二大脑正好相反。两者不冲突，一起用才是完整的检索：
+**先划清边界**：结果没法互相塞进对方的窗口。Listary 6 的插件接口还没公开，Everything 的列表也只认自己的索引——
+所以「在 Listary 窗口里同时看到两种结果」做不到，这是它们的设计，不是配置能解决的。
 
-| 你要找的东西 | 该用谁 |
+能做的是反过来：**让第二大脑当主窗口，一次给两路结果**。
+
+<p align="center"><img src="assets/screenshot-both.png" alt="一次搜索同时给出文件名命中与内容命中"></p>
+
+| 你手里的线索 | 出现在 |
 |---|---|
-| 记得文件名或文件夹名 | Everything / Listary |
-| 只记得「哪份文件里提过这句」 | 第二大脑 |
+| 文件名、文件夹名 | 📁 文件名命中（顶部，最多 6 条） |
+| 正文里的某句话 | 内容命中（下面，带命中片段并高亮） |
 
-为了不用每次都先开窗口再输入，exe 支持直接带参数启动：
+上图搜的是「国办发2019」：正文里没有，但文件名里有 2 个——不用换工具就找到了。
+**装没装 Everything 都能用**：检测到 Everything 的网页服务时，文件名那一路会补上索引之外的全盘文件，并标「全盘」；没有就只列已收录的。
+
+<details>
+<summary>可选：让「文件名命中」覆盖全盘（接 Everything，不配也不影响使用）</summary>
+
+第二大脑只认得自己索引过的文档。想让文件名那一路也覆盖没入库的文件（安装包、视频、压缩包…），
+可以让它去问 Everything——走 Everything 自带的网页服务，不需要装任何插件：
+
+1. Everything → 工具 → 选项 → **HTTP 服务器** → 勾「启用 HTTP 服务器」，端口填 `8199`，确定
+2. 回到第二大脑重新搜一次，来自 Everything 的条目会带「全盘」标记
+
+接口只读、只在本机回环地址上问；配好之前第二大脑不会去碰它。
+</details>
+
+**Listary 仍然值得配**，它的价值是「入口」：
 
 | 命令 | 效果 |
 |---|---|
 | `SecondBrain.exe 报销标准` | 开窗并直接出结果 |
-| `SecondBrain.exe --settings` | 开窗并直接展开设置面板 |
+| `SecondBrain.exe --settings` | 开窗直接展开设置面板 |
 | `SecondBrain.exe --lang en 报销` | 强制英文界面（`zh` 同理） |
 
-**在 Listary 里挂一条命令**（选项 → 命令 → ➕）：
-
-- 关键字：`sb`
-- 标题：第二大脑
-- 路径：`你的解压目录\SecondBrain.exe`
-- 参数：`"{query}"`
-
-之后任何地方双击 Ctrl，输入 `sb 报销流程` 回车，第二大脑直接带着结果开窗。
-同一个面板里也能给 Everything 加一条（关键字 `ev`，参数 `-search "{query}"`），
-于是「`ev` 找文件名 / `sb` 找文件内容」就都在一个入口里了。
+在 Listary 里挂一条命令（选项 → 命令 → ➕）：关键字 `sb`、路径指向 `SecondBrain.exe`、参数 `"{query}"`。
+之后任何地方双击 Ctrl，输 `sb 报销流程` 回车，第二大脑直接带着结果开窗。
+同一个面板再给 Everything 配一条 `ev`（参数 `-search "{query}"`），
+「`ev` 找文件名 / `sb` 找文件内容」就都在一个入口里了。
 
 PowerToys Run、快捷方式、AutoHotkey 同理——只要能传参，就能直达结果，不用先开窗口再输入。
 

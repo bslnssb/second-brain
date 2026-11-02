@@ -78,36 +78,53 @@ The settings panel — scanning, updating and health checks all live here, no co
 
 ### Pairing it with Listary / Everything (one finds names, the other finds contents)
 
-Everything and Listary are superb at **finding “what is this file called”** in milliseconds, but they have
-no idea what's written inside. Second Brain is the mirror image. They don't compete — together they cover
-both questions:
+**The boundary first**: neither tool lets another program put results into its window. Listary 6 hasn't
+published a plugin API, and Everything's list only ever shows Everything's index. So "type once in
+Listary and see both kinds of result" is not possible — that's their design, not a setting you missed.
 
-| What you're after | Use |
+What does work is the other direction: **make Second Brain the window, and have it show both lists at once.**
+
+<p align="center"><img src="assets/screenshot-both.png" alt="One search returning both filename matches and content matches"></p>
+
+| What you remember | Where it shows up |
 |---|---|
-| You remember a file or folder name | Everything / Listary |
-| You only remember “some document mentioned this phrase” | Second Brain |
+| A file name or folder name | 📁 Filename matches (top, up to 6) |
+| A phrase from inside a document | Content matches (below, with highlighted snippets) |
 
-So you don't have to open a window and type again, the exe accepts launch arguments:
+The shot above searched for 国办发2019: nothing in any indexed body, but two file names matched — found
+without switching tools. **This works with or without Everything.** When Everything's web service is
+detected, the filename list also covers files outside the index and tags them 「全盘」 (disk); otherwise it
+lists indexed files only.
+
+<details>
+<summary>Optional: let filename matching cover the whole disk (Everything, never required)</summary>
+
+Second Brain only knows the documents it has indexed. To also match files that were never indexed
+(installers, videos, archives), it can ask Everything over Everything's built-in web service — no plugin
+needed:
+
+1. Everything → Tools → Options → **HTTP Server** → tick *Enable HTTP server*, port `8199`, OK
+2. Search again; entries that came from Everything carry the 「全盘」 tag
+
+The interface is read-only and only queried on the loopback address. Until you set it up, Second Brain
+never contacts it.
+</details>
+
+**Listary is still worth configuring** — its value is the entry point:
 
 | Command | Effect |
 |---|---|
-| `SecondBrain.exe expense policy` | Opens with the results already rendered |
-| `SecondBrain.exe --settings` | Opens straight into the settings panel |
-| `SecondBrain.exe --lang zh expenses` | Forces the interface language (`en` likewise) |
+| `SecondBrain.exe 报销标准` | Opens with results already on screen |
+| `SecondBrain.exe --settings` | Opens into the settings panel |
+| `SecondBrain.exe --lang en 报销` | Forces the English interface (`zh` likewise) |
 
-**Hooking it into Listary** (Options → Commands → ➕):
-
-- Keyword: `sb`
-- Title: Second Brain
-- Path: `your\extract\folder\SecondBrain.exe`
-- Parameter: `"{query}"`
-
-From then on: double-tap Ctrl anywhere, type `sb expense policy`, press Enter — the window opens with
-results. You can add Everything in the same panel (keyword `ev`, parameter `-search "{query}"`), so
-“`ev` for names / `sb` for contents” both live behind one entry point.
+Add one command in Listary (Options → Commands → ➕): keyword `sb`, pointing at `SecondBrain.exe`, arguments
+`"{query}"`. From then on, double-tap Ctrl anywhere, type `sb invoice policy`, and the window opens with
+results. Give Everything its own `ev` entry (arguments `-search "{query}"`) in the same panel and both
+habits live behind one hotkey: `ev` for names, `sb` for contents.
 
 PowerToys Run, shortcuts and AutoHotkey work the same way — anything that can pass an argument can jump
-straight to the results.
+straight to results.
 
 ### Command line (source edition, optional)
 
