@@ -31,7 +31,7 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-APP_VERSION = 'v6.0'
+APP_VERSION = 'v6.3'
 
 def app_dir():
     """脚本所在目录；打包成 exe 后为 exe 所在目录（数据库/配置放在 exe 旁边）"""
@@ -124,6 +124,75 @@ def _group_key(path: str, home: str):
         seg = rest.split('\\')[0] if rest else ''
         d = drive + seg if seg else drive.rstrip('\\/')
     return d, _noise_dir(d)
+
+# 全盘文件名索引的构建状态（/api/names 轮询用）
+NAMES = {'state': 'idle', 'err': '', 'n': 0}
+
+def build_files_index(targets=None):
+    """走一遍全盘，把文件名写进 files 表。只记路径与文件名，不打开、不读内容。
+
+    先建 files_new 再原子换名：中途失败或被关掉，正在用的那份索引保持完整可用，
+    不会出现「搜到一半的半个磁盘」这种状态。"""
+    global NAMES
+    try:
+        if NAMES['state'] == 'busy' or PROG.get('state') == 'busy':
+            NAMES = {'state': 'error', 'err': '另一项任务正在进行', 'n': 0,
+                     'k': 'e_names_busy'}
+            return
+        NAMES = {'state': 'busy', 'err': '', 'n': 0}
+        roots = ([os.path.normpath(str(t)) for t in targets] if targets is not None
+                 else scan_docs.drive_targets())
+        _prog(state='busy', phase='names', done=0, total=len(roots) + 1, ok=0, fail=0,
+              msg='建立全盘文件名索引', k='m_names')
+        con = sqlite3.connect(DB, check_same_thread=False)
+        con.execute('PRAGMA journal_mode=WAL')
+        # synchronous=OFF 只影响这条一次性的批量写：崩了最多重扫一遍，换来成倍的写入速度
+        con.execute('PRAGMA synchronous=OFF')
+        con.execute('DROP TABLE IF EXISTS files_new')
+        con.execute('CREATE TABLE files_new(path TEXT PRIMARY KEY, name TEXT NOT NULL, '
+                    'dir TEXT, ext TEXT, size REAL, mtime REAL)')
+        con.commit()
+        batch, n = [], 0
+        for i, root in enumerate(roots):
+            _prog(done=i, msg=f'扫描文件名 {root}', k='m_names_target', a={'p': root})
+            for cur, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d.lower() not in scan_docs.SKIP_DIRS
+                           and not d.startswith('.')]
+                if scan_docs.is_novel_dir(cur):
+                    dirs[:] = []
+                    continue
+                for f in files:
+                    batch.append((os.path.join(cur, f), f.lower(), cur,
+                                  os.path.splitext(f)[1].lower(), None, None))
+                    if len(batch) >= 20000:
+                        con.executemany('INSERT OR REPLACE INTO files_new'
+                                        '(path,name,dir,ext,size,mtime) VALUES(?,?,?,?,?,?)', batch)
+                        con.commit()
+                        n += len(batch); batch = []
+                        _prog(done=i, msg=f'扫描文件名 {root}（已 {n}）',
+                              k='m_names_progress', a={'n': n})
+            if batch:
+                con.executemany('INSERT OR REPLACE INTO files_new'
+                                '(path,name,dir,ext,size,mtime) VALUES(?,?,?,?,?,?)', batch)
+                con.commit()
+                n += len(batch); batch = []
+        _prog(done=len(roots), msg='整理文件名索引…', k='m_names_finish')
+        # 换表这一下很快，但要挡住 HTTP 线程正在进行的查询，避免它们撞上「表刚被删」
+        with con_lock:
+            con.execute('DROP TABLE IF EXISTS files')
+            con.execute('ALTER TABLE files_new RENAME TO files')
+            con.execute('CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)')
+            con.commit()
+        con.close()
+        NAMES = {'state': 'done', 'err': '', 'n': n}
+        _prog(state='done', phase='', msg=f'文件名索引完成：{n} 个文件',
+              k='m_names_done', a={'n': n})
+        print(f'全盘文件名索引完成：{n} 个文件')
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        NAMES = {'state': 'error', 'err': f'{type(e).__name__}: {e}', 'n': 0}
+        _prog(state='error', phase='', msg=f'文件名索引失败：{e}', err=str(e))
 
 # 质量自检（GUI/CLI 共用）；在独立子进程里跑，绝不碰正在服务的真实索引库
 SELFTEST = {'state': 'idle', 'msg': '', 'ok': None, 'k': ''}
@@ -503,6 +572,16 @@ def init_db():
             pass  # 列已存在
     con.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
                    path UNINDEXED, ext UNINDEXED, body, tokenize='trigram')""")
+    # 全盘文件名索引：只存路径/名字/大小/时间，不读内容。让「文件名命中」这栏
+    # 覆盖整个磁盘，而不是只覆盖已入库的几千篇——这正是原先要去问 Everything 的那件事。
+    # name 存小写，查询时把关键词也转小写，这样 instr 只用一次 lower()。
+    con.execute("""CREATE TABLE IF NOT EXISTS files(
+                   path TEXT PRIMARY KEY, name TEXT NOT NULL, dir TEXT,
+                   ext TEXT, size REAL, mtime REAL)""")
+    try:
+        con.execute('CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)')
+    except sqlite3.Error:
+        pass
     return con
 
 def _count_docs(con):
@@ -811,6 +890,28 @@ def name_rows(con, q, limit=15):
            + ' LIMIT ?')
     return [r[0] for r in con.execute(sql, (*toks, limit))]
 
+def file_rows(con, q, limit=12):
+    """全盘文件名检索（自建索引，不依赖 Everything）。
+
+    走 instr 全表扫：157 万行、命中够 6 条就提前收工，常见的词 20~40ms。
+    不按路径长度排序——那要先把所有命中都捞出来再排，稀见词会从 20ms 变成 600ms，
+    而 6 个名额本来就只是「先告诉你有没有」。"""
+    q = (q or '').strip().lower()
+    if not q:
+        return []
+    try:
+        return [r[0] for r in con.execute(
+            'SELECT path FROM files WHERE instr(name, ?) > 0 LIMIT ?', (q, limit))]
+    except sqlite3.Error:
+        return []
+
+def file_count(con):
+    """全盘文件名索引里的条目数；0 表示还没建过"""
+    try:
+        return con.execute('SELECT count(*) FROM files').fetchone()[0]
+    except sqlite3.Error:
+        return 0
+
 def search_rows(con, q, limit=20, ext=None, path_filter=None, with_name=True):
     """正文检索 + 文件名补充检索。
 
@@ -1110,6 +1211,7 @@ mark{background:var(--mark);border-radius:3px;padding:0 2px;font-weight:600}
 .pbtn:disabled{opacity:.5;cursor:default}
 .prow{display:flex;gap:10px;flex-wrap:wrap}
 .pmsg{font-size:13px;color:var(--sub);margin-top:10px;line-height:1.7;min-height:18px}
+.nstat{font-size:12px;color:var(--sub);margin-top:8px;line-height:1.7}
 .pbar{height:8px;background:#e8eaf3;border-radius:6px;overflow:hidden;margin-top:10px}
 .pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4f6ef7,#7c3aed);transition:width .3s}
 .help{margin-top:12px;font-size:12.5px;color:var(--sub)}
@@ -1130,7 +1232,7 @@ nz{display:inline-block;color:#b45309;font-size:11px;border:1px solid #fde68a;ba
 <button class=gear id=gear onclick=showCfg() data-i18n="settings">⚙ 设置 / 更新</button>
 </div>
 <h1>🧠 <em data-i18n="brand">第二大脑</em></h1>
-<p data-i18n="sub">搜你电脑里文档的「内容」 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳</p>
+<p data-i18n="sub">搜文档内容和文件名 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳</p>
 </div>
 <div class=bar>
 <input id=q data-i18n-ph="ph_q" placeholder="输入关键词，比如：项目方案 / 课程笔记 / 报销标准" autofocus>
@@ -1143,11 +1245,13 @@ nz{display:inline-block;color:#b45309;font-size:11px;border:1px solid #fde68a;ba
 <div class=chips id=dirs></div>
 <div id=cand></div>
 <div class=prow>
-<button class=pbtn id=smartbtn data-i18n="btn_scan" data-i18n-title="tip_scan" onclick=smartScan(this)>🚀 智能扫描全盘（推荐）</button>
-<button class=pbtn gray id=addbtn data-i18n="btn_add" data-i18n-title="tip_add" onclick=addDir()>➕ 手动添加文件夹</button>
-<button class=pbtn id=savebtn data-i18n="btn_save" data-i18n-title="tip_save" onclick=saveUpd(this)>💾 保存并更新索引</button>
-<button class=pbtn gray id=updonly data-i18n="btn_update" data-i18n-title="tip_update" onclick=upd(this)>🔄 按现有范围更新</button>
-<button class=pbtn gray id=stbtn data-i18n="btn_test" data-i18n-title="tip_test" onclick=selfTest(this)>🩺 引擎体检</button>
+<button class="pbtn" id=smartbtn data-i18n="btn_scan" data-i18n-title="tip_scan" onclick=smartScan(this)>🚀 智能扫描全盘（推荐）</button>
+<button class="pbtn gray" id=addbtn data-i18n="btn_add" data-i18n-title="tip_add" onclick=addDir()>➕ 手动添加文件夹</button>
+<button class="pbtn" id=savebtn data-i18n="btn_save" data-i18n-title="tip_save" onclick=saveUpd(this)>💾 保存并更新索引</button>
+<button class="pbtn gray" id=updonly data-i18n="btn_update" data-i18n-title="tip_update" onclick=upd(this)>🔄 按现有范围更新</button>
+<button class="pbtn gray" id=stbtn data-i18n="btn_test" data-i18n-title="tip_test" onclick=selfTest(this)>🩺 引擎体检</button>
+<button class="pbtn gray" id=nbtn data-i18n="btn_names" data-i18n-title="tip_names" onclick=buildNames(this)>🗂 重建文件名索引</button></div>
+<div class=nstat id=nstat></div>
 </div>
 <div class=pbar id=pw style=display:none><i id=pi></i></div>
 <div class=pmsg id=pm></div>
@@ -1163,7 +1267,7 @@ const DICT={
 zh:{
 title:'第二大脑 · 本地文档搜索',
 brand:'第二大脑',
-sub:'搜你电脑里文档的「内容」 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳',
+sub:'搜文档内容和文件名 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳',
 settings:'⚙ 设置 / 更新',
 ph_q:'输入关键词，比如：项目方案 / 课程笔记 / 报销标准',
 ph_t:'类型：pdf / docx…',
@@ -1176,17 +1280,28 @@ btn_add:'➕ 手动添加文件夹',
 btn_save:'💾 保存并更新索引',
 btn_update:'🔄 按现有范围更新',
 btn_test:'🩺 引擎体检',
+btn_names:'🗂 重建文件名索引',
 tip_scan:'第一次用点这个：扫一遍电脑（只记文件名，不读内容），列出哪里有多少文档给您勾选，噪音目录自动不勾',
 tip_add:'自己挑要搜索的文件夹，精确控制范围',
 tip_save:'把勾选/添加的文件夹存为索引范围并开始收录（第一次全量较慢，之后增量很快）',
 tip_update:'日常维护：来了新文件点一下，只收新文件，约 1~3 分钟',
 tip_test:'给搜索引擎考试：用内置假图书馆测搜得准不准、OCR 错字率、坏文件崩不崩溃。约 1~2 分钟，不碰真实文档库',
-help_q:'❓ 这五个按钮分别是干嘛的？',
+tip_names:'扫一遍全盘、只记文件名（不打开、不读内容），让「文件名命中」覆盖整个磁盘——安装包、图片、视频、压缩包都能按名字搜到。157 万个文件实测约 3 分钟',
+help_q:'❓ 这六个按钮分别是干嘛的？',
 help_1:'🚀 <b>智能扫描全盘</b>——第一次用点这个：扫一遍电脑（只记文件名、不读内容），列出「哪里有多少文档」给您勾选，疑似噪音自动不勾、小说目录直接排除',
 help_2:'➕ <b>手动添加文件夹</b>——想精确控制搜索范围时用，点一次弹一个目录选择框',
 help_3:'💾 <b>保存并更新索引</b>——把上面勾选/添加的范围生效并开始收录：第一次全量较慢，之后每次只收新文件',
 help_4:'🔄 <b>按现有范围更新</b>——日常维护按钮：电脑里来了新文档点一下，约 1~3 分钟',
 help_5:'🩺 <b>引擎体检</b>——给搜索引擎「考试」：用一份内置的假图书馆测它搜得准不准、排序对不对、OCR 错字率多少、坏文件崩不崩溃，约 1~2 分钟。<b>不碰您的真实文档库</b>，报告在 eval_report.txt',
+help_6:'🗂 <b>重建文件名索引</b>——扫一遍全盘但只记文件名，不打开任何文件，约 3 分钟（157 万个文件）。之后搜「文件名」能覆盖整个磁盘（安装包、视频、压缩包都算），不只是入库的那几千份文档。加了移动硬盘、换了大批文件后点一次',
+nstat_off:'全盘文件名索引：还没建立 · 现在只能搜到已入库的文档，点「🗂 重建文件名索引」扫一遍（约 3 分钟）',
+nstat_on:'全盘文件名索引：{n} 个文件（只记名字和路径，不读内容）',
+m_names:'建立全盘文件名索引中…',
+m_names_target:'扫描 {p}',
+m_names_progress:'扫描 {p}（已 {n} 个文件）',
+m_names_finish:'整理文件名索引…',
+m_names_done:'文件名索引完成：{n} 个文件',
+e_names_busy:'已有任务在跑，等它跑完再点',
 empty_hint:'输入关键词开始搜索',
 empty_tip:'<b>小提示</b>：两个过滤框可以留空；点结果里的「打开」直接打开原文件',
 footer:'第二大脑 __VER__ · 结果按相关度(bm25)排序 · 引擎体检：设置里点「🩺 引擎体检」或命令行 selftest，报告在 eval_report.txt',
@@ -1195,7 +1310,7 @@ found:'找到 <b>{n}</b> 条 · {ms} ms',
 searching:'搜索中…',
 need_kw:'请先输入关键词',
 no_hit:'没有找到「{q}」',
-ev_h:'📁 文件名命中',ev_sub:'全盘任意文件 · 含 Everything',ev_sub_off:'索引内已收录的文件',ev_tag:'全盘',
+ev_h:'📁 文件名命中',ev_sub:'全盘任意文件 · 本机文件名索引',ev_sub_off:'索引内已收录的文件',ev_tag:'全盘',
 ev_more:'还有更多 —— 再加一个关键词缩小范围',
 ev_only:'索引的内容里没有命中，但文件名有 <b>{n}</b> 条匹配：',
 no_hit_tip:'试试<b>换个词</b>、<b>少个过滤条件</b>，或先点「🔄 按现有范围更新」把新文件收进来',
@@ -1244,7 +1359,7 @@ e_query:'查询出错（关键词至少 3 个字符效果最佳）: {e}'
 en:{
 title:'Second Brain · Local Document Search',
 brand:'Second Brain',
-sub:'Search inside your own documents — __TOTAL__ files indexed · 100% local & offline · best with 3+ characters',
+sub:'Search document contents and file names — __TOTAL__ files indexed · 100% local & offline · best with 3+ characters',
 settings:'⚙ Settings',
 ph_q:'Keywords, e.g. project plan / lecture notes / expense policy',
 ph_t:'Type: pdf / docx…',
@@ -1257,17 +1372,28 @@ btn_add:'➕ Add folder',
 btn_save:'💾 Save & build index',
 btn_update:'🔄 Update index',
 btn_test:'🩺 Health check',
+btn_names:'🗂 Rebuild name index',
 tip_scan:'First run: scans the whole computer (file names only, never contents), then lists candidate folders with document counts. Noisy folders stay unchecked.',
 tip_add:'Pick the folders you want to search, one by one',
 tip_save:'Save the selected folders as the index scope and start indexing (the first full build is slow, later runs are incremental)',
 tip_update:'Routine maintenance: pick up newly added documents, usually 1-3 minutes',
 tip_test:'Exams for the search engine: measures ranking quality, OCR error rate and crash-resistance on corrupted files. About 1-2 minutes, never touches your real library.',
-help_q:'❓ What do these five buttons do?',
+tip_names:'Walks every disk but records file names only — nothing is opened or read. Lets the filename column cover the whole machine (installers, images, videos, archives), not just indexed documents. About 3 minutes for 1.57M files.',
+help_q:'❓ What do these six buttons do?',
 help_1:'🚀 <b>Smart scan</b> — first run: walks your disks (file names only), lists folder candidates with counts. Likely-noise folders are unchecked, fiction folders are excluded entirely.',
 help_2:'➕ <b>Add folder</b> — use when you want precise control over the search scope; opens a folder picker.',
 help_3:'💾 <b>Save & build index</b> — applies the selected scope and starts indexing. Slow the first time, incremental afterwards.',
 help_4:'🔄 <b>Update index</b> — everyday maintenance: click when new documents arrive, about 1-3 minutes.',
 help_5:'🩺 <b>Health check</b> — runs an exam on a synthetic library: ranking quality, OCR error rate, robustness against corrupted files. Takes 1-2 minutes and <b>never touches your real library</b>. Report saved to eval_report.txt',
+help_6:'🗂 <b>Rebuild name index</b> — walks every disk but records file names only, nothing is opened. Afterwards filename search covers the whole machine (installers, videos, archives), not just the few thousand indexed documents. Run it after adding a drive or moving a lot of files.',
+nstat_off:'Disk-wide name index: not built yet · only indexed documents can be matched — click 🗂 Rebuild name index (about 3 minutes)',
+nstat_on:'Disk-wide name index: {n} files (names and paths only, contents never read)',
+m_names:'Building the disk-wide name index…',
+m_names_target:'Scanning {p}',
+m_names_progress:'Scanning {p} ({n} files so far)',
+m_names_finish:'Sorting the name index…',
+m_names_done:'Name index complete: {n} files',
+e_names_busy:'Another task is running — wait for it to finish',
 empty_hint:'Type a keyword to start searching',
 empty_tip:'<b>Tip</b>: the two filter boxes are optional; hit “Open” on a result to launch the original file',
 footer:'Second Brain __VER__ · results ranked by relevance (bm25) · health check: “🩺 Health check” in settings, or `selftest` on the command line — report in eval_report.txt',
@@ -1276,7 +1402,7 @@ found:'<b>{n}</b> results · {ms} ms',
 searching:'Searching…',
 need_kw:'Please type a keyword first',
 no_hit:'Nothing found for “{q}”',
-ev_h:'📁 Filename matches',ev_sub:'any file on disk · incl. Everything',ev_sub_off:'files already in the index',ev_tag:'disk',
+ev_h:'📁 Filename matches',ev_sub:'any file on disk · built-in name index',ev_sub_off:'files already in the index',ev_tag:'disk',
 ev_more:'more matches — add a keyword to narrow it down',
 ev_only:'Nothing in the index matched, but <b>{n}</b> filenames do:',
 no_hit_tip:'Try <b>another keyword</b>, <b>fewer filters</b>, or run the updater to index new files first.',
@@ -1345,7 +1471,7 @@ if(HAS_RESULT&&qEl.value.trim())go(); else if(!HAS_RESULT)showEmpty();
 if($('pm').textContent&&DIRS.length)pm.textContent='';
 }
 function toggleLang(){LANG=(LANG==='zh'?'en':'zh');try{localStorage.setItem('sb_lang',LANG)}catch(e){}
-applyLang();try{if(PROG_CACHE)renderProg(PROG_CACHE)}catch(e){}}
+applyLang();try{if(PROG_CACHE)renderProg(PROG_CACHE)}catch(e){}loadNames()}
 function showEmpty(){rEl.className='empty';rEl.innerHTML=esc(T('empty_hint'))+'<br>'+T('empty_tip')}
 let TOAST_T=0;
 function toast(m){const el=$('toast');el.textContent=m;el.classList.add('on');clearTimeout(TOAST_T);TOAST_T=setTimeout(()=>el.classList.remove('on'),1800)}
@@ -1407,7 +1533,7 @@ if(e.key==='Escape'){if(document.activeElement===qEl){qEl.value='';HAS_RESULT=0;
 if((e.ctrlKey||e.metaKey)&&e.key==='f'){e.preventDefault();qEl.focus();qEl.select()}});
 let DIRS=[],EXC=[],tid=0,PROG_CACHE=null;
 async function cfgLoad(){try{const c=await(await fetch('/api/config')).json();DIRS=c.include_dirs||[];EXC=c.exclude_dirs||[];
-if(!c.exists){showCfg(1);pm.textContent=T('first_run')}draw()}catch(e){}}
+if(!c.exists){showCfg(1);pm.textContent=T('first_run')}draw()}catch(e){}loadNames()}
 function showCfg(wizard){cfg.classList.add('on');if(wizard)$('gear').style.display='none'}
 function draw(){const el=$('dirs');if(!el)return;
 el.innerHTML=DIRS.map((d,i)=>'<span class=chip>'+esc(d)+' <b onclick=delD('+i+')>✕</b></span>').join('')
@@ -1441,6 +1567,23 @@ DIRS=gs.filter(g=>!g.noise).map(g=>g.dir);draw();
 pm.textContent=T('cand_done')}
 function candPick(i,on){const d=CAND[i].dir;
 if(on){if(!DIRS.includes(d))DIRS.push(d)}else{DIRS=DIRS.filter(x=>x!==d)}draw()}
+async function loadNames(){try{const d=await(await fetch('/api/names')).json();
+const el=$('nstat');if(!el)return;
+el.innerHTML=d.count>0?F(T('nstat_on'),{n:d.count.toLocaleString()}):esc(T('nstat_off'));
+}catch(e){}}
+async function buildNames(b){b.disabled=1;$('pw').style.display='';$('pi').style.width='3%';
+pm.textContent=T('m_names');
+try{const r=await(await fetch('/api/names',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+if(!r.ok){pm.textContent=T(r.k)||r.err||'';b.disabled=0;$('pw').style.display='none';return}}
+catch(e){pm.textContent=String(e);b.disabled=0;$('pw').style.display='none';return}
+clearInterval(tid);tid=setInterval(async()=>{let d;
+try{d=await(await fetch('/api/names')).json()}catch(e){return}
+if(d.state==='busy'){try{const s=await(await fetch('/api/status')).json();
+const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):10;$('pi').style.width=pc+'%';
+pm.textContent='🗂 '+(smsg(s)||T('m_names'));}catch(e){}}
+else{clearInterval(tid);b.disabled=0;$('pw').style.display='none';
+pm.textContent=d.state==='done'?F(T('m_names_done'),{n:d.n}):((T(d.k)||'')+' '+(d.err||''));
+loadNames()}},1000)}
 async function selfTest(b){b.disabled=1;$('pw').style.display='';$('pi').style.width='5%';
 pm.textContent=T('test_hint');
 await fetch('/api/selftest',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
@@ -1548,28 +1691,53 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
             elif self.path.startswith('/api/discover'):
                 body = json.dumps(dict(DISCOVER), ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/names'):
+                # 全盘文件名索引的构建进度 + 当前规模
+                try:
+                    with con_lock:
+                        cnt = file_count(conn())
+                except sqlite3.Error:
+                    cnt = 0
+                body = json.dumps({'state': NAMES.get('state'), 'n': NAMES.get('n', 0),
+                                   'count': cnt, 'err': NAMES.get('err', ''),
+                                   'k': NAMES.get('k', '')}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/files'):
-                # 第二路结果：文件名。索引内的一律能查；装了 Everything 且开着网页服务时再补全盘。
-                # 拿不到 Everything 就返回 st=off，界面照样显示索引内的那几条。
+                # 第二路结果：文件名。已入库的排前面（用户真正当资料看的那些），
+                # 再用自建的全盘文件名索引补齐。两者都没有时才退回 Everything ——
+                # 那条路径只为了照顾「装了 Everything 但还没建过文件名索引」的老用户。
                 qs = parse_qs(urlparse(self.path).query)
                 q = (qs.get('q', [''])[0] or '').strip()
                 items, st, more = [], 'off', False
                 if q:
                     try:
                         with con_lock:
-                            local = name_rows(conn(), q, 7)
+                            c = conn()
+                            local = name_rows(c, q, 4)
+                            has_disk = file_count(c) > 0
+                            disk = file_rows(c, q, 14) if has_disk else []
                     except sqlite3.Error:
-                        local = []
+                        local, disk, has_disk = [], [], False
                     for p in local:
                         items.append({'n': os.path.basename(p), 'p': p,
                                       'd': os.path.dirname(p), 't': 'file', 'src': 'idx'})
-                    ev, st = ev_search(q, 7)
                     seen = {os.path.normcase(x['p']) for x in items}
-                    for x in ev:
-                        if os.path.normcase(x['p']) not in seen:
-                            x['src'] = 'ev'
-                            items.append(x)
-                            seen.add(os.path.normcase(x['p']))
+                    for p in disk:
+                        key = os.path.normcase(p)
+                        if key in seen:
+                            continue
+                        items.append({'n': os.path.basename(p), 'p': p,
+                                      'd': os.path.dirname(p), 't': 'file', 'src': 'disk'})
+                        seen.add(key)
+                    if has_disk:
+                        st = 'ok'
+                    else:
+                        ev, st = ev_search(q, 7)
+                        for x in ev:
+                            if os.path.normcase(x['p']) not in seen:
+                                x['src'] = 'ev'
+                                items.append(x)
+                                seen.add(os.path.normcase(x['p']))
                     # 这一栏是「先告诉你有没有」，不是列表页：多了会把正文结果挤到屏幕外
                     more = len(items) > 6
                     items = items[:6]
@@ -1656,6 +1824,14 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                     sp.write_text(json.dumps(
                         {'scan_csv': 'scan_raw.csv', 'include_dirs': dirs, 'exclude_dirs': exc},
                         ensure_ascii=False, indent=2), encoding='utf-8')
+                    body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/names'):
+                if NAMES.get('state') == 'busy' or PROG.get('state') == 'busy':
+                    body = json.dumps({'ok': False, 'err': '已有任务在跑', 'k': 'e_names_busy'},
+                                      ensure_ascii=False).encode()
+                else:
+                    threading.Thread(target=build_files_index, daemon=True).start()
                     body = json.dumps({'ok': True}, ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/discover'):

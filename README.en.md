@@ -6,7 +6,7 @@ Turn the documents scattered across your hard drive into a local knowledge base 
 
 Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it works with the network cable unplugged.
 
-> Why not Everything? Everything searches file *names*. This searches what's written *inside* the files.
+> Why not Everything? It knows what a file is called, not what's written inside it. Second Brain does both, but the second one is the point — recalling a sentence and not which file holds it is something Everything can never answer.
 > Why not an online note app? Your contracts, medical records and internal training material don't belong on someone else's server.
 
 ---
@@ -76,10 +76,14 @@ The settings panel — scanning, updating and health checks all live here, no co
 <p align="center"><sub>The same panel switched to Chinese:</sub><br>
 <img src="assets/screenshot-settings-zh.png" width="620" alt="Second Brain settings panel, Chinese"></p>
 
-### Pairing it with Listary / Everything (one finds names, the other finds contents)
+### How it relates to Listary / Everything
 
-**The boundary first**: neither tool lets another program put results into its window. Listary 6 hasn't
-published a plugin API, and Everything's list only ever shows Everything's index. So "type once in
+**To be clear: filename search is built in.** Click 🗂 *Rebuild name index* in the settings panel and it
+walks every disk recording names only — nothing is opened or read (1.57M files took about 3 minutes here).
+After that, installers, images, videos and archives all match by name, next to your indexed documents.
+
+**The boundary still exists**: neither tool lets another program put results into its window. Listary 6
+hasn't published a plugin API, and Everything's list only ever shows Everything's index. So "type once in
 Listary and see both kinds of result" is not possible — that's their design, not a setting you missed.
 
 What does work is the other direction: **make Second Brain the window, and have it show both lists at once.**
@@ -88,27 +92,20 @@ What does work is the other direction: **make Second Brain the window, and have 
 
 | What you remember | Where it shows up |
 |---|---|
-| A file name or folder name | 📁 Filename matches (top, up to 6) |
+| A file name or folder name | 📁 Filename matches (top, up to 6, from the disk-wide name index) |
 | A phrase from inside a document | Content matches (below, with highlighted snippets) |
 
 The shot above searched for 国办发2019: nothing in any indexed body, but two file names matched — found
-without switching tools. **This works with or without Everything.** When Everything's web service is
-detected, the filename list also covers files outside the index and tags them 「全盘」 (disk); otherwise it
-lists indexed files only.
+without switching tools. The two lists are complementary: a file already listed as a content hit never
+reappears in the filename column.
 
-<details>
-<summary>Optional: let filename matching cover the whole disk (Everything, never required)</summary>
+**So do you still need Everything?** It doesn't conflict — each is fast at something different. Everything
+builds its index straight from the NTFS file table, so millions of files stay instant and it follows the
+system live; Second Brain's name index is a snapshot you rescan on demand.
 
-Second Brain only knows the documents it has indexed. To also match files that were never indexed
-(installers, videos, archives), it can ask Everything over Everything's built-in web service — no plugin
-needed:
-
-1. Everything → Tools → Options → **HTTP Server** → tick *Enable HTTP server*, port `8199`, OK
-2. Search again; entries that came from Everything carry the 「全盘」 tag
-
-The interface is read-only and only queried on the loopback address. Until you set it up, Second Brain
-never contacts it.
-</details>
+- Looking for something whose *name* you know: Everything is faster and always current
+- Asking which file ever *mentioned* a phrase: only Second Brain can answer
+- Added a drive or moved a lot of files: click 🗂 *Rebuild name index* once
 
 **Listary is still worth configuring** — its value is the entry point:
 
@@ -117,14 +114,6 @@ never contacts it.
 | `SecondBrain.exe 报销标准` | Opens with results already on screen |
 | `SecondBrain.exe --settings` | Opens into the settings panel |
 | `SecondBrain.exe --lang en 报销` | Forces the English interface (`zh` likewise) |
-
-Add one command in Listary (Options → Commands → ➕): keyword `sb`, pointing at `SecondBrain.exe`, arguments
-`"{query}"`. From then on, double-tap Ctrl anywhere, type `sb invoice policy`, and the window opens with
-results. Give Everything its own `ev` entry (arguments `-search "{query}"`) in the same panel and both
-habits live behind one hotkey: `ev` for names, `sb` for contents.
-
-PowerToys Run, shortcuts and AutoHotkey work the same way — anything that can pass an argument can jump
-straight to results.
 
 ### Command line (source edition, optional)
 
