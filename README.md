@@ -44,6 +44,8 @@ exe 版和源码版读写**同一个** `brain.db`，两者可以混用；把 exe
 
 ## 安装
 
+（exe 用户跳过本节——设置面板里的「🚀 智能扫描全盘」会替你完成这一切。）
+
 需要 Python 3.10+（推荐 3.12）。
 
 ```bash
@@ -60,31 +62,36 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 
 ## 用法
 
+### 图形界面（exe 的正常用法，全程不碰命令行）
+
+1. 双击 `SecondBrain.exe` 打开窗口，搜索框里输关键词、回车，就能搜文件**内容**
+2. **第一次使用**：点右上角「⚙ 设置 / 更新」，再点「🚀 智能扫描全盘」——程序会自动找出值得索引的文件夹，列出来让你确认后建库
+3. **日常维护**：电脑里来了新文档，设置里点一下「🔄 按现有范围更新」（约 1~3 分钟）
+4. 想确认引擎状态：设置里点「🩺 引擎体检」
+
+设置面板——扫描、更新、体检都在这里，不用记任何命令：
+
+<p align="center"><img src="assets/screenshot-settings-zh.png" width="620" alt="第二大脑设置面板：索引范围与五个维护按钮"></p>
+
+<p align="center"><sub>同一面板切到 English 的样子：</sub><br>
+<img src="assets/screenshot-settings-en.png" width="620" alt="Second Brain settings panel"></p>
+
+### 命令行（源码版进阶，exe 用户不需要）
+
 ```bash
-python scan_docs.py                 # 1. 扫描磁盘，生成待索引进清单（只记路径，不读内容）
-python brain.py index scope.json    # 2. 建索引（断点续建，实时显示 篇数/速率/ETA）
-python brain.py serve               # 3. 打开网页界面 http://127.0.0.1:8765
-```
-
-日常维护一条命令搞定（重扫 → 增量索引 → 清理失效条目）：
-
-```bash
-python brain.py update
-```
-
-其他：
-
-```bash
+python brain.py update              # 等价于设置里的「🔄 按现有范围更新」：重扫 → 增量索引 → 清理
+python brain.py serve               # 打开网页界面 http://127.0.0.1:8765
+python scan_docs.py                 # 只扫描磁盘，生成待索引清单（不读内容）
+python brain.py index scope.json    # 只建索引（断点续建，实时显示 篇数/速率/ETA）
 python brain.py search 关键词 [条数] [扩展名] [路径含]   # 命令行搜索
-python brain.py prune                                  # 只清理已删除文件的条目
-python brain.py selftest                               # 质量自检，报告写入 eval_report.txt
+python brain.py prune               # 只清理已删除文件的条目
+python brain.py selftest            # 质量自检，报告写入 eval_report.txt
 ```
 
-### 桌面窗口版
+### 桌面窗口版（源码用户）
 
 不想看到命令行窗口，运行 `python app_window.py`（Windows 上也可双击 `start.bat`）：它用 pywebview 起一个**独立桌面窗口**
 （不是浏览器标签页），背后跑本机的 HTTP 服务。没装 pywebview 时自动退回浏览器打开。
-
 `update.bat` 是日常维护入口，等价于 `python brain.py update`。
 
 ## 索引范围配置

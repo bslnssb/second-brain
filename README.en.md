@@ -44,6 +44,8 @@ failure breakdown), while text-based PDFs, Office files, EPUB and the rest behav
 
 ## Install
 
+(Exe users can skip this section — “🚀 Smart scan” in the settings panel does all of it for you.)
+
 Python 3.10+ required (3.12 recommended).
 
 ```bash
@@ -60,27 +62,33 @@ Edit `scope.json` and put your folders in `include_dirs` (lowercase paths; backs
 
 ## Usage
 
+### Graphical interface (the normal way with the exe — no terminal involved)
+
+1. Double-click `SecondBrain.exe`, type keywords in the search box, hit Enter — that's a full-text search over file **contents**
+2. **First run**: click “⚙ Settings” at the top right, then “🚀 Smart scan” — it picks out the folders worth indexing on its own and asks you to confirm
+3. **Routine maintenance**: got new documents? One click on “🔄 Update index” in settings (takes 1–3 minutes)
+4. Curious about engine health: “🩺 Health check” in the same panel
+
+The settings panel — scanning, updating and health checks all live here, no commands to remember:
+
+<p align="center"><img src="assets/screenshot-settings-en.png" width="620" alt="Second Brain settings panel: index scope and the five maintenance buttons"></p>
+
+<p align="center"><sub>The same panel switched to Chinese:</sub><br>
+<img src="assets/screenshot-settings-zh.png" width="620" alt="Second Brain settings panel, Chinese"></p>
+
+### Command line (source edition, optional)
+
 ```bash
-python scan_docs.py                 # 1. scan disks, write the candidate list (paths only, contents untouched)
-python brain.py index scope.json    # 2. build the index (resumable, shows count / rate / ETA)
-python brain.py serve               # 3. open the web UI at http://127.0.0.1:8765
-```
-
-Routine maintenance is one command (rescan → incremental index → prune stale entries):
-
-```bash
-python brain.py update
-```
-
-Other commands:
-
-```bash
+python brain.py update              # same as “🔄 Update index” in settings: rescan → incremental index → prune
+python brain.py serve               # open the web UI at http://127.0.0.1:8765
+python scan_docs.py                 # scan disks only, write the candidate list (paths only)
+python brain.py index scope.json    # build the index only (resumable, shows count / rate / ETA)
 python brain.py search <keywords> [limit] [ext] [path-contains]   # search from the terminal
 python brain.py prune                                            # only remove entries for vanished files
 python brain.py selftest                                         # quality self-test → eval_report.txt
 ```
 
-### Desktop window
+### Desktop window (source edition)
 
 Don't want a console window? Run `python app_window.py` (or double-click `start.bat` on Windows): it opens a
 **standalone desktop window** via pywebview — not a browser tab — backed by the local HTTP server.

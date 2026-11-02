@@ -1244,7 +1244,7 @@ if(e.key==='Escape'){if(document.activeElement===qEl){qEl.value='';HAS_RESULT=0;
 if((e.ctrlKey||e.metaKey)&&e.key==='f'){e.preventDefault();qEl.focus();qEl.select()}});
 let DIRS=[],EXC=[],tid=0,PROG_CACHE=null;
 async function cfgLoad(){try{const c=await(await fetch('/api/config')).json();DIRS=c.include_dirs||[];EXC=c.exclude_dirs||[];
-if(!c.exists){showCfg(1);pm.textContent=T('first_run');draw()}}catch(e){}}
+if(!c.exists){showCfg(1);pm.textContent=T('first_run')}draw()}catch(e){}}
 function showCfg(wizard){cfg.classList.add('on');if(wizard)$('gear').style.display='none'}
 function draw(){const el=$('dirs');if(!el)return;
 el.innerHTML=DIRS.map((d,i)=>'<span class=chip>'+esc(d)+' <b onclick=delD('+i+')>✕</b></span>').join('')
