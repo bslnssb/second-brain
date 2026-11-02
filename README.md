@@ -11,9 +11,9 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 
 ---
 
-<p align="center"><img src="assets/screenshot-quick.png" alt="双击 Ctrl 弹出的快搜窗：搜「报」，列出命中的文件与所在目录，每行带 Ctrl+1~9 快捷键"></p>
+<p align="center"><img src="assets/screenshot-quick.png" alt="双击 Ctrl 弹出的快搜窗：搜「报」，列出命中的文件（带真实系统图标）、正文命中带紫色标签，每行带 Ctrl+1~9 快捷键"></p>
 
-<p align="center"><sub>双击 Ctrl 弹出的快搜窗 —— 敲一个字就出结果，Ctrl+1~9 直接打开</sub></p>
+<p align="center"><sub>双击 Ctrl 弹出的快搜窗 —— 敲一个字就出结果，名字和正文一起搜，Ctrl+1~9 直接打开</sub></p>
 
 <p align="center"><img src="assets/screenshot-zh.png" alt="第二大脑的 exe 窗口：搜索「文档」，命中 7 篇，每条显示命中的那几行并高亮关键词"></p>
 
@@ -23,6 +23,9 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 ## 特性
 
 - **双击 Ctrl 快搜**：任何地方连按两下 Ctrl，屏幕上方弹出搜索框，敲两个字出结果，`↑↓` 选、`Enter` 开、`Ctrl+1~9` 直接开第 N 条、`Esc` 收起
+- **拼音也能搜**：输入 `azb` 出「安装包」，`xzrs` 出「行政人事」——学 Listary 的模糊习惯，首字母和全拼都认
+- **正文命中进快搜窗**：名字里没有、正文里有的，停手 300ms 后自动补进来，带紫色「正文」标签和命中那句话——这是 Listary 和 Everything 都做不到的
+- **真实系统图标**：每行显示该扩展名在资源管理器里的同一张图标（PDF 红、Word 蓝、Excel 绿），不是自绘简笔画
 - **中文全文搜索**：≥3 字走 FTS5 trigram 倒排（快且带高亮），1~2 字自动降级 LIKE 兜底
 - **扫描件自动 OCR**：纯图片 PDF 自动识别前 15 页，离线中文识别（RapidOCR），装好后零联网
 - **格式覆盖广**：PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
@@ -74,17 +77,20 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 | 按键 | 作用 |
 |---|---|
 | 直接打字 | 边打边出结果（前缀命中走索引，通常 0~2 毫秒） |
+| 打拼音 | `azb` 出「安装包」，`xzrs` 出「行政人事」——首字母和全拼都认 |
 | `↑` `↓` | 上下选 |
 | `Enter` | 打开当前行 |
 | `Ctrl+1` ~ `Ctrl+9` | 直接打开第 N 行，手不用离开键盘 |
 | `Ctrl+Enter` | 跳到主窗口，用同一个关键词做正文检索 |
 | `Esc` | 收起（点到别的窗口也会自动收起） |
 
+停手 300 毫秒后会自动补一次「包含」搜索：名字任意位置含关键词的、以及**正文里含关键词的**，带紫色「正文」标签和命中那句话一起排进列表。名字不够用的时候，正文来补。
+
 关掉主窗口不会退出程序——它收在托盘里继续等你的双击 Ctrl。要真的退出，右键托盘图标选「退出」。
 
-<p align="center"><img src="assets/screenshot-quick-empty.png" width="680" alt="刚唤出的快搜窗：一个输入框、一行提示，敲字就出结果"></p>
+<p align="center"><img src="assets/screenshot-quick-empty.png" width="680" alt="刚唤出的快搜窗：一个输入框、最近打开的文件列表、每行带真实系统图标"></p>
 
-<p align="center"><sub>刚唤出来的样子：一个输入框，一行提示</sub></p>
+<p align="center"><sub>刚唤出来的样子：最近开过的文件已经排在那了，不用打字也有东西可选</sub></p>
 
 **第一次使用：**
 
@@ -106,9 +112,13 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 ### 和 Listary / Everything 是什么关系
 
 **如果你要的就是「双击 Ctrl 打字找文件」，装上第二大脑就够了，不用再装 Listary。**
-快搜窗就是照它的习惯做的：双击 Ctrl 唤出、一行输入、九行结果、`Ctrl+1~9` 直接打开、`Esc` 收起。
-文件名和文件夹名一起搜 —— 输入一个「报」字，文件和目录都排进同一个列表（目录是黄色文件夹图标），
-`Enter` 打开文件、或者直接进到那个目录里。
+快搜窗就是照它的习惯做的：双击 Ctrl 唤出、一行输入、九行结果、`Ctrl+1~9` 直接打开、`Esc` 收起、
+**拼音模糊**（`azb` 出安装包）、**真实系统图标**（和资源管理器里同一张）、**空状态列最近文件**、
+**路径分级显示**（`C: › … › Library › 行政人事`）。
+文件名和文件夹名一起搜 —— 输入一个「报」字，文件和目录都排进同一个列表，`Enter` 打开文件或进到那个目录。
+
+**正文也能在快搜窗里出**：停手 300ms 后自动补一次正文搜索，命中带紫色「正文」标签和那句话的片段。
+这是 Listary 和 Everything 都做不到的——它们只看名字。
 
 **它没做的部分，也说清楚**：Listary 还有几样第二大脑没有 —— 在「打开 / 保存」对话框里直接跳目录、
 在资源管理器里选中文件、以及索引跟着 NTFS 实时更新（我们的文件名索引是一次扫描的快照，要手动重扫）。
@@ -120,8 +130,8 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 | | 找「我知道它叫什么」 | 问「哪句话在哪份文件里」 | 索引更新 |
 |---|---|---|---|
 | Everything | 最强，实时 | 做不到 | 跟盘实时 |
-| Listary | 强，还带启动器 | 做不到 | 跟盘实时 |
-| **第二大脑** | 够用：全盘 157 万文件名 + 11 万文件夹名，前缀命中 0.2ms | **只有它做得到** | 手动「重建文件名索引」 |
+| Listary | 强，还带拼音和启动器 | 做不到（要靠搭档 Gety） | 跟盘实时 |
+| **第二大脑** | 够用：全盘 157 万文件名 + 11 万文件夹名，前缀 0.2ms，带拼音 | **快搜窗里就有** | 手动「重建文件名索引」 |
 
 装过 Everything 的老用户还能用 `/api/files` 那条兜底通道（装 Everything 并开着它的 HTTP 服务时生效），
 但那只是给「已经装了 Everything、还没建过文件名索引」的人准备的过渡路径，正常用不到。

@@ -31,7 +31,7 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-APP_VERSION = 'v6.4'
+APP_VERSION = 'v6.5'
 
 def app_dir():
     """脚本所在目录；打包成 exe 后为 exe 所在目录（数据库/配置放在 exe 旁边）"""
@@ -66,6 +66,128 @@ NOISE_WORDS = ('steam', 'steamapps', 'epic games', '游戏', '驱动', 'driver',
 
 # 智能扫描发现结果（供 /api/discover 轮询）
 DISCOVER = {'state': 'idle', 'groups': [], 'err': ''}
+
+# ---------------------------------------------------------------- 拼音（azb → 安装包）
+# Listary 抓人的功能之一：打首字母就能找到中文名。做法是给文件夹名和已入库文档名
+# 各存一份「全拼」和「首字母」，查询时打字母就同时查这两列。
+# 全盘 157 万个文件名不参与：既没必要（平时要找的是文件夹和文档），也扛不住
+# （11 万条要十几秒，157 万就是几分钟，还要多占一倍存储）。
+_PY_MEMO = {}
+_PY_LOCK = threading.Lock()
+PY_READY = {'state': 'idle', 'n': 0, 'total': 0}   # 老库回填进度（首次启动时在后台补）
+
+
+def py_keys(name):
+    """名字 → (全拼, 首字母)，只含小写字母和数字。算不出来返回 ('', '')。
+
+    '产品迭代周报' → ('chanpindiedaizhoubao', 'cpddzb')
+    '2026 Q3' → ('2026q3', '2026q3')
+
+    中间的空格和分隔符全部去掉：用户打首字母不会去打空格，
+    '产品 迭代' 的 'cpdd' 必须能匹配上。"""
+    key = str(name or '')
+    with _PY_LOCK:
+        got = _PY_MEMO.get(key)
+    if got is not None:
+        return got
+    try:
+        from pypinyin import lazy_pinyin, Style
+        src = key.lower()
+        # errors 决定非汉字怎么走：英文数字原样留着（再小写），
+        # 于是 'Q3-周报' 不会因为夹了个英文就整串算不出来。
+        full = ''.join(lazy_pinyin(src, errors=lambda x: list(x)))
+        ini = ''.join(lazy_pinyin(src, style=Style.FIRST_LETTER, errors=lambda x: list(x)))
+        out = (re.sub(r'[^a-z0-9]', '', full)[:180], re.sub(r'[^a-z0-9]', '', ini)[:90])
+    except Exception:
+        out = ('', '')          # 没装 pypinyin 时静默降级，拼音功能不参与
+    with _PY_LOCK:
+        if len(_PY_MEMO) > 20000:      # 同名目录很多，缓存够用就行，别无限长大
+            _PY_MEMO.clear()
+        _PY_MEMO[key] = out
+    return out
+
+
+def _is_letters(q):
+    """纯 ascii 字母/数字才走拼音：中文查询自己就能匹配名字，不需要再翻一遍。"""
+    return bool(q) and all(('a' <= c <= 'z') or ('0' <= c <= '9') for c in q)
+
+
+def backfill_pinyin():
+    """给老库补拼音。11 万文件夹 + 8 千文档，十几秒。
+
+    v6.4 之前建的索引没有 py/ini 列，init_db 只会把列补上、值是 NULL。
+    这里用独立连接分批 UPDATE（每批 500 条、立刻 commit）：WAL 下读不会被挡，
+    搜索照常出结果，只是补到哪一行哪一行才参与拼音匹配。
+    单独开连接、不碰全局 conn()，免得和 HTTP 线程抢同一把 con_lock。"""
+    global PY_READY
+    if PY_READY['state'] == 'busy':
+        return 0
+    if not py_keys('测试')[1]:
+        PY_READY = {'state': 'nopinyin', 'n': 0, 'total': 0}   # 没装 pypinyin，直接放弃
+        return 0
+    PY_READY = {'state': 'busy', 'n': 0, 'total': 0}
+    done = 0
+    try:
+        con = sqlite3.connect(DB, check_same_thread=False)
+        con.execute('PRAGMA journal_mode=WAL')
+        for tbl in ('dirs', 'meta'):     # 这个函数可能先于 init_db 被调用，列自己补
+            for col in ('py', 'ini'):
+                try:
+                    con.execute(f'ALTER TABLE {tbl} ADD COLUMN {col} TEXT')
+                except sqlite3.Error:
+                    pass
+        con.commit()
+        jobs = []
+        for tbl, col in (('dirs', 'name'), ('meta', 'path')):
+            try:
+                left = con.execute(f'SELECT count(*) FROM {tbl} WHERE ini IS NULL').fetchone()[0]
+            except sqlite3.Error:
+                left = 0
+            if left:
+                jobs.append((tbl, col, left))
+        PY_READY['total'] = sum(j[2] for j in jobs)
+        for tbl, col, _left in jobs:
+            while True:
+                try:
+                    rows = con.execute(f'SELECT rowid, {col} FROM {tbl} '
+                                       'WHERE ini IS NULL LIMIT 500').fetchall()
+                except sqlite3.Error:
+                    break
+                if not rows:
+                    break
+                upd = []
+                for rid, val in rows:
+                    nm = val if tbl == 'dirs' else os.path.basename(str(val).rstrip('\\/'))
+                    py, ini = py_keys(nm or '')
+                    upd.append((py, ini, rid))
+                try:
+                    con.executemany(f'UPDATE {tbl} SET py=?, ini=? WHERE rowid=?', upd)
+                    con.commit()
+                except sqlite3.Error:
+                    break
+                done += len(upd)
+                PY_READY['n'] = done
+            try:    # 补完一表建索引；建了才走得了索引查询
+                con.execute(f'CREATE INDEX IF NOT EXISTS idx_{tbl}_ini ON {tbl}(ini)')
+                con.execute(f'CREATE INDEX IF NOT EXISTS idx_{tbl}_py ON {tbl}(py)')
+                con.commit()
+            except sqlite3.Error:
+                pass
+        con.close()
+        PY_READY = {'state': 'done', 'n': done, 'total': done}
+        if done:
+            print(f'拼音回填完成：{done} 条')
+    except Exception as e:
+        PY_READY = {'state': 'error', 'n': done, 'total': PY_READY.get('total', 0)}
+        print('拼音回填失败:', e)
+    return done
+
+
+def start_pinyin_backfill():
+    """后台补拼音，启动时不挡路。已经补过就直接返回。"""
+    t = threading.Thread(target=backfill_pinyin, daemon=True)
+    t.start()
+    return t
 
 def discover_scan(targets=None, home=None):
     """发现模式：走一遍全盘（或指定根），只记文件名，按顶层候选目录归组统计文档数，
@@ -179,7 +301,7 @@ def build_files_index(targets=None):
         # 光靠文件路径猜不出空文件夹。整体占比不到文件数的 1/4，代价可以接受。
         con.execute('DROP TABLE IF EXISTS dirs_new')
         con.execute('CREATE TABLE dirs_new(path TEXT PRIMARY KEY, name TEXT NOT NULL, '
-                    'parent TEXT)')
+                    'parent TEXT, py TEXT, ini TEXT)')
         con.commit()
         batch, dbatch, n = [], [], 0
         for i, root in enumerate(roots):
@@ -192,7 +314,8 @@ def build_files_index(targets=None):
                     continue
                 base = os.path.basename(cur)
                 if base:
-                    dbatch.append((cur, base.lower(), os.path.dirname(cur)))
+                    py, ini = py_keys(base)     # 建的时候就填好，重建完拼音立刻可用
+                    dbatch.append((cur, base.lower(), os.path.dirname(cur), py, ini))
                 for f in files:
                     batch.append((os.path.join(cur, f), f.lower(), cur,
                                   os.path.splitext(f)[1].lower(), None, None))
@@ -201,7 +324,7 @@ def build_files_index(targets=None):
                                         '(path,name,dir,ext,size,mtime) VALUES(?,?,?,?,?,?)', batch)
                         if dbatch:
                             con.executemany('INSERT OR REPLACE INTO dirs_new'
-                                            '(path,name,parent) VALUES(?,?,?)', dbatch)
+                                            '(path,name,parent,py,ini) VALUES(?,?,?,?,?)', dbatch)
                             dbatch = []
                         con.commit()
                         n += len(batch); batch = []
@@ -213,8 +336,8 @@ def build_files_index(targets=None):
                 con.commit()
                 n += len(batch); batch = []
         if dbatch:
-            con.executemany('INSERT OR REPLACE INTO dirs_new(path,name,parent) VALUES(?,?,?)',
-                            dbatch)
+            con.executemany('INSERT OR REPLACE INTO dirs_new'
+                            '(path,name,parent,py,ini) VALUES(?,?,?,?,?)', dbatch)
             con.commit()
         _prog(done=len(roots), msg='整理文件名索引…', k='m_names_finish')
         # 换表这一下很快，但要挡住 HTTP 线程正在进行的查询，避免它们撞上「表刚被删」
@@ -225,6 +348,8 @@ def build_files_index(targets=None):
             con.execute('DROP TABLE IF EXISTS dirs')
             con.execute('ALTER TABLE dirs_new RENAME TO dirs')
             con.execute('CREATE INDEX IF NOT EXISTS idx_dirs_name ON dirs(name)')
+            con.execute('CREATE INDEX IF NOT EXISTS idx_dirs_ini ON dirs(ini)')
+            con.execute('CREATE INDEX IF NOT EXISTS idx_dirs_py ON dirs(py)')
             con.commit()
         con.close()
         NAMES = {'state': 'done', 'err': '', 'n': n}
@@ -625,6 +750,24 @@ def init_db():
         con.execute('CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)')
     except sqlite3.Error:
         pass
+    # 打开记录。单独一张小表，不往 files 里加列：files 有 157 万行，
+    # 每打开一个文件就 UPDATE 它一次，会把索引页写脏，还会让全盘重建变慢。
+    # 这里只有几百行，读写都是微秒级。
+    con.execute("""CREATE TABLE IF NOT EXISTS recent(
+                   path TEXT PRIMARY KEY, name TEXT, isdir INTEGER DEFAULT 0,
+                   hits INTEGER DEFAULT 1, last REAL)""")
+    try:
+        con.execute('CREATE INDEX IF NOT EXISTS idx_recent_last ON recent(last DESC)')
+    except sqlite3.Error:
+        pass
+    # 拼音列（v6.5）：dirs 和 meta 各加两份。老库在这里补列，回填交给
+    # backfill_pinyin() 在后台线程慢慢走 —— 11 万条要十几秒，不能挡住启动。
+    for tbl in ('dirs', 'meta'):
+        for col in ('py', 'ini'):
+            try:
+                con.execute(f'ALTER TABLE {tbl} ADD COLUMN {col} TEXT')
+            except sqlite3.Error:
+                pass                    # 列已存在，或者这张表还没建
     return con
 
 def _count_docs(con):
@@ -985,31 +1128,151 @@ def _mini_rank(name, q):
     return 1 if name[i - 1] in _SEP else 2
 
 
-def mini_search(con, q, limit=9, deep=False):
+def record_open(con, path, isdir=False):
+    """记一次打开。写失败不能影响「打开文件」本身，所以整体吞异常。
+
+    Listary 的「越用越准」就是靠这张表 —— 同一档匹配里，你常开的排前面。"""
+    path = str(path or '')
+    if not path:
+        return
+    name = os.path.basename(path.rstrip('\\/')) or path
+    try:
+        con.execute(
+            'INSERT INTO recent(path,name,isdir,hits,last) VALUES(?,?,?,1,?) '
+            'ON CONFLICT(path) DO UPDATE SET hits=hits+1, last=excluded.last',
+            (path, name, 1 if isdir else 0, time.time()))
+        con.commit()
+    except sqlite3.Error:
+        pass
+
+
+def _recent_map(con):
+    """path(小写) -> 最近得分。整表读进内存：几十到几百行，比逐行查库便宜得多。"""
+    try:
+        rows = con.execute('SELECT path, hits, last FROM recent '
+                           'ORDER BY last DESC LIMIT 800').fetchall()
+    except sqlite3.Error:
+        return {}
+    out = {}
+    for i, (path, hits, _last) in enumerate(rows):
+        # 最近的第 0 名权重最高；开过的次数再叠一点，免得只开过一次的旧文件挤掉常驻文件。
+        out[os.path.normcase(path)] = (hits or 1) - i * 0.05
+    return out
+
+
+def recent_rows(con, limit=6):
+    """最近打开的文件/文件夹，最近的在最前 —— 快搜窗的空状态直接铺这一列。
+    Listary V7 起打开启动器就是这一屏，一个字都不用打。"""
+    try:
+        rows = con.execute('SELECT path,name,isdir FROM recent '
+                           'ORDER BY last DESC LIMIT ?', (limit,)).fetchall()
+    except sqlite3.Error:
+        return []
+    out, seen = [], set()
+    for path, name, isdir in rows:
+        key = os.path.normcase(path)
+        if key in seen or not os.path.exists(path):   # 删掉的、挪走的就别占位置了
+            continue
+        seen.add(key)
+        out.append({'n': name or os.path.basename(path.rstrip('\\/')) or path,
+                    'p': path, 'd': os.path.dirname(path.rstrip('\\/')),
+                    't': 'dir' if isdir else 'file',
+                    'e': '' if isdir else os.path.splitext(path)[1].lower()})
+    return out
+
+
+def _py_hits(con, q, deep, limit=40):
+    """纯字母输入时补一档拼音匹配。返回 {小写路径: (原路径, 等级, 是否目录)}，
+    等级越小越准：0 首字母前缀 / 1 全拼前缀 / 2 首字母包含 / 3 全拼包含。
+
+    前缀两档走 idx_*_ini / idx_*_py，11 万行也是毫秒级；"包含"只能全表 instr，
+    所以只在 deep（用户停手 300ms）时才做。"""
+    if not _is_letters(q):
+        return {}
+    hi = q + '\uffff'
+    found = {}
+
+    def take(tbl, isdir, sql, args, level):
+        try:
+            rows = con.execute(sql, args).fetchall()
+        except sqlite3.Error:
+            return                       # 老库还没建这张表 / 还没补拼音列
+        for (p,) in rows:
+            k = os.path.normcase(p)
+            if k not in found or level < found[k][1]:
+                found[k] = (p, level, isdir)
+
+    for tbl, isdir in (('dirs', True), ('meta', False)):
+        take(tbl, isdir, f'SELECT path FROM {tbl} WHERE ini>=? AND ini<? LIMIT ?',
+             (q, hi, limit), 0)
+        take(tbl, isdir, f'SELECT path FROM {tbl} WHERE py>=? AND py<? LIMIT ?',
+             (q, hi, limit), 1)
+        if deep:
+            take(tbl, isdir, f'SELECT path FROM {tbl} WHERE instr(ini,?)>0 LIMIT ?',
+                 (q, limit), 2)
+            take(tbl, isdir, f'SELECT path FROM {tbl} WHERE instr(py,?)>0 LIMIT ?',
+                 (q, limit), 3)
+    return found
+
+
+# 拼音的排序位。第一档给「整个名字的首字母正好等于关键词」——打 azb 出现「安装包」，
+# 这是最准的一种命中，比一堆恰好以 AZB 开头的英文文件更该排在前面。
+# 其余三档排在「名字里直接含关键词」之后，但仍然进得来。
+def _py_rank(level, name, q):
+    if level == 0:
+        # 整个名字的首字母正好等于关键词：打 azb 得到「安装包」，这是最该排第一的命中。
+        # 给负分是因为「名字以 azb 开头」的英文文件可能有几十个（游戏资源里全是 AZB_xxx），
+        # 排在 0 后面就永远看不见了。
+        return -0.15 if py_keys(name)[1] == q else 1.2
+    return (2.4, 3.0, 3.2)[level - 1]
+
+
+def _body_hits(con, q, limit=3):
+    """正文命中，排在名字命中之后垫底。片段里 char(1)/char(2) 是高亮标记，
+    前端换成 <mark> —— 这两家长处都不在正文，这是第二大脑唯一守得住的差异。"""
+    try:
+        rows = search_rows(con, q, limit=limit, with_name=False)
+    except Exception:
+        return []
+    out = []
+    for path, snip in rows:
+        s = re.sub(r'\s+', ' ', str(snip or '')).strip()
+        out.append({'n': os.path.basename(path) or path, 'p': path,
+                    'd': os.path.dirname(path), 't': 'doc',
+                    'e': os.path.splitext(path)[1].lower(), 'b': s[:110]})
+    return out
+
+
+def mini_search(con, q, limit=9, deep=False, body=False):
     """返回 {'items': [...], 'deep': bool, 'ms': int}。
-    deep=False 只做前缀匹配（毫秒级）；deep=True 补上「名字里任何位置包含」。"""
+
+    deep=False：中文前缀 + 拼音前缀，全部走索引，毫秒级；
+    deep=True ：再加「名字任意位置包含」（全表扫）和拼音模糊 —— 用户停手后才发；
+    body=True ：最后补几条正文命中（带片段），排在名字命中后面。"""
     q = (q or '').strip().lower()
     if not q:
         return {'items': [], 'deep': deep, 'ms': 0, 'n': 0}
+    ck = (q, bool(body))
     if deep:
         with MINI_LOCK:
-            got = MINI_CACHE.get(q)
+            got = MINI_CACHE.get(ck)
         if got and time.time() - got[0] < MINI_TTL:
             return {'items': [dict(x) for x in got[1][:limit]], 'deep': True, 'ms': 0,
                     'n': len(got[1]), 'cache': True}
     t0 = time.perf_counter()
     items, seen = [], set()
 
-    def add(path, isdir, ext=''):
+    def add(path, isdir, ext='', rank=None):
         key = os.path.normcase(path)
         if key in seen:
             return
         seen.add(key)
-        items.append({'n': os.path.basename(path.rstrip('\\/')) or path,
-                      'p': path,
+        name = os.path.basename(path.rstrip('\\/')) or path
+        items.append({'n': name, 'p': path,
                       'd': os.path.dirname(path.rstrip('\\/')),
                       't': 'dir' if isdir else 'file',
-                      'e': '' if isdir else ext})
+                      'e': '' if isdir else ext,
+                      'r': _mini_rank(name.lower(), q) if rank is None else rank})
 
     frows = drows = []
     # 两张表分开兜错：老库还没有 dirs 表（v6.3 之前建的索引），
@@ -1038,18 +1301,38 @@ def mini_search(con, q, limit=9, deep=False):
         add(path, False, ext or '')
     for (path,) in drows:
         add(path, True)
+    # 拼音：azb → 安装包。和中文命中并存，同一个路径只留更准的那个位次。
+    for _k, (path, level, isdir) in _py_hits(con, q, deep).items():
+        add(path, isdir, os.path.splitext(path)[1].lower(),
+            _py_rank(level, os.path.basename(path.rstrip('\\/')) or path, q))
     if not items and not _has_files(con):
         # 还没建过全盘索引时，至少让已入库的文档文件名可用
         for p in name_rows(con, q, limit * 3):
             add(p, False, os.path.splitext(p)[1].lower())
-    items.sort(key=lambda it: (_mini_rank(it['n'].lower(), q), len(it['n']), it['n'].lower()))
+    # 排序分三档，和 Listary V7.1 的思路一致：先看名字像不像（前缀 > 词边界 > 中间），
+    # 同一档里再看你平时开不开它 —— 常开的排前面，但你打的前缀永远压过习惯。
+    rec = _recent_map(con)
+    items.sort(key=lambda it: (it['r'],
+                               -rec.get(os.path.normcase(it['p']), 0.0),
+                               len(it['n']), it['n'].lower()))
+    out = items[:limit]
+    if body:
+        # 正文命中垫在名字命中之后。名字已经给出了答案时就不占位置了，
+        # 只留出 3 行给「文件名里没有、正文里提过」的文档。
+        room = max(0, min(3, limit - len(out)))
+        if room:
+            for it in _body_hits(con, q, room):
+                if os.path.normcase(it['p']) in seen:
+                    continue
+                seen.add(os.path.normcase(it['p']))
+                out.append(it)
     if deep:
         with MINI_LOCK:
             if len(MINI_CACHE) > MINI_CACHE_MAX:
                 for k in sorted(MINI_CACHE, key=lambda k: MINI_CACHE[k][0])[:100]:
                     MINI_CACHE.pop(k, None)
-            MINI_CACHE[q] = (time.time(), [dict(x) for x in items])
-    return {'items': items[:limit], 'deep': deep,
+            MINI_CACHE[ck] = (time.time(), [dict(x) for x in items])
+    return {'items': out, 'deep': deep,
             'ms': int((time.perf_counter() - t0) * 1000), 'n': len(items)}
 
 def search_rows(con, q, limit=20, ext=None, path_filter=None, with_name=True):
@@ -1203,6 +1486,173 @@ def ev_search(q, limit=20):
     return items, 'ok'
 
 
+# ---------------------------------------------------------------- 系统图标
+# 快搜窗里的图标原先是自绘的「文档 + 彩色条」，一看就是画的。系统图标好看在哪：
+# 它和你在资源管理器里看到的是同一张图，认得出来。做法是拿扩展名问 shell
+# （SHGFI_USEFILEATTRIBUTES 允许传 ".pdf" 这种不存在的路径），再画到 32 位 DIB 上。
+# 只依赖 ctypes + zlib，不引进 PIL —— 打包体积一点没涨。
+ICON_CACHE = {}
+ICON_LOCK = threading.Lock()
+ICON_SIZE = 32                     # 界面显示 17px，2 倍屏正好吃满
+
+
+def _png_chunk(tag, data):
+    import struct
+    import zlib as _z
+    c = tag + data
+    return (struct.pack('>I', len(data)) + c
+            + struct.pack('>I', _z.crc32(c) & 0xFFFFFFFF))
+
+
+def _rgba_to_png(buf, size=ICON_SIZE):
+    """BGRA（DIB 从上到下的顺序）→ PNG。手写编码比引依赖划算：
+    IHDR + 一行一个 0 过滤字节的 IDAT + IEND，就这三块。"""
+    import struct
+    import zlib as _z
+    alphas = buf[3::4]
+    opaque = not any(alphas)       # 老式图标只给了 AND 掩码，alpha 全是 0
+    rows = []
+    for y in range(size):
+        base = y * size * 4
+        row = bytearray(size * 4)
+        for x in range(size):
+            i = base + x * 4
+            row[x * 4] = buf[i + 2]        # R
+            row[x * 4 + 1] = buf[i + 1]    # G
+            row[x * 4 + 2] = buf[i]        # B
+            row[x * 4 + 3] = 255 if opaque else buf[i + 3]
+        rows.append(b'\x00' + bytes(row))
+    raw = b''.join(rows)
+    return (b'\x89PNG\r\n\x1a\n'
+            + _png_chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0))
+            + _png_chunk(b'IDAT', _z.compress(raw, 9))
+            + _png_chunk(b'IEND', b''))
+
+
+def _hicon_png(hicon, size=ICON_SIZE):
+    """HICON → PNG。画进一块自带 alpha 的 DIB，AlphaBlend 由 DrawIconEx 处理。
+
+    每个 GDI 函数都要显式写 argtypes：不写的话 ctypes 按 int 传参，
+    64 位下句柄被截成 32 位，画出来是一片空白（和 SetWindowsHookEx 那个坑同源）。"""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    class BIH(ctypes.Structure):
+        _fields_ = [('biSize', wintypes.DWORD), ('biWidth', wintypes.LONG),
+                    ('biHeight', wintypes.LONG), ('biPlanes', wintypes.WORD),
+                    ('biBitCount', wintypes.WORD), ('biCompression', wintypes.DWORD),
+                    ('biSizeImage', wintypes.DWORD), ('biXPelsPerMeter', wintypes.LONG),
+                    ('biYPelsPerMeter', wintypes.LONG), ('biClrUsed', wintypes.DWORD),
+                    ('biClrImportant', wintypes.DWORD)]
+
+    class BI(ctypes.Structure):
+        _fields_ = [('bmiHeader', BIH), ('bmiColors', wintypes.DWORD * 3)]
+
+    gdi32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                       ctypes.POINTER(ctypes.c_void_p),
+                                       ctypes.c_void_p, ctypes.c_uint]
+    gdi32.CreateDIBSection.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.SelectObject.restype = ctypes.c_void_p
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    user32.GetDC.argtypes = [ctypes.c_void_p]
+    user32.GetDC.restype = ctypes.c_void_p
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    user32.DrawIconEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+    user32.DrawIconEx.restype = ctypes.c_int
+
+    bi = BI()
+    bi.bmiHeader.biSize = ctypes.sizeof(BIH)
+    bi.bmiHeader.biWidth = size
+    bi.bmiHeader.biHeight = -size         # 负数 = 从上往下写，省一次翻转
+    bi.bmiHeader.biPlanes = 1
+    bi.bmiHeader.biBitCount = 32
+    bi.bmiHeader.biCompression = 0         # BI_RGB
+
+    hdc_screen = user32.GetDC(None)
+    if not hdc_screen:
+        return None
+    bits = ctypes.c_void_p()
+    hbmp = gdi32.CreateDIBSection(hdc_screen, ctypes.byref(bi), 0,
+                                  ctypes.byref(bits), None, 0)
+    if not hbmp or not bits:
+        user32.ReleaseDC(None, hdc_screen)
+        return None
+    mdc = gdi32.CreateCompatibleDC(hdc_screen)
+    gdi32.SelectObject(mdc, hbmp)
+    user32.DrawIconEx(mdc, 0, 0, ctypes.c_void_p(hicon), size, size, 0, None, 3)  # DI_NORMAL
+    buf = ctypes.string_at(bits, size * size * 4)
+    gdi32.DeleteDC(mdc)
+    gdi32.DeleteObject(hbmp)
+    user32.ReleaseDC(None, hdc_screen)
+    return _rgba_to_png(buf, size) if buf else None
+
+
+def sys_icon(ext, isdir=False):
+    """扩展名 → PNG 字节（按扩展名缓存，首次提取一次就够）。
+    拿不到时返回 None，前端回落到自绘图标，不影响可用性。
+
+    用 ctypes 直接调 shell32：pywin32 的 win32gui 并没有封装 SHGetFileInfo。"""
+    key = 'dir' if isdir else (ext or '').lower()
+    with ICON_LOCK:
+        if key in ICON_CACHE:
+            return ICON_CACHE[key]
+    png = None
+    hicon = 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEINFOW(ctypes.Structure):
+            _fields_ = [('hIcon', wintypes.HANDLE), ('iIcon', ctypes.c_int),
+                        ('dwAttributes', wintypes.DWORD),
+                        ('szDisplayName', wintypes.WCHAR * 260),
+                        ('szTypeName', wintypes.WCHAR * 80)]
+
+        shell32 = ctypes.windll.shell32
+        shell32.SHGetFileInfoW.restype = ctypes.c_size_t
+        shell32.SHGetFileInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                          ctypes.POINTER(SHFILEINFOW),
+                                          wintypes.UINT, wintypes.UINT]
+        SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES = 0x100, 0x0, 0x10
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_DIRECTORY = 0x80, 0x10
+        if isdir:
+            # 文件夹图标问不出来：shell 不给「目录类型」的通用图标，只认真实存在的目录。
+            # 拿 Windows 目录当样本问一次就行，所有文件夹共用同一张。
+            name = os.environ.get('WINDIR') or 'C:\\'
+            args_flags = SHGFI_ICON | SHGFI_LARGEICON
+        else:
+            name = key or '.txt'
+            # USEFILEATTRIBUTES：只按扩展名查类型对应的图标，不去碰磁盘
+            args_flags = SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES
+        attr = FILE_ATTRIBUTE_DIRECTORY if isdir else FILE_ATTRIBUTE_NORMAL
+        info = SHFILEINFOW()
+        ok = shell32.SHGetFileInfoW(name, attr, ctypes.byref(info),
+                                    ctypes.sizeof(info), args_flags)
+        hicon = int(getattr(info, 'hIcon', 0) or 0)
+        if ok and hicon:
+            png = _hicon_png(hicon)
+    except Exception:
+        png = None
+    finally:
+        if hicon:
+            try:
+                import ctypes
+                ctypes.windll.user32.DestroyIcon(ctypes.c_void_p(hicon))
+            except Exception:
+                pass
+    with ICON_LOCK:                    # 失败也缓存（None），免得每行都重试一次
+        ICON_CACHE[key] = png
+    return png
+
+
 def allow_open(paths, replace=False):
     """登记「刚出现在结果里的路径」。/open 与快搜窗的「打开」都只认这份白名单 ——
     os.startfile 对 .exe 就是「运行」，没有闸门等于给了一个任意路径执行入口。
@@ -1312,13 +1762,13 @@ MINI_TPL = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:#fff;overflow:hidden;
-  font-family:"Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+  font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
   color:#1a2233;-webkit-font-smoothing:antialiased}
 #pane{display:flex;flex-direction:column;height:100%}
-.bar{display:flex;align-items:center;height:60px;padding:0 14px 0 22px;flex:0 0 auto}
+.bar{display:flex;align-items:center;height:62px;padding:0 12px 0 22px;flex:0 0 auto}
 #q{flex:1;min-width:0;border:0;outline:0;background:transparent;font-size:19px;
-  font-family:inherit;color:#101828;letter-spacing:.2px}
-#q::placeholder{color:#a6adbb;font-weight:400}
+  font-family:inherit;color:#101828;letter-spacing:.2px;line-height:1.4}
+#q::placeholder{color:#a9b0be;font-weight:400}
 .act{display:flex;align-items:center;gap:2px;flex:0 0 auto}
 .ab{border:0;background:transparent;width:34px;height:34px;border-radius:9px;cursor:pointer;
   display:flex;align-items:center;justify-content:center;color:#9aa3b2;transition:.13s}
@@ -1327,30 +1777,48 @@ html,body{height:100%;background:#fff;overflow:hidden;
 #list{flex:0 0 auto;padding:0 8px;overflow:hidden}
 .row{display:flex;align-items:center;gap:11px;height:50px;padding:0 14px 0 12px;
   border-radius:9px;cursor:default;user-select:none;position:relative}
-.row.on{background:#eef2fb}
-.row.on:before{content:"";position:absolute;left:0;top:11px;bottom:11px;width:3px;
+#list.rec .row{height:46px}
+.row.on{background:#f2f5fc}
+.row.on:before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;
   border-radius:2px;background:#4f6ef7}
-.ico{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:19px}
-.txt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
-.nm{font-size:14.5px;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ico{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:19px;height:19px}
+.ico .ic{display:block;width:19px;height:19px}
+.ico .fic{display:none;width:17px;height:17px}
+.ico.noic .ic{display:none}
+.ico.noic .fic{display:block}
+.txt{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.nm{font-size:14.5px;line-height:1.22;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:#1b2334}
 .nm b{font-weight:700;color:#0d1424}
-.pt{font-size:12px;color:#98a0ae;line-height:1.2;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap}
-.kbd{flex:0 0 auto;font-size:12px;color:#b7bdc9;font-variant-numeric:tabular-nums}
+.tag{font-style:normal;font-size:10.5px;line-height:1;color:#8b7ad6;background:#f1eefc;
+  border-radius:4px;padding:2px 5px;margin-left:7px;vertical-align:1.5px;letter-spacing:.02em}
+.sn{font-size:12px;line-height:1.25;color:#9aa3b2;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.sn mark{background:#fff2b8;border-radius:2px;padding:0 1px;color:#5a4a12;font-weight:500}
+.pt{display:flex;align-items:baseline;font-size:11.5px;line-height:1.2;color:#aab2c0;
+  white-space:nowrap;overflow:hidden}
+.pt b{font-weight:400;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto}
+.pt b.last{color:#7c8698}
+.pt u{text-decoration:none;color:#d4d9e2;margin:0 5px;flex:0 0 auto;font-size:11px}
+.rh{display:flex;align-items:center;height:26px;padding:0 14px 0 13px;font-size:11px;
+  letter-spacing:.06em;color:#b3bac7;flex:0 0 auto}
+.rh span{margin-left:auto;letter-spacing:0;color:#c6ccd7}
+.kbd{flex:0 0 auto;font-size:12px;color:#c0c6d1;font-variant-numeric:tabular-nums}
 .row.on .kbd{color:#8b93a5}
-.foot{display:flex;align-items:center;justify-content:space-between;height:38px;
-  margin:0 8px;padding:0 12px;border-top:1px solid #f0f1f5;font-size:12.5px;color:#7b8398;
+.foot{display:flex;align-items:center;justify-content:space-between;height:36px;
+  margin:0 8px;padding:0 12px;border-top:1px solid #f1f2f6;font-size:12.5px;color:#7b8398;
   gap:10px;flex:0 0 auto}
 .foot.hide{display:none}
+.rh.hide{display:none}
 .foot .fl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .foot .fr{flex:0 0 auto;color:#a7aebc;font-size:11.5px}
 .foot b{font-weight:600;color:#3b465c}
 .empty{height:64px;display:flex;align-items:center;padding:0 24px;font-size:13px;color:#9aa3b2}
-.empty i{font-style:normal;margin-left:auto;color:#c2c8d4;font-size:12px}
+.empty i{font-style:normal;margin-left:auto;color:#c2c8d4;font-size:11.5px}
 </style></head><body>
 <div id="pane">
   <div class="bar">
-    <input id="q" spellcheck="false" autocomplete="off" placeholder="搜索应用和文件">
+    <input id="q" spellcheck="false" autocomplete="off" placeholder="搜索文件名、文件夹或正文内容">
     <div class="act">
       <button class="ab" id="btnDetail" title="详细搜索（Ctrl+Enter）">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -1363,16 +1831,19 @@ html,body{height:100%;background:#fff;overflow:hidden;
       </button>
     </div>
   </div>
+  <div class="rh hide" id="rh">最近打开<span>Enter 直接打开</span></div>
   <div id="list"></div>
   <div class="foot hide" id="foot"><span class="fl" id="ft"></span>
     <span class="fr" id="fr">Ctrl+Enter 详细搜索</span></div>
-  <div class="empty hide" id="empty">输入关键词，边打边出结果<i>↑↓ 选择 · Enter 打开 · Esc 关闭</i></div>
+  <div class="empty hide" id="empty">输入文件名或正文关键词，边打边出结果<i>双击 Ctrl 唤出 · Esc 关闭</i></div>
 </div>
 <script>
 var Q = document.getElementById('q'), LIST = document.getElementById('list'),
     FOOT = document.getElementById('foot'), FT = document.getElementById('ft'),
+    FR = document.getElementById('fr'), RH = document.getElementById('rh'),
     EMPTY = document.getElementById('empty');
 var API = null, rows = [], cur = -1, seq = 0, timer = 0, deeptimer = 0, shown = 60;
+var MODE = 'empty', RECENT = [];
 var TYPE = {'.pdf':'#e05252','.doc':'#2b6cb0','.docx':'#2b6cb0','.xls':'#2f855a',
   '.xlsx':'#2f855a','.csv':'#2f855a','.ppt':'#dd6b20','.pptx':'#dd6b20',
   '.md':'#64748b','.txt':'#64748b','.jpg':'#7c3aed','.png':'#7c3aed','.jpeg':'#7c3aed',
@@ -1382,13 +1853,33 @@ var TYPE = {'.pdf':'#e05252','.doc':'#2b6cb0','.docx':'#2b6cb0','.xls':'#2f855a'
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function ico(it){
-  if(it.t==='dir')return '<svg width="17" height="17" viewBox="0 0 24 24"><path d="M2.6 7.1c0-1 .8-1.8 1.8-1.8h4c.5 0 1 .2 1.3.6l1.3 1.5h8.7c1 0 1.8.8 1.8 1.8v9.4c0 1-.8 1.8-1.8 1.8H4.4c-1 0-1.8-.8-1.8-1.8z" fill="#f4bd4e"/></svg>';
-  var c = TYPE[it.e] || '#a3a9b6';
-  return '<svg width="17" height="17" viewBox="0 0 24 24"><path d="M4.8 2.6h8.4L18.8 8.3v13.1H4.8z" fill="#fff" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><path d="M13.2 2.6v5.7h5.6" fill="none" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><rect x="7.2" y="11.7" width="9" height="2.6" rx="1.3" fill="'+c+'" opacity=".92"/><rect x="7.2" y="16" width="5.8" height="2.6" rx="1.3" fill="'+c+'" opacity=".45"/></svg>';
+  /* 真图标：向 shell 要该扩展名的图标（/api/icon），和资源管理器里看到的是同一张。
+     拿不到就把这批 SVG 露出来（onerror 给父元素加 noic），不影响可用性。 */
+  var dir = it.t==='dir';
+  var fb = dir
+    ? '<svg class="fic" viewBox="0 0 24 24"><path d="M2.6 7.1c0-1 .8-1.8 1.8-1.8h4c.5 0 1 .2 1.3.6l1.3 1.5h8.7c1 0 1.8.8 1.8 1.8v9.4c0 1-.8 1.8-1.8 1.8H4.4c-1 0-1.8-.8-1.8-1.8z" fill="#f4bd4e"/></svg>'
+    : (function(){ var c = TYPE[it.e] || '#a3a9b6';
+        return '<svg class="fic" viewBox="0 0 24 24"><path d="M4.8 2.6h8.4L18.8 8.3v13.1H4.8z" fill="#fff" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><path d="M13.2 2.6v5.7h5.6" fill="none" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><rect x="7.2" y="11.7" width="9" height="2.6" rx="1.3" fill="'+c+'" opacity=".92"/><rect x="7.2" y="16" width="5.8" height="2.6" rx="1.3" fill="'+c+'" opacity=".45"/></svg>'; })();
+  var q = dir ? 'd=1' : 'e='+encodeURIComponent(it.e||'');
+  return '<img class="ic" src="/api/icon?'+q+'" alt="" '
+    +'onerror="this.parentNode.classList.add(&quot;noic&quot;)">'+fb;
 }
-function midCut(p){
-  if(p.length<=56)return p;
-  return p.slice(0,15)+'…'+p.slice(-38);
+/* 路径分级：Listary 7.1 起把文件夹路径拆成一级一级，每级独立好读，
+   比一整行灰字好认得多。层级超过三级就保留盘符 + 最后两级——
+   最后一级就是文件所在的文件夹，这才是你要的定位信息。 */
+function segs(p){
+  if(!p)return '';
+  var parts=String(p).split(/[\\\/]+/), out=[];
+  for(var k=0;k<parts.length;k++) if(parts[k]) out.push(parts[k]);
+  if(!out.length)return '';
+  var show=out;
+  if(out.length>3) show=[out[0],'…',out[out.length-2],out[out.length-1]];
+  var h='';
+  for(var i=0;i<show.length;i++){
+    if(i)h+='<u>›</u>';
+    h+='<b'+(i===show.length-1?' class="last"':'')+'>'+esc(show[i])+'</b>';
+  }
+  return h;
 }
 function hl(name,q){
   if(!q)return esc(name);
@@ -1400,9 +1891,10 @@ function hl(name,q){
   return out+esc(name.slice(i));
 }
 function height(){
-  var n=rows.length, h=60;
-  if(n>0) h+=n*50+38; else h+=64;   /* 空态 60+64=124，Listary 的条也是这个比例 */
-  return h;
+  var n=rows.length;
+  if(!n) return 62+64;                      /* 空且没记录：一条提示，最克制 */
+  if(MODE==='recent') return 62+26+n*46+36; /* 空状态推荐：标题行 + 紧凑行 + 提示条 */
+  return 62+n*50+36;
 }
 function resize(){
   var h=height();
@@ -1410,26 +1902,68 @@ function resize(){
   shown=h;
   if(API&&API.resize)API.resize(h);
 }
+/* 正文片段的 char(1)/char(2) 是检索层给的命中标记，换成 <mark>；
+   其余字符一律转义，片段来自本地文件的任意内容，不能直接塞进 innerHTML。 */
+function snipHtml(s){
+  var out='', open=false;
+  s=String(s||'');
+  for(var i=0;i<s.length;i++){
+    var c=s.charAt(i);
+    if(c==='\u0001'){ if(!open){out+='<mark>';open=true;} }
+    else if(c==='\u0002'){ if(open){out+='</mark>';open=false;} }
+    else out+=esc(c);
+  }
+  return out+(open?'</mark>':'');
+}
+function rowHtml(it,i,q,withKey){
+  var sub = it.b
+    ? '<span class="sn">'+snipHtml(it.b)+'</span>'
+    : '<span class="pt">'+segs(it.d||'')+'</span>';
+  return '<div class="row'+(i===cur?' on':'')+'" data-i="'+i+'">'
+    +'<span class="ico">'+ico(it)+'</span>'
+    +'<span class="txt"><span class="nm">'+(q?hl(it.n,q):esc(it.n))
+      +(it.b?'<i class="tag">正文</i>':'')+'</span>'+sub+'</span>'
+    +(withKey?'<span class="kbd">'+(i<9?'Ctrl+'+(i+1):'')+'</span>':'')+'</div>';
+}
 function render(items,q,keep){
   var old=cur;
+  MODE='result';
   rows=items||[];
   cur=rows.length?(keep&&old>=0?Math.min(old,rows.length-1):0):-1;
   var html='';
-  for(var i=0;i<rows.length;i++){
-    var it=rows[i];
-    html+='<div class="row'+(i===cur?' on':'')+'" data-i="'+i+'">'
-      +'<span class="ico">'+ico(it)+'</span>'
-      +'<span class="txt"><span class="nm">'+hl(it.n,q)+'</span>'
-      +'<span class="pt">'+esc(midCut(it.d||''))+'</span></span>'
-      +'<span class="kbd">'+(i<9?'Ctrl+'+(i+1):'')+'</span></div>';
-  }
+  for(var i=0;i<rows.length;i++) html+=rowHtml(rows[i],i,q,true);
+  LIST.className='';
   LIST.innerHTML=html;
-  EMPTY.classList.toggle('hide', !!q);
+  RH.classList.add('hide');
+  EMPTY.classList.add('hide');
   FOOT.classList.toggle('hide', !rows.length);
   if(rows.length){
     FT.innerHTML='展示更多 “'+esc(q)+'” 的搜索结果';
+    FR.innerHTML='Ctrl+Enter 详细搜索';
   }
   bind(); resize();
+}
+/* 空状态：打开就先给一屏「刚动过的文件」。Listary V7 起就是这个做法——
+   很多时候要找的东西就在眼前，搜索这一步可以直接省掉。 */
+function renderRecent(items){
+  MODE='recent';
+  rows=items||[]; cur=-1;
+  var html='';
+  for(var i=0;i<rows.length;i++) html+=rowHtml(rows[i],i,'',false);
+  LIST.className='rec';
+  LIST.innerHTML=html;
+  RH.classList.toggle('hide', !rows.length);
+  EMPTY.classList.toggle('hide', !!rows.length);
+  FOOT.classList.toggle('hide', !rows.length);
+  if(rows.length){ FT.innerHTML='也可以直接打字，正文一样能搜'; FR.innerHTML='Esc 关闭'; }
+  bind(); resize();
+}
+function fetchRecent(){
+  fetch('/api/recent').then(function(r){return r.json()}).then(function(d){
+    if(MODE!=='empty')return;         /* 用户已经开始打字了，别把结果顶掉 */
+    RECENT=d.items||[];
+    renderRecent(RECENT);
+  }).catch(function(){});
 }
 function bind(){
   var els=LIST.querySelectorAll('.row');
@@ -1473,7 +2007,9 @@ function doPrefix(v){
 }
 function doDeep(v){
   var my=++seq;
-  fetch('/api/mini?q='+encodeURIComponent(v)+'&deep=1').then(function(r){return r.json()})
+  /* body=1：连同正文一起查。名字命中已经排满一屏时这一步本来就不会发，
+     发出来的时候说明名字不够，正好拿正文命中补满最后几行。 */
+  fetch('/api/mini?q='+encodeURIComponent(v)+'&deep=1&body=1').then(function(r){return r.json()})
     .then(function(d){
       if(my!==seq)return;
       if(!(d.items||[]).length)return;
@@ -1483,11 +2019,11 @@ function doDeep(v){
 function schedule(){
   clearTimeout(timer); clearTimeout(deeptimer);
   var v=Q.value.trim();
-  if(!v){ seq++; render([],''); return; }
+  if(!v){ seq++; MODE='empty'; renderRecent(RECENT); return; }
   timer=setTimeout(function(){ doPrefix(v); },80);
 }
 Q.addEventListener('input',schedule);
-Q.addEventListener('focus',function(){ setTimeout(function(){Q.select()},10); });
+Q.addEventListener('focus',function(){ setTimeout(function(){Q.focus()},10); });
 Q.addEventListener('keydown',function(e){
   var k=e.key;
   if(k==='ArrowDown'){e.preventDefault();sel(Math.min(cur+1,rows.length-1));}
@@ -1509,14 +2045,16 @@ window.addEventListener('pywebviewready',function(){ API=window.pywebview.api; }
 document.addEventListener('DOMContentLoaded',function(){
   if(window.pywebview&&window.pywebview.api)API=window.pywebview.api;
   Q.focus();
+  fetchRecent();
 });
 window.addEventListener('focus',function(){
-  setTimeout(function(){Q.focus();Q.select();},20);
+  setTimeout(function(){Q.focus();},20);
 });
 window.__onShow=function(){
-  Q.value=''; rows=[]; cur=-1; seq++;
-  render([],''); Q.focus();
-  try{ if(API&&API.resize)API.resize(124); }catch(e){}
+  Q.value=''; cur=-1; seq++;
+  renderRecent(RECENT);        /* 先用上次那一屏，秒出；下面再后台刷新 */
+  Q.focus();
+  fetchRecent();
 };
 window.addEventListener('blur',function(){
   /* 失焦交给 Python 判断（MiniApi.blurred）：搜索结果出来时窗口会变高，
@@ -2134,18 +2672,49 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/mini'):
                 # 双击 Ctrl 弹出的快搜窗。deep=0 只做前缀（走索引，毫秒级），
-                # deep=1 才全表扫「名字任意位置包含」，由前端在结果不满一屏时补发。
+                # deep=1 才全表扫「名字任意位置包含」，由前端在结果不满一屏时补发；
+                # body=1 连正文一起查（两家长处都不在正文，这是第二大脑的差异点）。
                 qs = parse_qs(urlparse(self.path).query)
                 q = (qs.get('q', [''])[0] or '').strip()
                 deep = qs.get('deep', ['0'])[0] in ('1', 'true')
+                want_body = qs.get('body', ['0'])[0] in ('1', 'true')
                 try:
                     with con_lock:
-                        d = mini_search(conn(), q, 9, deep)
+                        d = mini_search(conn(), q, 9, deep, want_body)
                 except sqlite3.Error as e:
                     d = {'items': [], 'deep': deep, 'ms': 0, 'n': 0, 'err': str(e)}
                 if d['items']:
                     allow_open([x['p'] for x in d['items']])
                 body = json.dumps(d, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/icon'):
+                # 系统图标。按扩展名取，和资源管理器里看到的是同一张图；
+                # 拿不到就回 204，前端换回自绘图标。
+                qs = parse_qs(urlparse(self.path).query)
+                ext = (qs.get('e', [''])[0] or '').strip().lower()[:12]
+                isdir = qs.get('d', ['0'])[0] in ('1', 'true') or ext == 'dir'
+                png = sys_icon('' if isdir else ext, isdir)
+                if png:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/png')
+                    self.send_header('Cache-Control', 'max-age=86400')
+                    self.send_header('Content-Length', str(len(png)))
+                    self.end_headers()
+                    self.wfile.write(png)
+                    return
+                self.send_response(204)
+                self.end_headers()
+                return
+            elif self.path.startswith('/api/recent'):
+                # 快搜窗的空状态：打开就先给一屏「你刚动过的文件」，不用先打字。
+                try:
+                    with con_lock:
+                        items = recent_rows(conn(), 5)
+                except sqlite3.Error:
+                    items = []
+                if items:
+                    allow_open([x['p'] for x in items])
+                body = json.dumps({'items': items}, ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api?'):
                 qs = parse_qs(urlparse(self.path).query)
@@ -2182,6 +2751,8 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                     if ok:
                         try:
                             os.startfile(p)
+                            with con_lock:
+                                record_open(conn(), p, os.path.isdir(p))
                         except Exception:
                             ok = False
                 body = json.dumps({'ok': ok}, ensure_ascii=False).encode()
@@ -2308,6 +2879,7 @@ def serve(port=8765):
             sys.exit(1)
     threading.Timer(1.2, webbrowser.open, args=(f'http://127.0.0.1:{port}',)).start()
     print(f'第二大脑已启动：http://127.0.0.1:{port}（关闭本窗口即停止服务）')
+    start_pinyin_backfill()      # 老库补拼音，后台跑，不挡界面
     srv.serve_forever()
 
 def cli(argv=None):

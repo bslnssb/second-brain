@@ -23,6 +23,9 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 ## Features
 
 - **Double-tap Ctrl quick search** — tap Ctrl twice anywhere and a search box drops down from the top of the screen: type two characters, pick with `↑↓`, `Enter` to open, `Ctrl+1`–`Ctrl+9` to open the Nth row, `Esc` to dismiss
+- **Pinyin fuzzy match** — type `azb` for 安装包 (installer), `xzrs` for 行政人事 (HR). Both first-letter and full pinyin work, just like Listary
+- **Content hits in the quick window** — if the keyword isn't in any file *name* but is inside a document, the match still shows up after a 300 ms pause, with a purple "正文/content" tag and the matching sentence. Neither Listary nor Everything can do this
+- **Real system icons** — each row shows the actual icon the OS uses for that extension (red PDF, blue Word, green Excel), not a hand-drawn placeholder
 - **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
 - **Automatic OCR for scans** — image-only PDFs get their first 15 pages recognised offline (RapidOCR); no network after install
 - **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
@@ -75,18 +78,23 @@ the screen — one input box, nine rows:
 | Key | What it does |
 |---|---|
 | Just type | Results appear as you type (prefix hits come from an index, usually 0–2 ms) |
+| Type pinyin | `azb` → 安装包, `xzrs` → 行政人事 — first-letter and full pinyin both work |
 | `↑` `↓` | Move the selection |
 | `Enter` | Open the selected row |
 | `Ctrl+1` – `Ctrl+9` | Open the Nth row without leaving the keyboard |
 | `Ctrl+Enter` | Jump to the main window and run the same query as a full-text search |
 | `Esc` | Dismiss (clicking another window dismisses it too) |
 
+300 ms after you stop typing, a "contains" pass runs automatically: names that contain the query anywhere, plus
+**content matches** — documents whose body text mentions it, shown with a purple "content" tag and the matching
+sentence. When names run out, content fills in.
+
 Closing the main window does not quit the program — it drops to the tray and keeps waiting for your double
 Ctrl. To really quit, right-click the tray icon and choose Quit.
 
-<p align="center"><img src="assets/screenshot-quick-empty.png" width="680" alt="The quick window right after it appears: a single input box and a one-line hint"></p>
+<p align="center"><img src="assets/screenshot-quick-empty.png" width="680" alt="The quick window right after it appears: a single input box plus a list of recently opened files, each with a real system icon"></p>
 
-<p align="center"><sub>What you get on the double tap: one input box, one hint</sub></p>
+<p align="center"><sub>What you get on the double tap: recently opened files already listed, no typing needed</sub></p>
 
 **First run:**
 
@@ -110,9 +118,14 @@ The settings panel — scanning, updating and health checks all live here, no co
 
 **If all you want is "double-tap Ctrl, type a name, open the file", Second Brain alone is enough — you don't
 need Listary.** The quick window copies its habits: double-tap Ctrl to summon, one input line, nine rows,
-`Ctrl+1–9` to open, `Esc` to dismiss. File **and** folder names are searched together — type 报 and files and
-directories land in the same list (directories carry a yellow folder icon); `Enter` opens the file, or jumps
-straight into that folder.
+`Ctrl+1–9` to open, `Esc` to dismiss, **pinyin fuzzy** (`azb` → 安装包), **real system icons** (the same one
+Explorer shows), **recent files in the empty state**, and **breadcrumb paths** (`C: › … › Library › HR`).
+File **and** folder names are searched together — type 报 and files and directories land in the same list;
+`Enter` opens the file, or jumps straight into that folder.
+
+**Content hits show up in the quick window too**: 300 ms after you stop typing, a body-text pass runs
+automatically, and matches appear with a purple "content" tag and the matching sentence. This is what
+Listary and Everything *cannot* do — they only look at names.
 
 **What it does not do, stated plainly**: Listary still has things Second Brain doesn't — jumping to a folder
 from inside an Open/Save dialog, selecting a file in Explorer, and an index that follows NTFS live (ours is a

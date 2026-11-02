@@ -11,6 +11,7 @@
 
 带参数时走命令行（update / selftest / search …），方便打包成 exe 后复用同一入口。
 """
+import ctypes
 import json
 import os
 import socket
@@ -166,6 +167,28 @@ def round_corners(hwnd):
         import ctypes
         v = ctypes.c_int(2)          # DWMWCP_ROUND
         return ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(v), 4) == 0
+    except Exception:
+        return False
+
+
+class _MARGINS(ctypes.Structure):
+    _fields_ = [('l', ctypes.c_int), ('r', ctypes.c_int),
+                ('t', ctypes.c_int), ('b', ctypes.c_int)]
+
+
+def soft_shadow(hwnd):
+    """给无边框窗口要一圈系统投影。
+
+    FormBorderStyle.None 的窗口 DWM 默认不画阴影，贴在桌面上像一张纸片 ——
+    这正是「小窗」最缺的那点质感。把 frame 扩 1px 进客户区（内容位置一点没动），
+    DWM 就按带边框窗口对待，投出 Win11 那种柔和的光。
+
+    这是个纯增益项：属性设不上就只是没阴影，窗口照常工作。"""
+    if not hwnd:
+        return False
+    try:
+        m = _MARGINS(1, 1, 1, 1)
+        return ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(m)) == 0
     except Exception:
         return False
 
@@ -350,8 +373,18 @@ class MiniApi:
                 ok = True
             except Exception:
                 ok = False
+        if ok:
+            self._remember(p)
         self._app.hide_mini()
         return ok
+
+    def _remember(self, p):
+        """记一次打开。快搜窗下次弹出时的「最近打开」和结果排序都读这份记录。"""
+        try:
+            with brain.con_lock:
+                brain.record_open(brain.conn(), p, os.path.isdir(p))
+        except Exception:
+            pass
 
     def reveal(self, p):
         """在资源管理器里定位这个文件（快搜窗里 Ctrl+Enter 的备用动作）"""
@@ -446,6 +479,7 @@ class App:
         self.hwnd_mini = wait_hwnd(MINI_TITLE)
         self.hwnd_main = wait_hwnd(MAIN_TITLE)
         round_corners(self.hwnd_mini)
+        soft_shadow(self.hwnd_mini)
         if self.start_mini:
             self.show_mini()
         self.hotkey = self._install_hotkey()
@@ -637,6 +671,7 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
         return
     url = f'http://127.0.0.1:{port}'
     _start_server(port)
+    brain.start_pinyin_backfill()   # 老库补拼音（11 万条十几秒），后台跑，不挡窗口
 
     params = []
     if query:
