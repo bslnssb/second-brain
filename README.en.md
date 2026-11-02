@@ -11,6 +11,10 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 ---
 
+<p align="center"><img src="assets/screenshot-quick.png" alt="The quick-search window after double-tapping Ctrl: searching 报 lists matching files with their folders, each row labelled Ctrl+1–9"></p>
+
+<p align="center"><sub>Double-tap Ctrl anywhere — one character is enough, Ctrl+1–9 opens a row directly</sub></p>
+
 <p align="center"><img src="assets/screenshot-en.png" alt="The Second Brain exe window searching for a term: 7 matches, each showing the exact lines that matched with the keyword highlighted"></p>
 
 <p align="center"><sub>Same index, switched to Chinese in the top-right corner — the UI language never changes what gets indexed</sub><br>
@@ -18,6 +22,7 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 ## Features
 
+- **Double-tap Ctrl quick search** — tap Ctrl twice anywhere and a search box drops down from the top of the screen: type two characters, pick with `↑↓`, `Enter` to open, `Ctrl+1`–`Ctrl+9` to open the Nth row, `Esc` to dismiss
 - **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
 - **Automatic OCR for scans** — image-only PDFs get their first 15 pages recognised offline (RapidOCR); no network after install
 - **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
@@ -31,7 +36,7 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 | Way | Who it's for | How to start |
 |---|---|---|
-| **Download the exe** (no install) | You'd rather not touch a terminal | From [Releases](https://github.com/bslnssb/second-brain/releases/latest) take `SecondBrain-Windows.zip` (with OCR, 157 MB download / ~320 MB unpacked) or `SecondBrain-Core-Windows.zip` (no OCR, 25 MB / ~52 MB), unzip anywhere, double-click `SecondBrain.exe` |
+| **Download the exe** (no install) | You'd rather not touch a terminal | From [Releases](https://github.com/bslnssb/second-brain/releases/latest) take `SecondBrain-Windows.zip` (with OCR, 165 MB download / ~321 MB unpacked) or `SecondBrain-Core-Windows.zip` (no OCR, 27 MB / ~53 MB), unzip anywhere, double-click `SecondBrain.exe` |
 | **Run from source** | You want to read or change the code | Follow *Install* below |
 
 The exe and the source version read and write the **same** `brain.db`, so you can mix them — drop the exe next to an existing library and it picks it up automatically.
@@ -64,10 +69,35 @@ Edit `scope.json` and put your folders in `include_dirs` (lowercase paths; backs
 
 ### Graphical interface (the normal way with the exe — no terminal involved)
 
-1. Double-click `SecondBrain.exe`, type keywords in the search box, hit Enter — that's a full-text search over file **contents**
-2. **First run**: click “⚙ Settings” at the top right, then “🚀 Smart scan” — it picks out the folders worth indexing on its own and asks you to confirm
-3. **Routine maintenance**: got new documents? One click on “🔄 Update index” in settings (takes 1–3 minutes)
-4. Curious about engine health: “🩺 Health check” in the same panel
+**Day to day: double-tap Ctrl.** Tap Ctrl twice anywhere and the quick-search window appears near the top of
+the screen — one input box, nine rows:
+
+| Key | What it does |
+|---|---|
+| Just type | Results appear as you type (prefix hits come from an index, usually 0–2 ms) |
+| `↑` `↓` | Move the selection |
+| `Enter` | Open the selected row |
+| `Ctrl+1` – `Ctrl+9` | Open the Nth row without leaving the keyboard |
+| `Ctrl+Enter` | Jump to the main window and run the same query as a full-text search |
+| `Esc` | Dismiss (clicking another window dismisses it too) |
+
+Closing the main window does not quit the program — it drops to the tray and keeps waiting for your double
+Ctrl. To really quit, right-click the tray icon and choose Quit.
+
+<p align="center"><img src="assets/screenshot-quick-empty.png" width="680" alt="The quick window right after it appears: a single input box and a one-line hint"></p>
+
+<p align="center"><sub>What you get on the double tap: one input box, one hint</sub></p>
+
+**First run:**
+
+1. Double-click `SecondBrain.exe` and click “⚙ Settings” at the top right
+2. Click “🚀 Smart scan” — it picks out the folders worth indexing on its own, asks you to confirm, then builds the library
+3. When that finishes, click “🗂 Rebuild name index” (30 s – 3 min depending on file count) — this is the
+   data behind the quick window: names only, nothing is opened or read
+4. **Routine maintenance**: new documents? click “🔄 Update index”. Moved a lot of files? click
+   “🗂 Rebuild name index” again
+
+The main window is the *detailed* search: hit the body text, read the matching lines, filter by type or path.
 
 The settings panel — scanning, updating and health checks all live here, no commands to remember:
 
@@ -78,42 +108,46 @@ The settings panel — scanning, updating and health checks all live here, no co
 
 ### How it relates to Listary / Everything
 
-**To be clear: filename search is built in.** Click 🗂 *Rebuild name index* in the settings panel and it
-walks every disk recording names only — nothing is opened or read (1.57M files took about 3 minutes here).
-After that, installers, images, videos and archives all match by name, next to your indexed documents.
+**If all you want is "double-tap Ctrl, type a name, open the file", Second Brain alone is enough — you don't
+need Listary.** The quick window copies its habits: double-tap Ctrl to summon, one input line, nine rows,
+`Ctrl+1–9` to open, `Esc` to dismiss. File **and** folder names are searched together — type 报 and files and
+directories land in the same list (directories carry a yellow folder icon); `Enter` opens the file, or jumps
+straight into that folder.
 
-**The boundary still exists**: neither tool lets another program put results into its window. Listary 6
-hasn't published a plugin API, and Everything's list only ever shows Everything's index. So "type once in
-Listary and see both kinds of result" is not possible — that's their design, not a setting you missed.
+**What it does not do, stated plainly**: Listary still has things Second Brain doesn't — jumping to a folder
+from inside an Open/Save dialog, selecting a file in Explorer, and an index that follows NTFS live (ours is a
+snapshot you rescan). So if you use Listary as a *file-dialog accelerator*, the two don't conflict; install both.
 
-What does work is the other direction: **make Second Brain the window, and have it show both lists at once.**
+**What about Everything?** Its index is built straight from the NTFS file table, so millions of files stay
+instant and it follows the system live. Second Brain's name index is a static snapshot, but it can find things
+whose *name* says nothing and whose *body* says everything.
 
-<p align="center"><img src="assets/screenshot-both.png" alt="One search returning both filename matches and content matches"></p>
+| | "I know what it's called" | "Which file ever said this?" | Index freshness |
+|---|---|---|---|
+| Everything | Best in class, live | Cannot do it | Live |
+| Listary | Strong, plus a launcher | Cannot do it | Live |
+| **Second Brain** | Enough: 1.57M file names + 113k folder names disk-wide, 0.2 ms for prefix hits | **Only this one can** | Manual "Rebuild name index" |
 
-| What you remember | Where it shows up |
-|---|---|
-| A file name or folder name | 📁 Filename matches (top, up to 6, from the disk-wide name index) |
-| A phrase from inside a document | Content matches (below, with highlighted snippets) |
+Older users with Everything installed still have the `/api/files` fallback path (it works when Everything is
+running with its HTTP server on). That exists for people who already run Everything and haven't built a name
+index yet — normal use never touches it.
 
-The shot above searched for 国办发2019: nothing in any indexed body, but two file names matched — found
-without switching tools. The two lists are complementary: a file already listed as a content hit never
-reappears in the filename column.
-
-**So do you still need Everything?** It doesn't conflict — each is fast at something different. Everything
-builds its index straight from the NTFS file table, so millions of files stay instant and it follows the
-system live; Second Brain's name index is a snapshot you rescan on demand.
-
-- Looking for something whose *name* you know: Everything is faster and always current
-- Asking which file ever *mentioned* a phrase: only Second Brain can answer
-- Added a drive or moved a lot of files: click 🗂 *Rebuild name index* once
-
-**Listary is still worth configuring** — its value is the entry point:
+**Command-line entries** (for shortcuts and other launchers):
 
 | Command | Effect |
 |---|---|
-| `SecondBrain.exe 报销标准` | Opens with results already on screen |
-| `SecondBrain.exe --settings` | Opens into the settings panel |
+| `SecondBrain.exe 报销标准` | Opens the main window with results already on screen |
+| `SecondBrain.exe --settings` | Opens straight into the settings panel |
+| `SecondBrain.exe --silent` | Stays resident with no window, waiting for the double Ctrl |
+| `SecondBrain.exe --mini` | Shows the quick-search window on startup |
 | `SecondBrain.exe --lang en 报销` | Forces the English interface (`zh` likewise) |
+
+**Autostart**: put a shortcut to `SecondBrain.exe` in `shell:startup` with `--silent` appended to the target —
+it then sits quietly in the tray from boot, one double Ctrl away. Quit from the tray icon.
+
+**If you already live in Listary's input box**: you can still add a command there (Options → Commands → ➕),
+keyword `sb`, argument `"{query}"`, so `sb 报销流程` opens Second Brain with results. With the quick window
+around, that's now optional.
 
 ### Command line (source edition, optional)
 

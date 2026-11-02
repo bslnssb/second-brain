@@ -30,7 +30,12 @@ for pkg in ('webview',               # 桌面窗口
     binaries += b
     hiddenimports += h
 
-hiddenimports += ['pypdf', 'scan_docs', 'selftest']
+# 托盘图标要读 ico 文件；窗口图标由 exe 资源自带，这里补一份给托盘用
+datas += [('assets/icon.ico', 'assets')]
+
+# hotkey / tray 在函数里 import（进程起来才装钩子和托盘），显式列出避免漏收
+hiddenimports += ['pypdf', 'scan_docs', 'selftest', 'hotkey', 'tray',
+                  'win32gui', 'win32api', 'win32con', 'win32process']
 
 # 不打包 OCR 链路，同时挡掉 PyInstaller 顺着本机环境误收的重型包
 EXCLUDES = [

@@ -31,7 +31,7 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-APP_VERSION = 'v6.3'
+APP_VERSION = 'v6.4'
 
 def app_dir():
     """脚本所在目录；打包成 exe 后为 exe 所在目录（数据库/配置放在 exe 旁边）"""
@@ -128,6 +128,30 @@ def _group_key(path: str, home: str):
 # 全盘文件名索引的构建状态（/api/names 轮询用）
 NAMES = {'state': 'idle', 'err': '', 'n': 0}
 
+def _real_case(path):
+    """把路径各级还原成磁盘上的真实大小写。
+
+    scope.json 里的 include_dirs 是人手写进去的（`d:\\my docs\\reports\\...`），
+    Windows 不区分大小写所以扫描照常工作，但这串小写会被原样存进文件名索引，
+    快搜窗里显示出来就像是拼错了。逐级 os.listdir 对上原名即可 —— 一个根路径
+    也就几层目录，比起扫一遍全盘的开销可以忽略。"""
+    if not path:
+        return path
+    p = os.path.normpath(str(path))
+    drive, rest = os.path.splitdrive(p)
+    if not drive:
+        return p
+    drive = drive[0].upper() + drive[1:]     # 盘符统一大写（'d:' → 'D:'）
+    cur = drive + os.sep
+    for seg in [s for s in rest.split(os.sep) if s]:
+        try:
+            real = next((n for n in os.listdir(cur) if n.lower() == seg.lower()), None)
+        except OSError:
+            return p                  # 盘没插 / 没权限：保持原样，别让整个索引挂在这
+        cur = os.path.join(cur, real or seg)
+    return cur
+
+
 def build_files_index(targets=None):
     """走一遍全盘，把文件名写进 files 表。只记路径与文件名，不打开、不读内容。
 
@@ -140,8 +164,8 @@ def build_files_index(targets=None):
                      'k': 'e_names_busy'}
             return
         NAMES = {'state': 'busy', 'err': '', 'n': 0}
-        roots = ([os.path.normpath(str(t)) for t in targets] if targets is not None
-                 else scan_docs.drive_targets())
+        roots = ([_real_case(t) for t in targets] if targets is not None
+                 else [_real_case(t) for t in scan_docs.drive_targets()])
         _prog(state='busy', phase='names', done=0, total=len(roots) + 1, ok=0, fail=0,
               msg='建立全盘文件名索引', k='m_names')
         con = sqlite3.connect(DB, check_same_thread=False)
@@ -151,8 +175,13 @@ def build_files_index(targets=None):
         con.execute('DROP TABLE IF EXISTS files_new')
         con.execute('CREATE TABLE files_new(path TEXT PRIMARY KEY, name TEXT NOT NULL, '
                     'dir TEXT, ext TEXT, size REAL, mtime REAL)')
+        # 目录也单独存一份：Listary 那类工具的体验里「搜文件夹」和「搜文件」一样常用，
+        # 光靠文件路径猜不出空文件夹。整体占比不到文件数的 1/4，代价可以接受。
+        con.execute('DROP TABLE IF EXISTS dirs_new')
+        con.execute('CREATE TABLE dirs_new(path TEXT PRIMARY KEY, name TEXT NOT NULL, '
+                    'parent TEXT)')
         con.commit()
-        batch, n = [], 0
+        batch, dbatch, n = [], [], 0
         for i, root in enumerate(roots):
             _prog(done=i, msg=f'扫描文件名 {root}', k='m_names_target', a={'p': root})
             for cur, dirs, files in os.walk(root):
@@ -161,12 +190,19 @@ def build_files_index(targets=None):
                 if scan_docs.is_novel_dir(cur):
                     dirs[:] = []
                     continue
+                base = os.path.basename(cur)
+                if base:
+                    dbatch.append((cur, base.lower(), os.path.dirname(cur)))
                 for f in files:
                     batch.append((os.path.join(cur, f), f.lower(), cur,
                                   os.path.splitext(f)[1].lower(), None, None))
                     if len(batch) >= 20000:
                         con.executemany('INSERT OR REPLACE INTO files_new'
                                         '(path,name,dir,ext,size,mtime) VALUES(?,?,?,?,?,?)', batch)
+                        if dbatch:
+                            con.executemany('INSERT OR REPLACE INTO dirs_new'
+                                            '(path,name,parent) VALUES(?,?,?)', dbatch)
+                            dbatch = []
                         con.commit()
                         n += len(batch); batch = []
                         _prog(done=i, msg=f'扫描文件名 {root}（已 {n}）',
@@ -176,12 +212,19 @@ def build_files_index(targets=None):
                                 '(path,name,dir,ext,size,mtime) VALUES(?,?,?,?,?,?)', batch)
                 con.commit()
                 n += len(batch); batch = []
+        if dbatch:
+            con.executemany('INSERT OR REPLACE INTO dirs_new(path,name,parent) VALUES(?,?,?)',
+                            dbatch)
+            con.commit()
         _prog(done=len(roots), msg='整理文件名索引…', k='m_names_finish')
         # 换表这一下很快，但要挡住 HTTP 线程正在进行的查询，避免它们撞上「表刚被删」
         with con_lock:
             con.execute('DROP TABLE IF EXISTS files')
             con.execute('ALTER TABLE files_new RENAME TO files')
             con.execute('CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)')
+            con.execute('DROP TABLE IF EXISTS dirs')
+            con.execute('ALTER TABLE dirs_new RENAME TO dirs')
+            con.execute('CREATE INDEX IF NOT EXISTS idx_dirs_name ON dirs(name)')
             con.commit()
         con.close()
         NAMES = {'state': 'done', 'err': '', 'n': n}
@@ -912,6 +955,103 @@ def file_count(con):
     except sqlite3.Error:
         return 0
 
+
+# ---------------------------------------------------------------- 快搜（双击 Ctrl 弹出的迷你窗）
+# 目标是把「敲两个字就出结果」做到无感：前缀查询走 name 索引（157 万行 0.2ms），
+# 「包含」查询只能全表扫（最坏 500ms），所以拆成两趟，第二趟由前端判断要不要发。
+MINI_CACHE = {}                   # 关键词 -> (时间, 结果)：深搜一次 500ms，退格重搜不该再等
+MINI_LOCK = threading.Lock()
+MINI_TTL = 180.0
+MINI_CACHE_MAX = 400
+_SEP = ' .-_—~()[]{}【】（）、，'
+
+
+def _has_files(con):
+    """文件名索引里有没有东西。不能问 count(*)：157 万行的全表统计要 58ms，
+    而这里只想知道「表空不空」—— 取一行就够，微秒级。"""
+    try:
+        return con.execute('SELECT 1 FROM files LIMIT 1').fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _mini_rank(name, q):
+    """0 前缀 / 1 词边界 / 2 名字中间 / 3 完全不像。越小的越像用户想要的那个。"""
+    i = name.find(q)
+    if i < 0:
+        return 3
+    if i == 0:
+        return 0
+    return 1 if name[i - 1] in _SEP else 2
+
+
+def mini_search(con, q, limit=9, deep=False):
+    """返回 {'items': [...], 'deep': bool, 'ms': int}。
+    deep=False 只做前缀匹配（毫秒级）；deep=True 补上「名字里任何位置包含」。"""
+    q = (q or '').strip().lower()
+    if not q:
+        return {'items': [], 'deep': deep, 'ms': 0, 'n': 0}
+    if deep:
+        with MINI_LOCK:
+            got = MINI_CACHE.get(q)
+        if got and time.time() - got[0] < MINI_TTL:
+            return {'items': [dict(x) for x in got[1][:limit]], 'deep': True, 'ms': 0,
+                    'n': len(got[1]), 'cache': True}
+    t0 = time.perf_counter()
+    items, seen = [], set()
+
+    def add(path, isdir, ext=''):
+        key = os.path.normcase(path)
+        if key in seen:
+            return
+        seen.add(key)
+        items.append({'n': os.path.basename(path.rstrip('\\/')) or path,
+                      'p': path,
+                      'd': os.path.dirname(path.rstrip('\\/')),
+                      't': 'dir' if isdir else 'file',
+                      'e': '' if isdir else ext})
+
+    frows = drows = []
+    # 两张表分开兜错：老库还没有 dirs 表（v6.3 之前建的索引），
+    # 一个 OperationalError 不该把 files 的结果也一起吞掉。
+    try:
+        if deep:
+            frows = con.execute('SELECT path, ext FROM files WHERE instr(name,?)>0 LIMIT ?',
+                                (q, limit * 45)).fetchall()
+        else:
+            hi = q + '\uffff'          # BINARY 序：q 之后、q+任何常规字符之前
+            frows = con.execute('SELECT path, ext FROM files WHERE name>=? AND name<? LIMIT ?',
+                                (q, hi, limit * 8)).fetchall()
+    except sqlite3.Error:
+        frows = []
+    try:
+        if deep:
+            drows = con.execute('SELECT path FROM dirs WHERE instr(name,?)>0 LIMIT ?',
+                                (q, limit * 30)).fetchall()
+        else:
+            hi = q + '\uffff'
+            drows = con.execute('SELECT path FROM dirs WHERE name>=? AND name<? LIMIT ?',
+                                (q, hi, limit * 5)).fetchall()
+    except sqlite3.Error:
+        drows = []
+    for path, ext in frows:
+        add(path, False, ext or '')
+    for (path,) in drows:
+        add(path, True)
+    if not items and not _has_files(con):
+        # 还没建过全盘索引时，至少让已入库的文档文件名可用
+        for p in name_rows(con, q, limit * 3):
+            add(p, False, os.path.splitext(p)[1].lower())
+    items.sort(key=lambda it: (_mini_rank(it['n'].lower(), q), len(it['n']), it['n'].lower()))
+    if deep:
+        with MINI_LOCK:
+            if len(MINI_CACHE) > MINI_CACHE_MAX:
+                for k in sorted(MINI_CACHE, key=lambda k: MINI_CACHE[k][0])[:100]:
+                    MINI_CACHE.pop(k, None)
+            MINI_CACHE[q] = (time.time(), [dict(x) for x in items])
+    return {'items': items[:limit], 'deep': deep,
+            'ms': int((time.perf_counter() - t0) * 1000), 'n': len(items)}
+
 def search_rows(con, q, limit=20, ext=None, path_filter=None, with_name=True):
     """正文检索 + 文件名补充检索。
 
@@ -1062,6 +1202,24 @@ def ev_search(q, limit=20):
             EV_LAST[it['p']] = now
     return items, 'ok'
 
+
+def allow_open(paths, replace=False):
+    """登记「刚出现在结果里的路径」。/open 与快搜窗的「打开」都只认这份白名单 ——
+    os.startfile 对 .exe 就是「运行」，没有闸门等于给了一个任意路径执行入口。
+    replace=True 用于整页搜索（换一批结果就该作废旧白名单），
+    快搜窗用 replace=False：前缀结果先出、深度结果后补，两批都得能点。"""
+    now = time.time()
+    with EV_LOCK:
+        if replace:
+            EV_LAST.clear()
+        elif len(EV_LAST) > 4000:
+            for k in [k for k, v in EV_LAST.items() if now - v > EV_TTL]:
+                EV_LAST.pop(k, None)
+            if len(EV_LAST) > 4000:
+                EV_LAST.clear()
+        for p in paths:
+            EV_LAST[p] = now
+
 def ev_recent(p):
     """这个路径是不是刚搜出来的（决定能不能点「打开」）"""
     with EV_LOCK:
@@ -1149,6 +1307,230 @@ def conn():
     return _con
 
 
+MINI_TPL = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>第二大脑 · 快搜</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#fff;overflow:hidden;
+  font-family:"Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+  color:#1a2233;-webkit-font-smoothing:antialiased}
+#pane{display:flex;flex-direction:column;height:100%}
+.bar{display:flex;align-items:center;height:60px;padding:0 14px 0 22px;flex:0 0 auto}
+#q{flex:1;min-width:0;border:0;outline:0;background:transparent;font-size:19px;
+  font-family:inherit;color:#101828;letter-spacing:.2px}
+#q::placeholder{color:#a6adbb;font-weight:400}
+.act{display:flex;align-items:center;gap:2px;flex:0 0 auto}
+.ab{border:0;background:transparent;width:34px;height:34px;border-radius:9px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;color:#9aa3b2;transition:.13s}
+.ab:hover{background:#f1f3f8;color:#4f6ef7}
+.ab svg{width:17px;height:17px}
+#list{flex:0 0 auto;padding:0 8px;overflow:hidden}
+.row{display:flex;align-items:center;gap:11px;height:50px;padding:0 14px 0 12px;
+  border-radius:9px;cursor:default;user-select:none;position:relative}
+.row.on{background:#eef2fb}
+.row.on:before{content:"";position:absolute;left:0;top:11px;bottom:11px;width:3px;
+  border-radius:2px;background:#4f6ef7}
+.ico{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:19px}
+.txt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.nm{font-size:14.5px;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nm b{font-weight:700;color:#0d1424}
+.pt{font-size:12px;color:#98a0ae;line-height:1.2;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.kbd{flex:0 0 auto;font-size:12px;color:#b7bdc9;font-variant-numeric:tabular-nums}
+.row.on .kbd{color:#8b93a5}
+.foot{display:flex;align-items:center;justify-content:space-between;height:38px;
+  margin:0 8px;padding:0 12px;border-top:1px solid #f0f1f5;font-size:12.5px;color:#7b8398;
+  gap:10px;flex:0 0 auto}
+.foot.hide{display:none}
+.foot .fl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.foot .fr{flex:0 0 auto;color:#a7aebc;font-size:11.5px}
+.foot b{font-weight:600;color:#3b465c}
+.empty{height:64px;display:flex;align-items:center;padding:0 24px;font-size:13px;color:#9aa3b2}
+.empty i{font-style:normal;margin-left:auto;color:#c2c8d4;font-size:12px}
+</style></head><body>
+<div id="pane">
+  <div class="bar">
+    <input id="q" spellcheck="false" autocomplete="off" placeholder="搜索应用和文件">
+    <div class="act">
+      <button class="ab" id="btnDetail" title="详细搜索（Ctrl+Enter）">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4l-8.5 8.5"/>
+             <path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
+      </button>
+      <button class="ab" id="btnSearch" title="搜索">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+      </button>
+    </div>
+  </div>
+  <div id="list"></div>
+  <div class="foot hide" id="foot"><span class="fl" id="ft"></span>
+    <span class="fr" id="fr">Ctrl+Enter 详细搜索</span></div>
+  <div class="empty hide" id="empty">输入关键词，边打边出结果<i>↑↓ 选择 · Enter 打开 · Esc 关闭</i></div>
+</div>
+<script>
+var Q = document.getElementById('q'), LIST = document.getElementById('list'),
+    FOOT = document.getElementById('foot'), FT = document.getElementById('ft'),
+    EMPTY = document.getElementById('empty');
+var API = null, rows = [], cur = -1, seq = 0, timer = 0, deeptimer = 0, shown = 60;
+var TYPE = {'.pdf':'#e05252','.doc':'#2b6cb0','.docx':'#2b6cb0','.xls':'#2f855a',
+  '.xlsx':'#2f855a','.csv':'#2f855a','.ppt':'#dd6b20','.pptx':'#dd6b20',
+  '.md':'#64748b','.txt':'#64748b','.jpg':'#7c3aed','.png':'#7c3aed','.jpeg':'#7c3aed',
+  '.gif':'#7c3aed','.webp':'#7c3aed','.mp4':'#0891b2','.mkv':'#0891b2','.avi':'#0891b2',
+  '.mp3':'#0d9488','.wav':'#0d9488','.zip':'#a16207','.rar':'#a16207','.7z':'#a16207',
+  '.exe':'#475569','.lnk':'#475569','.psd':'#2563eb','.ai':'#d97706'};
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function ico(it){
+  if(it.t==='dir')return '<svg width="17" height="17" viewBox="0 0 24 24"><path d="M2.6 7.1c0-1 .8-1.8 1.8-1.8h4c.5 0 1 .2 1.3.6l1.3 1.5h8.7c1 0 1.8.8 1.8 1.8v9.4c0 1-.8 1.8-1.8 1.8H4.4c-1 0-1.8-.8-1.8-1.8z" fill="#f4bd4e"/></svg>';
+  var c = TYPE[it.e] || '#a3a9b6';
+  return '<svg width="17" height="17" viewBox="0 0 24 24"><path d="M4.8 2.6h8.4L18.8 8.3v13.1H4.8z" fill="#fff" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><path d="M13.2 2.6v5.7h5.6" fill="none" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><rect x="7.2" y="11.7" width="9" height="2.6" rx="1.3" fill="'+c+'" opacity=".92"/><rect x="7.2" y="16" width="5.8" height="2.6" rx="1.3" fill="'+c+'" opacity=".45"/></svg>';
+}
+function midCut(p){
+  if(p.length<=56)return p;
+  return p.slice(0,15)+'…'+p.slice(-38);
+}
+function hl(name,q){
+  if(!q)return esc(name);
+  var low=name.toLowerCase(), ql=q.toLowerCase(), out='', i=0, j;
+  while((j=low.indexOf(ql,i))>=0){
+    out+=esc(name.slice(i,j))+'<b>'+esc(name.slice(j,j+ql.length))+'</b>';
+    i=j+ql.length;
+  }
+  return out+esc(name.slice(i));
+}
+function height(){
+  var n=rows.length, h=60;
+  if(n>0) h+=n*50+38; else h+=64;   /* 空态 60+64=124，Listary 的条也是这个比例 */
+  return h;
+}
+function resize(){
+  var h=height();
+  if(h===shown)return;
+  shown=h;
+  if(API&&API.resize)API.resize(h);
+}
+function render(items,q,keep){
+  var old=cur;
+  rows=items||[];
+  cur=rows.length?(keep&&old>=0?Math.min(old,rows.length-1):0):-1;
+  var html='';
+  for(var i=0;i<rows.length;i++){
+    var it=rows[i];
+    html+='<div class="row'+(i===cur?' on':'')+'" data-i="'+i+'">'
+      +'<span class="ico">'+ico(it)+'</span>'
+      +'<span class="txt"><span class="nm">'+hl(it.n,q)+'</span>'
+      +'<span class="pt">'+esc(midCut(it.d||''))+'</span></span>'
+      +'<span class="kbd">'+(i<9?'Ctrl+'+(i+1):'')+'</span></div>';
+  }
+  LIST.innerHTML=html;
+  EMPTY.classList.toggle('hide', !!q);
+  FOOT.classList.toggle('hide', !rows.length);
+  if(rows.length){
+    FT.innerHTML='展示更多 “'+esc(q)+'” 的搜索结果';
+  }
+  bind(); resize();
+}
+function bind(){
+  var els=LIST.querySelectorAll('.row');
+  for(var i=0;i<els.length;i++){
+    els[i].onmouseenter=function(){ sel(+this.dataset.i); };
+    els[i].onclick=function(){ open(+this.dataset.i); };
+  }
+}
+function sel(i){
+  if(i<0||i>=rows.length)return;
+  cur=i;
+  var els=LIST.querySelectorAll('.row');
+  for(var k=0;k<els.length;k++) els[k].classList.toggle('on', k===i);
+}
+function open(i){
+  var it=rows[i]; if(!it)return;
+  if(API&&API.open_path)API.open_path(it.p);
+}
+function detail(){
+  var v=Q.value.trim();
+  if(API&&API.detail)API.detail(v);
+}
+/* 两趟查：
+   prefix 走名字索引，157 万行 0.2ms，每次输入都立刻发；
+   deep 要全表扫（一个都没命中时 500ms），所以等用户停手 300ms 再发，
+   期间继续打字就取消——打字快的人根本等不到它，看到的永远是毫秒级的前缀结果。 */
+function doPrefix(v){
+  var my=++seq;
+  fetch('/api/mini?q='+encodeURIComponent(v)).then(function(r){return r.json()})
+    .then(function(d){
+      if(my!==seq)return;
+      render(d.items||[],v);
+      if((d.items||[]).length<9 && v.length>=2){
+        clearTimeout(deeptimer);
+        deeptimer=setTimeout(function(){
+          if(my!==seq)return;
+          doDeep(v);
+        },300);
+      }
+    }).catch(function(){});
+}
+function doDeep(v){
+  var my=++seq;
+  fetch('/api/mini?q='+encodeURIComponent(v)+'&deep=1').then(function(r){return r.json()})
+    .then(function(d){
+      if(my!==seq)return;
+      if(!(d.items||[]).length)return;
+      render(d.items,v,true);
+    }).catch(function(){});
+}
+function schedule(){
+  clearTimeout(timer); clearTimeout(deeptimer);
+  var v=Q.value.trim();
+  if(!v){ seq++; render([],''); return; }
+  timer=setTimeout(function(){ doPrefix(v); },80);
+}
+Q.addEventListener('input',schedule);
+Q.addEventListener('focus',function(){ setTimeout(function(){Q.select()},10); });
+Q.addEventListener('keydown',function(e){
+  var k=e.key;
+  if(k==='ArrowDown'){e.preventDefault();sel(Math.min(cur+1,rows.length-1));}
+  else if(k==='ArrowUp'){e.preventDefault();sel(Math.max(cur-1,0));}
+  else if(k==='Enter'){
+    e.preventDefault();
+    if(e.ctrlKey||e.metaKey){ detail(); return; }
+    if(rows.length) open(cur<0?0:cur); else detail();
+  }
+  else if(k==='Escape'){ e.preventDefault(); if(API&&API.hide)API.hide(); }
+  else if(e.ctrlKey&&k>='1'&&k<='9'){ e.preventDefault(); var i=+k-1; if(rows[i])open(i); }
+  else if(k==='Tab'){ e.preventDefault(); detail(); }
+});
+document.getElementById('btnDetail').onclick=detail;
+document.getElementById('btnSearch').onclick=function(){
+  var v=Q.value.trim(); if(v) doPrefix(v); else Q.focus();
+};
+window.addEventListener('pywebviewready',function(){ API=window.pywebview.api; });
+document.addEventListener('DOMContentLoaded',function(){
+  if(window.pywebview&&window.pywebview.api)API=window.pywebview.api;
+  Q.focus();
+});
+window.addEventListener('focus',function(){
+  setTimeout(function(){Q.focus();Q.select();},20);
+});
+window.__onShow=function(){
+  Q.value=''; rows=[]; cur=-1; seq++;
+  render([],''); Q.focus();
+  try{ if(API&&API.resize)API.resize(124); }catch(e){}
+};
+window.addEventListener('blur',function(){
+  /* 失焦交给 Python 判断（MiniApi.blurred）：搜索结果出来时窗口会变高，
+     WebView2 重新布局会短暂丢焦点，无脑照着 blur 关窗就成了「刚打完字窗口没了」。
+     那边会看鼠标在不在窗口里，再决定是收起还是把焦点抢回来。 */
+  setTimeout(function(){
+    if(document.hasFocus())return;
+    if(API&&API.blurred)API.blurred();
+    else if(API&&API.hide)API.hide();
+  },180);
+});
+</script></body></html>'''
+
+
 def make_server(port=8765):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     PAGE_TPL = r'''<!doctype html><html lang="zh-CN"><head><meta charset=utf-8>
@@ -1163,6 +1545,9 @@ body{font-family:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif
 .hero h1{font-size:30px;font-weight:700;letter-spacing:.5px}
 .hero h1 em{font-style:normal;background:linear-gradient(120deg,#4f6ef7,#9333ea);-webkit-background-clip:text;background-clip:text;color:transparent}
 .hero p{color:var(--sub);margin-top:8px;font-size:14px}
+.hero .hk{margin-top:10px;font-size:12.5px;color:#9aa3b2}
+.hero .hk kbd{border:1px solid #e3e6ef;border-bottom-width:2px;border-radius:5px;padding:1px 7px;
+  font-size:11.5px;font-family:inherit;background:#fff;color:#5b6478;margin:0 1px}
 .tools{position:absolute;top:14px;right:18px;display:flex;gap:8px;align-items:center}
 .gear,.lang{border:1px solid #e3e6ef;background:#fff;border-radius:10px;padding:8px 14px;font-size:13px;color:var(--sub);cursor:pointer;transition:.15s;font-family:inherit}
 .gear:hover,.lang:hover{color:var(--acc);border-color:var(--acc)}
@@ -1233,6 +1618,7 @@ nz{display:inline-block;color:#b45309;font-size:11px;border:1px solid #fde68a;ba
 </div>
 <h1>🧠 <em data-i18n="brand">第二大脑</em></h1>
 <p data-i18n="sub">搜文档内容和文件名 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳</p>
+<p class=hk data-i18n="hk">双击 <kbd>Ctrl</kbd> 呼出快搜窗 —— 关掉本窗口不会退出，程序在托盘里等着</p>
 </div>
 <div class=bar>
 <input id=q data-i18n-ph="ph_q" placeholder="输入关键词，比如：项目方案 / 课程笔记 / 报销标准" autofocus>
@@ -1268,6 +1654,7 @@ zh:{
 title:'第二大脑 · 本地文档搜索',
 brand:'第二大脑',
 sub:'搜文档内容和文件名 —— __TOTAL__ 篇已入库 · 全程本地 · 中文 3 字以上效果最佳',
+hk:'双击 <kbd>Ctrl</kbd> 呼出快搜窗 —— 关掉本窗口不会退出，程序在托盘里等着',
 settings:'⚙ 设置 / 更新',
 ph_q:'输入关键词，比如：项目方案 / 课程笔记 / 报销标准',
 ph_t:'类型：pdf / docx…',
@@ -1360,6 +1747,7 @@ en:{
 title:'Second Brain · Local Document Search',
 brand:'Second Brain',
 sub:'Search document contents and file names — __TOTAL__ files indexed · 100% local & offline · best with 3+ characters',
+hk:'Double-tap <kbd>Ctrl</kbd> for quick search — closing this window keeps it running in the tray',
 settings:'⚙ Settings',
 ph_q:'Keywords, e.g. project plan / lecture notes / expense policy',
 ph_t:'Type: pdf / docx…',
@@ -1744,6 +2132,21 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 body = json.dumps({'items': items, 'st': st, 'more': more},
                                   ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/mini'):
+                # 双击 Ctrl 弹出的快搜窗。deep=0 只做前缀（走索引，毫秒级），
+                # deep=1 才全表扫「名字任意位置包含」，由前端在结果不满一屏时补发。
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get('q', [''])[0] or '').strip()
+                deep = qs.get('deep', ['0'])[0] in ('1', 'true')
+                try:
+                    with con_lock:
+                        d = mini_search(conn(), q, 9, deep)
+                except sqlite3.Error as e:
+                    d = {'items': [], 'deep': deep, 'ms': 0, 'n': 0, 'err': str(e)}
+                if d['items']:
+                    allow_open([x['p'] for x in d['items']])
+                body = json.dumps(d, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api?'):
                 qs = parse_qs(urlparse(self.path).query)
                 q = qs.get('q', [''])[0]
@@ -1783,6 +2186,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                             ok = False
                 body = json.dumps({'ok': ok}, ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/mini'):
+                body = MINI_TPL.encode()
+                ctype = 'text/html; charset=utf-8'
             else:
                 body = build_page().encode()
                 ctype = 'text/html; charset=utf-8'

@@ -26,7 +26,14 @@ for pkg in ('rapidocr_onnxruntime',  # 离线 OCR（含 onnx 模型）
     binaries += b
     hiddenimports += h
 
-hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest']
+# 托盘图标要读 ico 文件；窗口图标由 exe 资源自带，这里补一份给托盘用
+datas += [('assets/icon.ico', 'assets')]
+
+# hotkey / tray 是在函数里 import 的（进程起来才装钩子和托盘），
+# 显式列出来省得 PyInstaller 漏掉；win32* 由 pywin32 自带的 hook 收集。
+hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest',
+                  'hotkey', 'tray',
+                  'win32gui', 'win32api', 'win32con', 'win32process']
 
 # 本机装了一堆和本项目无关的重型包，PyInstaller 顺着 import 链会把 torch 整包拖进来
 # （实测多出 2GB 以上）。这里显式排除，产物只保留 OCR 真正需要的部分。
