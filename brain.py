@@ -1320,6 +1320,8 @@ cfgLoad();applyLang();
 // ?q=关键词 直接出结果：方便收藏常用搜索，或从命令行直接打开结果页
 const Q0=(new URLSearchParams(location.search)).get('q');
 if(Q0){qEl.value=Q0;go()}
+// ?cfg=1 打开即展开设置面板：供 --settings 启动参数、书签直达、截图
+try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 </script></body></html>'''
     import os
     from urllib.parse import urlparse, parse_qs

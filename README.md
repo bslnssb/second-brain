@@ -11,10 +11,10 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 
 ---
 
-<p align="center"><img src="assets/screenshot-zh.png" alt="第二大脑界面：搜索「文档」，命中 7 篇，每条显示命中的那几行并高亮关键词"></p>
+<p align="center"><img src="assets/screenshot-zh.png" alt="第二大脑的 exe 窗口：搜索「文档」，命中 7 篇，每条显示命中的那几行并高亮关键词"></p>
 
 <p align="center"><sub>同一份索引库，右上角切到 English 就是这样 —— 界面语言不影响索引内容</sub><br>
-<img src="assets/screenshot-en.png" width="620" alt="第二大脑英文界面"></p>
+<img src="assets/screenshot-en.png" width="620" alt="第二大脑 exe 窗口的英文界面"></p>
 
 ## 特性
 
@@ -23,7 +23,7 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 - **格式覆盖广**：PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
 - **增量维护**：改过的文件自动重索引，删掉的自动清理，已索引的秒跳过
 - **断点续建**：索引几万篇时中断也不要紧，重跑从断点继续
-- **中英双语界面**：网页右上角有 中 / EN 切换，默认跟随浏览器语言，选择会记住
+- **中英双语界面**：右上角有 中 / EN 切换，默认跟随系统语言，选择会记住
 - **质量自检（少见但重要）**：`python brain.py selftest` 用合成数据独立验证检索准确率、双 PDF 引擎交叉比对、OCR 字符错误率、9 类畸形文件 fuzz、数据库完整性，报告可任何人重跑复核
 - **零上传**：所有解析在本机完成，服务只绑 `127.0.0.1`
 
@@ -71,10 +71,41 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 
 设置面板——扫描、更新、体检都在这里，不用记任何命令：
 
-<p align="center"><img src="assets/screenshot-settings-zh.png" width="620" alt="第二大脑设置面板：索引范围与五个维护按钮"></p>
+<p align="center"><img src="assets/screenshot-settings-zh.png" width="880" alt="第二大脑 exe 设置面板：索引范围与智能扫描/添加文件夹/保存并更新索引/按现有范围更新/引擎体检五个按钮"></p>
 
 <p align="center"><sub>同一面板切到 English 的样子：</sub><br>
-<img src="assets/screenshot-settings-en.png" width="620" alt="Second Brain settings panel"></p>
+<img src="assets/screenshot-settings-en.png" width="620" alt="Second Brain settings panel in the exe window"></p>
+
+### 和 Listary / Everything 一起用（一个搜名字，一个搜内容）
+
+Everything、Listary 强在**毫秒级找到「文件叫什么」**，但对文件里写了什么一无所知；
+第二大脑正好相反。两者不冲突，一起用才是完整的检索：
+
+| 你要找的东西 | 该用谁 |
+|---|---|
+| 记得文件名或文件夹名 | Everything / Listary |
+| 只记得「哪份文件里提过这句」 | 第二大脑 |
+
+为了不用每次都先开窗口再输入，exe 支持直接带参数启动：
+
+| 命令 | 效果 |
+|---|---|
+| `SecondBrain.exe 报销标准` | 开窗并直接出结果 |
+| `SecondBrain.exe --settings` | 开窗并直接展开设置面板 |
+| `SecondBrain.exe --lang en 报销` | 强制英文界面（`zh` 同理） |
+
+**在 Listary 里挂一条命令**（选项 → 命令 → ➕）：
+
+- 关键字：`sb`
+- 标题：第二大脑
+- 路径：`你的解压目录\SecondBrain.exe`
+- 参数：`"{query}"`
+
+之后任何地方双击 Ctrl，输入 `sb 报销流程` 回车，第二大脑直接带着结果开窗。
+同一个面板里也能给 Everything 加一条（关键字 `ev`，参数 `-search "{query}"`），
+于是「`ev` 找文件名 / `sb` 找文件内容」就都在一个入口里了。
+
+PowerToys Run、快捷方式、AutoHotkey 同理——只要能传参，就能直达结果，不用先开窗口再输入。
 
 ### 命令行（源码版进阶，exe 用户不需要）
 
@@ -140,10 +171,11 @@ python brain.py selftest            # 质量自检，报告写入 eval_report.tx
 
 收藏常用搜索、做快捷方式时好用：
 
-| 参数 | 作用 |
-|---|---|
-| `?q=关键词` | 打开就直接出结果 |
-| `?lang=zh` / `?lang=en` | 这条链接强制用指定语言 |
+| 参数 | 作用 | exe 里的等价写法 |
+|---|---|---|
+| `?q=关键词` | 打开就直接出结果 | `SecondBrain.exe 关键词` |
+| `?cfg=1` | 打开就展开设置面板 | `SecondBrain.exe --settings` |
+| `?lang=zh` / `?lang=en` | 这条链接强制用指定语言 | `SecondBrain.exe --lang en` |
 
 例：`http://127.0.0.1:8765/?q=报销标准&lang=zh`
 

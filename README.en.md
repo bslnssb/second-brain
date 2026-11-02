@@ -11,10 +11,10 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 ---
 
-<p align="center"><img src="assets/screenshot-en.png" alt="Second Brain searching for a term: 7 matches, each showing the exact lines that matched with the keyword highlighted"></p>
+<p align="center"><img src="assets/screenshot-en.png" alt="The Second Brain exe window searching for a term: 7 matches, each showing the exact lines that matched with the keyword highlighted"></p>
 
 <p align="center"><sub>Same index, switched to Chinese in the top-right corner — the UI language never changes what gets indexed</sub><br>
-<img src="assets/screenshot-zh.png" width="620" alt="Second Brain Chinese interface"></p>
+<img src="assets/screenshot-zh.png" width="620" alt="Second Brain exe window, Chinese interface"></p>
 
 ## Features
 
@@ -23,7 +23,7 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 - **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
 - **Incremental maintenance** — modified files are re-indexed, deleted files are pruned, unchanged files are skipped instantly
 - **Resumable indexing** — interrupt a 50k-file build and restart it; it continues where it stopped
-- **Bilingual UI** — the web interface has a 中 / EN switch in the top-right corner; it follows your browser language by default and remembers your choice
+- **Bilingual UI** — a 中 / EN switch in the top-right corner; it follows your system language by default and remembers your choice
 - **Quality self-test (rare, but it matters)** — `python brain.py selftest` validates retrieval accuracy, cross-checks two PDF extractors, measures OCR character error rate, fuzzes 9 kinds of malformed files and checks database integrity. The report is reproducible by anyone
 - **Zero upload** — every parser runs locally; the HTTP server binds to `127.0.0.1` only
 
@@ -71,10 +71,43 @@ Edit `scope.json` and put your folders in `include_dirs` (lowercase paths; backs
 
 The settings panel — scanning, updating and health checks all live here, no commands to remember:
 
-<p align="center"><img src="assets/screenshot-settings-en.png" width="620" alt="Second Brain settings panel: index scope and the five maintenance buttons"></p>
+<p align="center"><img src="assets/screenshot-settings-en.png" width="880" alt="The Second Brain exe settings panel: index scope plus the five buttons (smart scan, add folder, save & build index, update index, health check)"></p>
 
 <p align="center"><sub>The same panel switched to Chinese:</sub><br>
 <img src="assets/screenshot-settings-zh.png" width="620" alt="Second Brain settings panel, Chinese"></p>
+
+### Pairing it with Listary / Everything (one finds names, the other finds contents)
+
+Everything and Listary are superb at **finding “what is this file called”** in milliseconds, but they have
+no idea what's written inside. Second Brain is the mirror image. They don't compete — together they cover
+both questions:
+
+| What you're after | Use |
+|---|---|
+| You remember a file or folder name | Everything / Listary |
+| You only remember “some document mentioned this phrase” | Second Brain |
+
+So you don't have to open a window and type again, the exe accepts launch arguments:
+
+| Command | Effect |
+|---|---|
+| `SecondBrain.exe expense policy` | Opens with the results already rendered |
+| `SecondBrain.exe --settings` | Opens straight into the settings panel |
+| `SecondBrain.exe --lang zh expenses` | Forces the interface language (`en` likewise) |
+
+**Hooking it into Listary** (Options → Commands → ➕):
+
+- Keyword: `sb`
+- Title: Second Brain
+- Path: `your\extract\folder\SecondBrain.exe`
+- Parameter: `"{query}"`
+
+From then on: double-tap Ctrl anywhere, type `sb expense policy`, press Enter — the window opens with
+results. You can add Everything in the same panel (keyword `ev`, parameter `-search "{query}"`), so
+“`ev` for names / `sb` for contents” both live behind one entry point.
+
+PowerToys Run, shortcuts and AutoHotkey work the same way — anything that can pass an argument can jump
+straight to the results.
 
 ### Command line (source edition, optional)
 
@@ -145,10 +178,11 @@ substring of the full path (case-insensitive).
 
 Handy for bookmarks and shortcuts:
 
-| Parameter | Effect |
-|---|---|
-| `?q=keyword` | Open the page with results already rendered |
-| `?lang=zh` / `?lang=en` | Force the interface language for this link |
+| Parameter | Effect | Equivalent on the exe |
+|---|---|---|
+| `?q=keyword` | Open with results already rendered | `SecondBrain.exe keyword` |
+| `?cfg=1` | Open with the settings panel expanded | `SecondBrain.exe --settings` |
+| `?lang=zh` / `?lang=en` | Force the interface language for this link | `SecondBrain.exe --lang en` |
 
 Example: `http://127.0.0.1:8765/?q=invoice&lang=en`
 

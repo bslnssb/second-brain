@@ -15,9 +15,16 @@ import threading
 import urllib.request
 import webbrowser
 from pathlib import Path
+from urllib.parse import quote
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+
+# brain.cli 能认的子命令：这些一律走命令行，不当作搜索词。
+# 没列在里面的裸参数（如 SecondBrain.exe 报销）视为「带关键词开窗，直接出结果」，
+# 是配合 Listary / PowerToys Run 这类启动器的入口。
+_CLI_CMDS = {'index', 'update', 'search', 'prune', 'serve',
+             'selftest', 'eval', '_extract', 'scan'}
 
 
 def _die(msg):
@@ -98,7 +105,16 @@ class Api:
         return ''
 
 
-def main():
+def main(query=None, show_settings=False, lang=None):
+    """开窗口。
+
+    query          非空时窗口带 ?q=<关键词> 打开，直接出结果
+    show_settings  为真时带 ?cfg=1 打开，直接展开设置面板
+    lang           'zh' / 'en' 时强制界面语言（否则跟浏览器/navigator.language）
+
+    这三个参数让 `SecondBrain.exe 关键词`、`SecondBrain.exe --settings`、
+    `SecondBrain.exe --lang en 报销` 能从 Listary / 快捷方式直达，省掉双击后再操作。
+    """
     global URL
     port = _pick_port()
     if not port:
@@ -108,20 +124,57 @@ def main():
     URL = f'http://127.0.0.1:{port}'
     _start_server(port)
 
+    target = URL
+    params = []
+    if query:
+        params.append('q=' + quote(query))
+    if show_settings:
+        params.append('cfg=1')
+    if lang in ('zh', 'en'):
+        params.append('lang=' + lang)
+    if params:
+        target += '/?' + '&'.join(params)
+
     if webview is None:
-        webbrowser.open(URL)
-        print(f'未安装 pywebview，已用浏览器打开：{URL}')
+        webbrowser.open(target)
+        print(f'未安装 pywebview，已用浏览器打开：{target}')
         # 浏览器模式下必须让主线程别退出，否则服务会被回收
         threading.Event().wait()
         return
 
     webview.create_window(
-        'Second Brain · 第二大脑', URL,
+        'Second Brain · 第二大脑', target,
         width=1360, height=880, min_size=(900, 600),
         text_select=True, js_api=Api(),
     )
     # 关窗即退出：daemon 线程随主进程结束
     webview.start()
+
+
+def _parse_window_args(argv):
+    """从 argv 里抽出窗口启动用的标志：--settings、--lang xx / --lang=xx。
+    其余非标志 token 原样留在 rest 里，由调用方决定是子命令还是搜索词。
+
+    返回 (rest, show_settings, lang)。"""
+    show_settings = False
+    lang = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--settings', '-s', '/settings'):
+            show_settings = True
+        elif a == '--lang':
+            if i + 1 < len(argv):
+                lang = argv[i + 1]
+                i += 1
+        elif a.startswith('--lang='):
+            lang = a.split('=', 1)[1]
+        else:
+            rest.append(a)
+        i += 1
+    lang = lang if lang in ('zh', 'en') else None
+    return rest, show_settings, lang
 
 
 def _attach_console():
@@ -147,11 +200,26 @@ def _attach_console():
         pass
 
 
+def _run_window(query, show_settings, lang):
+    try:
+        main(query=query, show_settings=show_settings, lang=lang)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _die(f'窗口启动失败：{type(e).__name__}: {e}\n\n'
+             f'Window failed to start.\n'
+             f'通常是缺少 WebView2 运行时，可从以下地址安装：\n'
+             f'https://developer.microsoft.com/microsoft-edge/webview2/')
+
+
 if __name__ == '__main__':
-    if len(sys.argv) > 1:
+    argv = sys.argv[1:]
+    rest, show_settings, lang = _parse_window_args(argv)
+    # 第一个剩余 token 是已知子命令（update / search / selftest…）→ 走命令行
+    if rest and not show_settings and not lang and rest[0] in _CLI_CMDS:
         _attach_console()
         try:
-            brain.cli(sys.argv[1:])
+            brain.cli(rest)
         except SystemExit:
             raise
         except Exception as e:
@@ -159,13 +227,13 @@ if __name__ == '__main__':
             traceback.print_exc()
             _die(f'命令执行失败：{type(e).__name__}: {e}\n\n'
                  f'Command failed. Run it from a terminal to see the full traceback.')
+    elif rest and rest[0].startswith('-'):
+        # 不认识的标志：交给 cli 报 usage，而不是当作搜索词
+        _attach_console()
+        brain.cli(rest)
+    elif argv:
+        # 裸关键词 / --settings / --lang → 开窗口
+        query = ' '.join(rest) if rest else None
+        _run_window(query, show_settings, lang)
     else:
-        try:
-            main()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            _die(f'窗口启动失败：{type(e).__name__}: {e}\n\n'
-                 f'Window failed to start.\n'
-                 f'通常是缺少 WebView2 运行时，可从以下地址安装：\n'
-                 f'https://developer.microsoft.com/microsoft-edge/webview2/')
+        _run_window(None, False, None)
