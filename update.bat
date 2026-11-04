@@ -1,47 +1,42 @@
 @echo off
-chcp 65001 >nul
-setlocal
+rem ±àÂëËµÃ÷£º±¾ÎÄ¼þ±£´æÎª GBK(ANSI)¡¢CRLF ÐÐÎ²£¬²»Òª¸Ä³É UTF-8¡ª¡ªcmd ½âÎöº¬ÖÐÎÄµÄÅú´¦ÀíÊ±»á´íÎ»¡£
 cd /d "%~dp0"
-set PYTHONIOENCODING=utf-8
+set "PYTHONIOENCODING=gbk:replace"
 set PYTHONUNBUFFERED=1
 
-if not exist scope.json (
-  echo [!] æœªæ‰¾åˆ° scope.jsonã€‚
-  echo     è¯·å…ˆæŠŠ scope.example.json å¤åˆ¶ä¸º scope.jsonï¼Œå¹¶æ”¹å¥½ include_dirsã€‚
+if not exist "%~dp0scope.json" (
+  echo [!] Î´ÕÒµ½ scope.json£¬ÇëÏÈ°Ñ scope.example.json ¸´ÖÆÒ»·Ý¸ÄÃûÎª scope.json£¬¸ÄºÃÀïÃæµÄÎÄ¼þ¼Ð¡£
   pause
   exit /b 1
 )
 
-rem æ‰“åŒ…ç‰ˆä¼˜å…ˆï¼šexe é‡Œå·²è‡ªå¸¦æ‰«æå™¨ã€ç´¢å¼•å™¨å’Œ OCRï¼Œä¸éœ€è¦æœ¬æœº Python
-rem update ä¸€æ¡å‘½ä»¤èµ°å®Œä¸‰ä»¶äº‹ï¼šé‡æ‰«æ¸…å• â†’ ç´¢å¼•æ–°å¢ž/å˜æ›´ â†’ æ¸…ç†å¤±æ•ˆæ¡ç›®
-rem å®Œæ•´ç‰ˆå’Œç²¾ç®€ç‰ˆçš„ exe åå­—ä¸åŒï¼Œä¸¤ä¸ªéƒ½è®¤ä¸€ä¸‹
-set EXE=
-if exist "%~dp0SecondBrain.exe" set EXE=%~dp0SecondBrain.exe
-if not defined EXE if exist "%~dp0SecondBrain-Core.exe" set EXE=%~dp0SecondBrain-Core.exe
-if defined EXE (
-  "%EXE%" update
-  echo.
-  echo å…¨éƒ¨å®Œæˆï¼Œå¯ä»¥å…³é—­æœ¬çª—å£ã€‚
-  pause
-  exit /b 0
+rem ÓÐÔ´Âë¾ÍÓÅÏÈÅÜÔ´Âë£»Ö»ÓÐ·¢²¼°ü£¨Ã»ÓÐ .py£©Ê±²Å×ß exe¡£
+set "SB_CMD="
+if exist "%~dp0brain.py" (
+  where python >nul 2>nul
+  if not errorlevel 1 set "SB_CMD=python brain.py update"
 )
-
-where python >nul 2>nul
-if not %errorlevel%==0 (
-  echo [!] æœªæ‰¾åˆ° Pythonï¼Œä¹Ÿæ²¡æœ‰ SecondBrain.exe / SecondBrain-Core.exeã€‚
-  echo     æ›´æ–°éœ€è¦ Python 3.12ï¼ˆåªåšæœç´¢åˆ™ä¸éœ€è¦ï¼‰ã€‚
+if not defined SB_CMD if exist "%~dp0SecondBrain.exe" set "SB_CMD=SecondBrain.exe update"
+if not defined SB_CMD if exist "%~dp0SecondBrain-Core.exe" set "SB_CMD=SecondBrain-Core.exe update"
+if not defined SB_CMD (
+  echo [!] Ã»ÕÒµ½¿ÉÔËÐÐµÄ³ÌÐò£ºÄ¿Â¼Àï¼ÈÃ»ÓÐ brain.py + Python£¬Ò²Ã»ÓÐ SecondBrain.exe¡£
   pause
   exit /b 1
 )
 
-echo [1/3] æ‰«æç£ç›˜ä¸Šçš„æ–‡æ¡£...
-python scan_docs.py
+echo ¿ªÊ¼¸üÐÂ£ºÉ¨Ãè´ÅÅÌ -> Ë÷ÒýÐÂÔö/±ä¸üÎÄ¼þ -> ÇåÀíÒÑÉ¾³ýÌõÄ¿
+echo ÆÚ¼ä¿ÉÒÔ×îÐ¡»¯±¾´°¿Ú£¬µ«²»Òª¹Ø±Õ£»É¨Ãè½×¶Î¿ÉÄÜ¼¸Ê®Ãë²»Êä³ö£¬ÊôÓÚÕý³£¡£
 echo.
-echo [2/3] ç´¢å¼•æ–°å¢žä¸Žå˜æ›´çš„æ–‡ä»¶...
-python brain.py index scope.json
+
+%SB_CMD%
+set "SB_RC=%errorlevel%"
 echo.
-echo [3/3] æ¸…ç†å·²åˆ é™¤æ–‡ä»¶çš„ç´¢å¼•...
-python brain.py prune
-echo.
-echo å…¨éƒ¨å®Œæˆï¼Œå¯ä»¥å…³é—­æœ¬çª—å£ã€‚
+if not "%SB_RC%"=="0" (
+  echo [!] Õâ´Î¸üÐÂÃ»ÓÐ³É¹¦Íê³É£¨ÍË³öÂë %SB_RC%£©¡£ÉÏÃæ´ø [!] µÄÄÇÐÐÊÇÔ­Òò£¬ÏÈ±ð¹Ø´°¿Ú¡£
+  echo     ³£¼ûÔ­Òò£ºÒªË÷ÒýµÄÎÄ¼þ¼Ð±»°á×ß»ò¸ÄÃûÁË£»»òÕßÁíÒ»¸ö¸üÐÂ»¹ÔÚÅÜ¡£
+  echo     Ë÷Òý±¾ÉíÃ»ÓÐ±»Çå¿Õ£¬°´ÌáÊ¾´¦ÀíºóÔÙË«»÷Ò»´Î¼´¿É¡£
+  pause
+  exit /b %SB_RC%
+)
+echo ¸üÐÂÍê³É£¬¿ÉÒÔ¹Ø±Õ±¾´°¿Ú¡£
 pause

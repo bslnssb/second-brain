@@ -23,8 +23,8 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 ## Features
 
 - **Double-tap Ctrl quick search** — tap Ctrl twice anywhere and a search box drops down from the top of the screen: type two characters, pick with `↑↓`, `Enter` to open, `Ctrl+1`–`Ctrl+9` to open the Nth row, `Esc` to dismiss
-- **Pinyin fuzzy match** — type `azb` for 安装包 (installer), `xzrs` for 行政人事 (HR). Both first-letter and full pinyin work, just like Listary
-- **Content hits in the quick window** — if the keyword isn't in any file *name* but is inside a document, the match still shows up after a 300 ms pause, with a purple "正文/content" tag and the matching sentence. Neither Listary nor Everything can do this
+- **Pinyin fuzzy match** — type `azb` for 安装包 (installer), `xzrs` for 行政人事 (HR). Both first-letter and full pinyin work, no need to remember the full spelling
+- **Content hits in the quick window** — if the keyword isn't in any file *name* but is inside a document, the match still shows up after a 300 ms pause, with a purple "正文/content" tag and the matching sentence. Neither Listary nor Everything does this
 - **Real system icons** — each row shows the actual icon the OS uses for that extension (red PDF, blue Word, green Excel), not a hand-drawn placeholder
 - **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
 - **Automatic OCR for scans** — image-only PDFs get their first 15 pages recognised offline (RapidOCR); no network after install
@@ -117,7 +117,7 @@ The settings panel — scanning, updating and health checks all live here, no co
 ### How it relates to Listary / Everything
 
 **If all you want is "double-tap Ctrl, type a name, open the file", Second Brain alone is enough — you don't
-need Listary.** The quick window copies its habits: double-tap Ctrl to summon, one input line, nine rows,
+need Listary.** The quick window follows the conventions people already know: double-tap Ctrl to summon, one input line, nine rows,
 `Ctrl+1–9` to open, `Esc` to dismiss, **pinyin fuzzy** (`azb` → 安装包), **real system icons** (the same one
 Explorer shows), **recent files in the empty state**, and **breadcrumb paths** (`C: › … › Library › HR`).
 File **and** folder names are searched together — type 报 and files and directories land in the same list;
@@ -157,6 +157,10 @@ index yet — normal use never touches it.
 
 **Autostart**: put a shortcut to `SecondBrain.exe` in `shell:startup` with `--silent` appended to the target —
 it then sits quietly in the tray from boot, one double Ctrl away. Quit from the tray icon.
+
+> Second Brain is an independent implementation: it uses no code, icons or UI assets from any product
+> mentioned here, and is not affiliated with or endorsed by them. Product names appear only to explain
+> the differences.
 
 **If you already live in Listary's input box**: you can still add a command there (Options → Commands → ➕),
 keyword `sb`, argument `"{query}"`, so `sb 报销流程` opens Second Brain with results. With the quick window

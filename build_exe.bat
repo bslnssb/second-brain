@@ -1,57 +1,22 @@
 @echo off
-chcp 65001 >nul
+rem 编码说明：GBK(ANSI) + CRLF，不要改成 UTF-8。
 setlocal
 cd /d "%~dp0"
 
-rem Build the Windows executables.
-rem   build_exe.bat           -> full + core
-rem   build_exe.bat full      -> full only (with OCR)
-rem   build_exe.bat core      -> core only (no OCR)
-rem
-rem Both editions are onedir: PyInstaller already explodes the bundle at build
-rem time, so indexing never pays a per-file unpack cost. See the .spec headers.
+echo [1/2] 打包完整版（含 OCR / PDF / Office 解析）...
+python -m PyInstaller --noconfirm --clean second-brain-app.spec || goto :fail
 
-set MODE=%~1
-if "%MODE%"=="" set MODE=all
+echo [2/2] 打包精简版（只要搜索，体积小）...
+python -m PyInstaller --noconfirm --clean second-brain-core.spec || goto :fail
 
-where python >nul 2>nul
-if errorlevel 1 (
-  echo [!] Python not found in PATH. Install Python 3.12 first.
-  pause
-  exit /b 1
-)
-
-if /i "%MODE%"=="full" goto :full
-if /i "%MODE%"=="core" goto :core
-if /i "%MODE%"=="all"  goto :full
-echo Usage: build_exe.bat [full^|core^|all]
-exit /b 2
-
-:full
-echo Building full edition with OCR ...
-python -m PyInstaller --noconfirm --distpath "..\build" --workpath "..\build\_work" second-brain-app.spec
-if errorlevel 1 (
-  echo [!] Full build failed. See the log above.
-  pause
-  exit /b 1
-)
-if /i not "%MODE%"=="all" goto :done
-
-:core
-echo Building core edition without OCR ...
-python -m PyInstaller --noconfirm --distpath "..\build-core" --workpath "..\build-core\_work" second-brain-core.spec
-if errorlevel 1 (
-  echo [!] Core build failed. See the log above.
-  pause
-  exit /b 1
-)
-if /i not "%MODE%"=="all" goto :done
-
-:done
 echo.
-echo Built:
-echo   ..\build\SecondBrain\SecondBrain.exe
-echo   ..\build-core\SecondBrain-Core\SecondBrain-Core.exe
-echo.
-echo Ship the whole folder (exe + _internal). Put it next to brain.db, double-click the exe.
+echo 打包完成，产物在 dist 目录。
+echo 注意：dist 里只放 exe 和 _internal，别把 brain.db / scope.json 拷进去。
 pause
+exit /b 0
+
+:fail
+echo.
+echo [!] 打包失败，看上面的报错。
+pause
+exit /b 2

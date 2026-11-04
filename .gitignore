@@ -37,3 +37,13 @@ dist-*/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 提取子进程的正文回传文件（含文档正文，见 brain.py）
+.extract-*.json
+
+# 运行时缓存 / 更新临时文件
+notices_cache.json
+tmp/
+*.bak
+*.bak-*
+install_update.bat
