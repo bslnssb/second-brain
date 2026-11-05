@@ -6,7 +6,7 @@
   快搜窗（/mini）  双击 Ctrl 弹出，一个输入框 + 九行结果，Ctrl+1~9 直接开，Esc 收起
   主窗口（/）      原来的完整界面：正文检索、类型/路径过滤、设置、索引维护
 
-快搜窗按 Listary 的习惯做：无边框、圆角（Win11 的 DWM 圆角）、常驻置顶、
+快搜窗按大家熟悉的习惯做：无边框、圆角（Win11 的 DWM 圆角）、常驻置顶、
 失焦自动收起。主窗口关掉只是隐藏，程序在托盘里等着，这样双击 Ctrl 随时能用。
 
 带参数时走命令行（update / selftest / search …），方便打包成 exe 后复用同一入口。
@@ -28,7 +28,7 @@ sys.path.insert(0, str(HERE))
 
 # brain.cli 能认的子命令：这些一律走命令行，不当作搜索词。
 # 没列在里面的裸参数（如 SecondBrain.exe 报销）视为「带关键词开窗，直接出结果」，
-# 是配合 Listary / PowerToys Run 这类启动器的入口。
+# 是配合 PowerToys Run 这类启动器的入口。
 _CLI_CMDS = {'index', 'update', 'search', 'prune', 'serve',
              'selftest', 'eval', '_extract', 'scan'}
 

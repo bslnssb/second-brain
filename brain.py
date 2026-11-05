@@ -68,7 +68,7 @@ NOISE_WORDS = ('steam', 'steamapps', 'epic games', '游戏', '驱动', 'driver',
 DISCOVER = {'state': 'idle', 'groups': [], 'err': ''}
 
 # ---------------------------------------------------------------- 拼音（azb → 安装包）
-# Listary 抓人的功能之一：打首字母就能找到中文名。做法是给文件夹名和已入库文档名
+# 同类文件搜索器普遍会做的一件事：打首字母就能找到中文名。做法是给文件夹名和已入库文档名
 # 各存一份「全拼」和「首字母」，查询时打字母就同时查这两列。
 # 全盘 157 万个文件名不参与：既没必要（平时要找的是文件夹和文档），也扛不住
 # （11 万条要十几秒，157 万就是几分钟，还要多占一倍存储）。
@@ -297,7 +297,7 @@ def build_files_index(targets=None):
         con.execute('DROP TABLE IF EXISTS files_new')
         con.execute('CREATE TABLE files_new(path TEXT PRIMARY KEY, name TEXT NOT NULL, '
                     'dir TEXT, ext TEXT, size REAL, mtime REAL)')
-        # 目录也单独存一份：Listary 那类工具的体验里「搜文件夹」和「搜文件」一样常用，
+        # 目录也单独存一份：这类工具的体验里「搜文件夹」和「搜文件」一样常用，
         # 光靠文件路径猜不出空文件夹。整体占比不到文件数的 1/4，代价可以接受。
         con.execute('DROP TABLE IF EXISTS dirs_new')
         con.execute('CREATE TABLE dirs_new(path TEXT PRIMARY KEY, name TEXT NOT NULL, '
@@ -1131,7 +1131,7 @@ def _mini_rank(name, q):
 def record_open(con, path, isdir=False):
     """记一次打开。写失败不能影响「打开文件」本身，所以整体吞异常。
 
-    Listary 的「越用越准」就是靠这张表 —— 同一档匹配里，你常开的排前面。"""
+    「越用越准」就是靠这张表 —— 同一档匹配里，你常开的排前面。"""
     path = str(path or '')
     if not path:
         return
@@ -1162,7 +1162,7 @@ def _recent_map(con):
 
 def recent_rows(con, limit=6):
     """最近打开的文件/文件夹，最近的在最前 —— 快搜窗的空状态直接铺这一列。
-    Listary V7 起打开启动器就是这一屏，一个字都不用打。"""
+    如今的启动器打开就是这一屏，一个字都不用打。"""
     try:
         rows = con.execute('SELECT path,name,isdir FROM recent '
                            'ORDER BY last DESC LIMIT ?', (limit,)).fetchall()
@@ -1309,7 +1309,7 @@ def mini_search(con, q, limit=9, deep=False, body=False):
         # 还没建过全盘索引时，至少让已入库的文档文件名可用
         for p in name_rows(con, q, limit * 3):
             add(p, False, os.path.splitext(p)[1].lower())
-    # 排序分三档，和 Listary V7.1 的思路一致：先看名字像不像（前缀 > 词边界 > 中间），
+    # 排序分三档，和近年主流搜索器的思路一致：先看名字像不像（前缀 > 词边界 > 中间），
     # 同一档里再看你平时开不开它 —— 常开的排前面，但你打的前缀永远压过习惯。
     rec = _recent_map(con)
     items.sort(key=lambda it: (it['r'],
@@ -1864,7 +1864,7 @@ function ico(it){
   return '<img class="ic" src="/api/icon?'+q+'" alt="" '
     +'onerror="this.parentNode.classList.add(&quot;noic&quot;)">'+fb;
 }
-/* 路径分级：Listary 7.1 起把文件夹路径拆成一级一级，每级独立好读，
+/* 路径分级：近年主流搜索器把文件夹路径拆成一级一级，每级独立好读，
    比一整行灰字好认得多。层级超过三级就保留盘符 + 最后两级——
    最后一级就是文件所在的文件夹，这才是你要的定位信息。 */
 function segs(p){
@@ -1943,7 +1943,7 @@ function render(items,q,keep){
   }
   bind(); resize();
 }
-/* 空状态：打开就先给一屏「刚动过的文件」。Listary V7 起就是这个做法——
+/* 空状态：打开就先给一屏「刚动过的文件」。近年主流搜索器就是这个做法——
    很多时候要找的东西就在眼前，搜索这一步可以直接省掉。 */
 function renderRecent(items){
   MODE='recent';
