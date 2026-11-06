@@ -2149,7 +2149,7 @@ def index(scope_path):
     except Exception:
         pass
     # 键一律用 normcase(path)：Windows 不区分大小写，若按原始字符串比对，
-    # 「d:\1\a.md」和「D:\1\a.md」会被当成两个文件——库里的重复行就是这么来的
+    # 「d:\work\a.md」和「D:\work\a.md」会被当成两个文件——库里的重复行就是这么来的
     # （2026-11-04 实测 docs 8,931 行里 3,671 行是重复、meta 39,890 里 3,937 行）。
     meta_info = {os.path.normcase(r[0]): r for r in
                  con.execute('SELECT path, indexed_at, size, mtime FROM meta')}
@@ -5535,7 +5535,7 @@ def _refresh_names_from_csv(scope_path=None):
     只做增补：
       * 新路径 → 插一行（exe/lnk 顺手读一下描述，界面上才认得出「微信」）；
       * 老路径 → 只更正 size，不动 mtime（mtime 是「最近打开」排序的依据之一）和 descr；
-      * 已有记录的盘符大小写（`d:\1\…` 与 `D:\1\…`）按不区分大小写去重，避免搜出两份。
+      * 已有记录的盘符大小写（`d:/work/…` 与 `D:/work/…`）按不区分大小写去重，避免搜出两份。
 
     返回 (新增文件数, 新增文件夹数)；读不到清单就返回 (0, 0)，绝不抛。"""
     try:
@@ -5557,7 +5557,7 @@ def _refresh_names_from_csv(scope_path=None):
             return 0, 0
         con = sqlite3.connect(DB, check_same_thread=False)
         con.execute('PRAGMA busy_timeout=5000')
-        # 只把「小写盘符开头」的老记录读出来（迁移遗留的 d:\1\…），一次全表扫 0.4 秒，
+        # 只把「小写盘符开头」的老记录读出来（迁移遗留的 d:\old\…），一次全表扫 0.4 秒，
         # 换来几千行比对，比逐行 WHERE lower(path)=? 快得多。
         case_map = {}
         for (old,) in con.execute(

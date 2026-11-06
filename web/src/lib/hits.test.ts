@@ -35,12 +35,12 @@ describe('midName', () => {
 
 describe('路径工具', () => {
   it('baseName 支持两种斜杠', () => {
-    expect(baseName('D:\\1\\a\\b.txt')).toBe('b.txt')
-    expect(baseName('D:/1/a/b.txt')).toBe('b.txt')
+    expect(baseName('C:\\work\\a\\b.txt')).toBe('b.txt')
+    expect(baseName('C:/work/a/b.txt')).toBe('b.txt')
     expect(baseName('b.txt')).toBe('b.txt')
   })
   it('dirName 取目录', () => {
-    expect(dirName('D:\\1\\a\\b.txt')).toBe('D:\\1\\a')
+    expect(dirName('C:\\work\\a\\b.txt')).toBe('C:\\work\\a')
   })
 })
 

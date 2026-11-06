@@ -1345,7 +1345,7 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
         webview.start(func=app.after_start, debug=False)
     except Exception as e:
         # pythonnet（pywebview 的 WinForms 后端）在两种环境下会加载失败：
-        #   1) 程序放在带 Low 完整性标签的目录里（例如 D:\1\项目\…）；
+        #   1) 程序放在带 Low 完整性标签的目录里（例如 D:\work\项目\…）；
         #   2) 机器缺 .NET / WebView2 运行时。
         # 此时窗口开不出来，但本地服务是好的 —— 退到浏览器模式，至少能继续用。
         _log(f'webview.start FAILED: {type(e).__name__}: {e}')

@@ -1,0 +1,31 @@
+name: privacy
+
+# 每次 push 都跑一遍 tools/check_public.py：
+# 该有的文件在不在、有没有把索引库/私人笔记/本机路径塞进来、版本号三处一不一致。
+# 本地也有同一条命令（python tools/check_public.py），CI 只是兜底 ——
+# v0.9.44 那次就是把作者的私人笔记当成用户手册提交上去的，靠人记性不可靠。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 需要历史给下面这一步
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 仓库体检（清单 / 黑名单 / 本机痕迹 / 版本号 / 体积）
+        run: python tools/check_public.py
+
+      - name: 扫本次提交带进来的新行
+        # 词表在 tools/private_words.txt 里，脚本读它 —— 这个文件里没有任何明文敏感词，
+        # 不会出现「CI 脚本自己把自己判失败」的情况。
+        run: python tools/check_public.py --history

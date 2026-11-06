@@ -1,0 +1,95 @@
+# 公开仓库内容清单（唯一权威）
+#
+# 这个文件回答一个问题：**release/github 里到底该有什么**。
+# 下次发版不要再凭记忆判断，跑 `python tools/sync_public.py` 和 `python tools/check_public.py`：
+#   清单里有、源目录有  → 同步过去
+#   清单里有、源目录没有 → 报错（改名或删了源文件，得改清单）
+#   仓库里有、清单里没有 → 报错（有人手滑放进来的东西）
+#
+# 三种前缀：
+#   sync  从开发根（../../）同步过来；开发根是唯一维护地
+#   local 只在这个仓库里维护，开发根没有（构建脚本、仓库自己的图标、CI 配置）
+#   build 构建产物，由 `npm run build` 生成在开发根 web/dist，同步过来；不进 git
+#
+# 目录以 / 结尾 = 整个子树。
+# 被 .gitignore 排除的东西（node_modules、dist、build、*.log）不用写在这里。
+
+# ─────────────────────────── 内核（开发根是唯一维护地） ───────────────────────────
+sync  brain.py
+sync  setup_app.py
+sync  selftest.py
+sync  app_window.py
+sync  hotkey.py
+sync  tray.py
+sync  apprank.py
+sync  scan_docs.py
+sync  ocr_backfill.py
+sync  gen_icon.py
+
+# ─────────────────────────── 文档 ───────────────────────────
+# README 只在这个仓库维护（开发根没有 README，它本来就是给外人看的）
+local README.md
+local README.en.md
+sync  使用说明.md
+sync  使用说明.en.md
+sync  使用说明.es.md
+sync  使用说明.hi.md
+sync  使用说明.pt.md
+sync  version.json
+
+# ─────────────────────────── 前端源码（构建产物见 build/） ───────────────────────────
+sync  web/index.html
+sync  web/package.json
+sync  web/pnpm-lock.yaml
+sync  web/postcss.config.js
+sync  web/tailwind.config.js
+sync  web/tsconfig.json
+sync  web/vite.config.ts
+sync  web/README.md
+sync  web/src/
+
+# ─────────────────────────── 图片资源 ───────────────────────────
+# 这三张在开发根 assets/ 里；二维码换了要同时改 brain.py 的 DONATE_SHA256
+# （否则「关于」面板会把新图判成「被篡改」而隐藏，这是设计如此）
+sync  assets/donate.png
+sync  assets/icon.ico
+sync  assets/icon_preview.png
+# 下面这些截图只在这个仓库里维护（README 用，2× DPR，760/1280 宽）
+local assets/screenshot-quick.png
+local assets/screenshot-quick-empty.png
+local assets/screenshot-quick-en.png
+local assets/screenshot-main.png
+local assets/screenshot-main-dark.png
+local assets/screenshot-main-en.png
+local assets/screenshot-settings.png
+local assets/screenshot-settings-en.png
+
+# ─────────────────────────── 打包脚本（只在这里维护） ───────────────────────────
+local second-brain-app.spec
+local second-brain-core.spec
+local SecondBrain-Setup.spec
+local gen_version.py
+local make_payload.py
+local stage_app.py
+local stage_setup.py
+local build_exe.bat
+local start.bat
+local update.bat
+local qa_test.py
+
+# ─────────────────────────── 仓库自己的东西 ───────────────────────────
+local .gitignore
+local .gitattributes
+local LICENSE
+local QA_FINDINGS.md
+local requirements.txt
+local scope.example.json
+local app.ico
+local logo40.png
+local logo64.png
+local logo256.png
+local tools/
+local .github/
+
+# ─────────────────────────── 构建产物（不进 git） ───────────────────────────
+build web/dist/
