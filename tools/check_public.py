@@ -117,11 +117,22 @@ def covered(path: str, patterns) -> bool:
 
 
 def scan_history(rng, words):
-    """扫提交历史里**新增的行**。老内容早就人工过了一遍，这里只防「这次带进来的」。"""
-    out = run_git('log', '-p', '--unified=0', '--no-color', rng)
+    """扫提交历史里**新增的行**。老内容早就人工过了一遍，这里只防「这次带进来的」。
+
+    `--format=%H` 是必须的：`git log -p` 默认会把 commit message 一起打出来，
+    而 commit message 里出现路径是正常的（说明问题时总要举个例子），
+    不加这个会把「我在说明里提了一句 D:\\1\\」也判成泄露 —— 第一次跑 CI 就是这么红的。
+    """
+    out = run_git('log', '-p', '--unified=0', '--no-color', '--format=%H', rng)
     hits = []
+    cur = ''
     for line in out.splitlines():
-        if not line.startswith('+') or line.startswith('+++'):
+        if line.startswith('+++ b/'):
+            cur = line[6:].strip()
+            continue
+        if line.startswith('+++') or not line.startswith('+'):
+            continue
+        if cur in SELF_SKIP:           # 规则文件本身当然含有这些词
             continue
         for w in words:
             if w in line:

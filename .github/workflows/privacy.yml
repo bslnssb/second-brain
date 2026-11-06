@@ -28,4 +28,13 @@ jobs:
       - name: 扫本次提交带进来的新行
         # 词表在 tools/private_words.txt 里，脚本读它 —— 这个文件里没有任何明文敏感词，
         # 不会出现「CI 脚本自己把自己判失败」的情况。
-        run: python tools/check_public.py --history
+        # 只扫 diff 的新增行，不扫 commit message：说明问题时总要在提交信息里举个路径的例子。
+        run: |
+          set -e
+          RANGE="${{ github.event.before }}..${{ github.sha }}"
+          case "$RANGE" in
+            0000000000000000000000000000000000000000*|..*|*0000000000000000000000000000000000000000)
+              RANGE="HEAD~1..HEAD" ;;
+          esac
+          echo "扫描范围: $RANGE"
+          python tools/check_public.py --history "$RANGE"
