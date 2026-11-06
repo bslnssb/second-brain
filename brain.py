@@ -17,6 +17,7 @@
 """
 import csv
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -35,7 +36,7 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-APP_VERSION = 'v0.9.45'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.46'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 BUILD_DATE = '2026-11-06'
 PY_VER = sys.version.split()[0]
 SQL_VER = sqlite3.sqlite_version
@@ -45,6 +46,43 @@ SQL_VER = sqlite3.sqlite_version
 # 绝不弹错误框——检查更新失败不该影响搜索。
 REPO_SLUG = 'bslnssb/second-brain'
 _UA = {'User-Agent': 'SecondBrain/%s' % APP_VERSION}
+
+# ---------------------------------------------------------------- 官方地址 / 赞赏码防篡改
+# 关于面板里的仓库地址**不写在前端**：写在这里，跟着 exe 一起编译。
+# 别人拿走仓库改一行 JS 就能换掉链接，但要换掉这里的地址得重新打包 exe。
+OFFICIAL_REPO = 'https://github.com/%s' % REPO_SLUG
+OFFICIAL_RELEASES = OFFICIAL_REPO + '/releases'
+OFFICIAL_ISSUES = OFFICIAL_REPO + '/issues'
+
+# 发行版赞赏码的 SHA-256（assets/donate.png）。用途只有一个：
+# 有人把安装包拆开、换掉二维码再发出去时，界面能当场认出「这不是我发出的那张」。
+# 换自己的收款码要同时改这一行 —— 这是故意的，改图比改这行容易得多。
+DONATE_SHA256 = '07710ddf1ccf1d443275df5ffae15820609d7d34160af6438edf50455be835ee'
+
+# /api/open_url 只认本仓库下的地址：这条路由会真的调起系统浏览器，
+# 放开任意 URL 等于给页面一个「随手打开钓鱼站」的按钮。
+# 注意别写成 startswith(OFFICIAL_REPO) —— 那样 `.../second-brain-evil` 也能过。
+def url_allowed(u):
+    u = (u or '').strip()
+    return u == OFFICIAL_REPO or u.startswith(OFFICIAL_REPO + '/')
+
+
+def file_sha256(p, limit=8 * 1024 * 1024):
+    """算文件指纹，读不出来就返回空串（不抛——关于面板不该因为图标缺失打不开）。"""
+    try:
+        h = hashlib.sha256()
+        with open(p, 'rb') as f:
+            while True:
+                b = f.read(262144)
+                if not b:
+                    break
+                h.update(b)
+                limit -= len(b)
+                if limit <= 0:
+                    break
+        return h.hexdigest()
+    except Exception:
+        return ''
 
 
 def _http_get(url, timeout=8, limit=16 * 1024 * 1024):
@@ -1147,7 +1185,8 @@ def build_files_index(targets=None):
         import traceback
         traceback.print_exc()
         NAMES = {'state': 'error', 'err': f'{type(e).__name__}: {e}', 'n': 0}
-        _prog(state='error', phase='', msg=f'文件名索引失败：{e}', err=str(e))
+        _prog(state='error', phase='', msg=f'文件名索引失败：{e}', err=str(e),
+              k='m_names_fail', a={'e': str(e)})
 
 # 质量自检（GUI/CLI 共用）；在独立子进程里跑，绝不碰正在服务的真实索引库
 SELFTEST = {'state': 'idle', 'msg': '', 'ok': None, 'k': ''}
@@ -5352,7 +5391,8 @@ def _repair_then_recheck(miss, scope_path):
         return miss
     if not fixed:
         return miss
-    _prog(msg='索引范围已自动修复：' + ' → '.join(f'{a} ⇒ {b}' for a, b in fixed), k='')
+    _prog(msg='索引范围已自动修复：' + ' → '.join(f'{a} ⇒ {b}' for a, b in fixed),
+          k='m_scope_fixed', a={'p': ' → '.join(f'{a} ⇒ {b}' for a, b in fixed)})
     return _missing_scope_dirs(scope_path)
 
 # 失效路径登记表：搜索时遇到不存在的路径记下来，启动后台 prune 时优先清，
@@ -8250,12 +8290,32 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 body = json.dumps(d, ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/ping'):
-                # 供桌面启动器确认「这个端口上跑的是不是本应用」，防止端口被别的程序占用时显示错页面
+                # 供桌面启动器确认「这个端口上跑的是不是本应用」，防止端口被别的程序占用时显示错页面。
+                # 官方地址也从这里发：前端只负责显示，改地址得动这个文件（跟着 exe 编译）。
                 body = json.dumps({'app': 'second-brain', 'ver': APP_VERSION,
                                    'dir': str(app_dir()),
                                    'lang': boot_lang(),
-                                   'fallback': bool(DATA_FALLBACK)},
+                                   'fallback': bool(DATA_FALLBACK),
+                                   'repo': OFFICIAL_REPO,
+                                   'releases': OFFICIAL_RELEASES,
+                                   'issues': OFFICIAL_ISSUES},
                                   ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+            elif self.path.startswith('/api/open_url'):
+                # 关于面板里的「官方仓库 / 发布页 / 反馈」：桌面端用系统浏览器打开，
+                # 浏览器端就等于普通跳转。白名单只认本仓库，见 url_allowed()。
+                qs = parse_qs(urlparse(self.path).query)
+                u = (qs.get('u', [''])[0] or '').strip()
+                if not url_allowed(u):
+                    body = json.dumps({'ok': False, 'err': 'url not allowed', 'k': 'e_url'},
+                                      ensure_ascii=False).encode()
+                else:
+                    try:
+                        import webbrowser
+                        webbrowser.open(u)
+                        body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                    except Exception as e:
+                        body = json.dumps({'ok': False, 'err': str(e)}, ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/config'):
                 sp = app_dir() / 'scope.json'
@@ -8716,7 +8776,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 self.end_headers()
                 return
             elif self.path.startswith('/api/donate'):
-                # 赞赏码清单：assets 里 donate*.png/jpg，文件名带数字就是档位（donate-6.png → ¥6）
+                # 赞赏码清单：assets 里 donate*.png/jpg，文件名带数字就是档位（donate-6.png → ¥6）。
+                # 每张都带上 SHA-256：前端拿它和编译进 exe 的 DONATE_SHA256 比，
+                # 对不上就**不显示二维码**——被换掉收款码的发行版在这里露馅。
                 items = []
                 for base in (app_dir() / 'assets', Path(__file__).resolve().parent / 'assets'):
                     if not base.is_dir():
@@ -8725,10 +8787,16 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                         if f.suffix.lower() not in ('.png', '.jpg', '.jpeg') or not f.is_file():
                             continue
                         digits = ''.join(ch for ch in f.stem if ch.isdigit())
-                        items.append({'file': f.name, 'amount': int(digits) if digits else 0})
+                        sha = file_sha256(f)
+                        items.append({'file': f.name,
+                                      'amount': int(digits) if digits else 0,
+                                      'sha': sha,
+                                      'official': bool(DONATE_SHA256) and sha == DONATE_SHA256})
                     if items:
                         break
-                body = json.dumps({'ok': True, 'items': items}, ensure_ascii=False).encode()
+                body = json.dumps({'ok': True, 'items': items,
+                                   'official_sha': DONATE_SHA256},
+                                  ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.split('?')[0] in ('/logo.png', '/appicon.png'):
                 # 程序自己的图标（关于弹窗、欢迎页用）。和捐赠码一样运行时读文件，
@@ -8924,19 +8992,35 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 self.wfile.write(body)
                 return
             if self.path.startswith('/api/config'):
-                dirs = [str(d).strip() for d in req.get('include_dirs', []) if str(d).strip()]
+                raw = [str(d).strip() for d in req.get('include_dirs', []) if str(d).strip()]
                 exc = [str(d).strip() for d in req.get('exclude_dirs', []) if str(d).strip()]
-                dirs = safe_scope_list(dirs)     # 只收本机存在的目录，挡掉远程共享/手打错路径
+                dirs = safe_scope_list(raw)     # 只收本机存在的目录，挡掉远程共享/手打错路径
                 if not dirs:
                     body = json.dumps({'ok': False, 'err': '至少要添加一个文件夹', 'k': 'e_need_dir'},
                                       ensure_ascii=False).encode()
                 else:
                     sp = app_dir() / 'scope.json'
                     try:
-                        sp.write_text(json.dumps(
-                            {'scan_csv': 'scan_raw.csv', 'include_dirs': dirs, 'exclude_dirs': exc},
-                            ensure_ascii=False, indent=2), encoding='utf-8')
-                        body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                        # 合并进原文件而不是整份重写：scope.json 里可能还有别的键
+                        # （早期版本写进去的 scan_csv、以后可能加的字段），别一保存就丢。
+                        try:
+                            sc_old = json.loads(sp.read_text(encoding='utf-8'))
+                            if not isinstance(sc_old, dict):
+                                sc_old = {}
+                        except Exception:
+                            sc_old = {}
+                        sc_old.setdefault('scan_csv', 'scan_raw.csv')
+                        sc_old['include_dirs'] = dirs
+                        sc_old['exclude_dirs'] = exc
+                        sp.write_text(json.dumps(sc_old, ensure_ascii=False, indent=2), encoding='utf-8')
+                        # 被 safe_scope_list 筛掉的（路径不存在 / 网络路径 / 手打错）要告诉界面，
+                        # 否则用户加了 5 个只生效 3 个，还以为是保存没生效。
+                        # 注意别拿 raw 和 dirs 直接比：dirs 是规范化过的大小写/斜杠，
+                        # `c://users//x` 和 `c:\users\x` 是同一个目录，直接比会全被当成「跳过」。
+                        dropped = [d for d in raw if not _safe_scope_dir(d)]
+                        body = json.dumps({'ok': True, 'include_dirs': dirs,
+                                           'exclude_dirs': exc, 'dropped': dropped},
+                                          ensure_ascii=False).encode()
                     except Exception as e:
                         print('[!] 保存索引范围失败：', e, flush=True)
                         body = json.dumps({'ok': False, 'err': '索引范围没保存（没有本机存在的文件夹，或写盘失败）',

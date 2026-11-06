@@ -15,6 +15,9 @@ import {
   type TimelineGroup,
   applyUpdate,
   checkUpdate,
+  copyText,
+  openUrl,
+  saveConfig,
   type UpdateInfo,
 } from '../api'
 import { baseName, dayLabel, dirName, fmtSize, fmtTime, midName } from '../lib/hits'
@@ -44,6 +47,16 @@ export function SettingsDrawer({ open, onClose, onTheme, onRefreshed }: Props) {
   const [stats, setStats] = useState<Stats>({ files: 0, docs: 0 })
   const [cfg, setCfg] = useState<ConfigInfo | null>(null)
   const [scopeOpen, setScopeOpen] = useState(false)
+  /** 范围编辑态：以前这块只读，用户发现范围不对只能去旧界面改 */
+  const [editing, setEditing] = useState(false)
+  const [eDirs, setEDirs] = useState<string[]>([])
+  const [eExcl, setEExcl] = useState<string[]>([])
+  const [dirIn, setDirIn] = useState('')
+  const [exclIn, setExclIn] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [scopeMsg, setScopeMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const reloadCfg = () => getConfig().then(setCfg).catch(() => {})
 
   useEffect(() => {
     if (!open) return
@@ -54,6 +67,9 @@ export function SettingsDrawer({ open, onClose, onTheme, onRefreshed }: Props) {
     getStats().then(setStats).catch(() => {})
     // 索引范围：用户在设置里最想知道「到底扫了我哪些文件夹」，别只给一个总数
     getConfig().then(setCfg).catch(() => {})
+    // 每次打开设置都退回只读，避免上次没保存的草稿留在界面上
+    setEditing(false)
+    setScopeMsg(null)
   }, [open])
 
   if (!open) return null
@@ -61,6 +77,75 @@ export function SettingsDrawer({ open, onClose, onTheme, onRefreshed }: Props) {
   const patch = (p: Settings) => {
     setS((cur) => ({ ...cur, ...p }))
     saveSettings(p).catch(() => {})
+  }
+
+  const beginEdit = () => {
+    setEDirs(cfg?.scope?.include_dirs ? [...cfg.scope.include_dirs] : [])
+    setEExcl(cfg?.scope?.exclude_dirs ? [...cfg.scope.exclude_dirs] : [])
+    setDirIn('')
+    setExclIn('')
+    setScopeMsg(null)
+    setEditing(true)
+  }
+
+  /** 桌面端有原生选目录框；浏览器里没有 pywebview，就只能手输 */
+  const pickFolder = async () => {
+    const w = window as unknown as {
+      pywebview?: { api?: { pick_folder?: () => Promise<string> } }
+    }
+    try {
+      const p = (await w.pywebview?.api?.pick_folder?.()) || ''
+      if (p) setEDirs((cur) => (cur.includes(p) ? cur : [...cur, p]))
+    } catch {
+      /* 浏览器里没有这个桥，忽略 */
+    }
+  }
+
+  const hasBridge = !!(window as unknown as { pywebview?: { api?: unknown } }).pywebview?.api
+
+  const addDir = () => {
+    const v = dirIn.trim()
+    if (!v) return
+    setEDirs((cur) => (cur.includes(v) ? cur : [...cur, v]))
+    setDirIn('')
+  }
+  const addExcl = () => {
+    const v = exclIn.trim()
+    if (!v) return
+    setEExcl((cur) => (cur.includes(v) ? cur : [...cur, v]))
+    setExclIn('')
+  }
+
+  const saveScope = async () => {
+    if (!eDirs.length) {
+      setScopeMsg({ ok: false, text: t('scope_need_one') })
+      return
+    }
+    setSaving(true)
+    try {
+      const r = await saveConfig(eDirs, eExcl)
+      if (!r.ok) {
+        setScopeMsg({ ok: false, text: r.k ? t(r.k) : r.err || t('e_scope_save') })
+        return
+      }
+      const dropped = r.dropped || []
+      setScopeMsg({
+        ok: true,
+        text:
+          t('scope_saved') +
+          ' · ' +
+          (dropped.length
+            ? t('scope_dropped').replace('{p}', dropped.join('、'))
+            : t('scope_saved_tip')),
+      })
+      setEditing(false)
+      reloadCfg()
+      getStats().then(setStats).catch(() => {})
+    } catch {
+      setScopeMsg({ ok: false, text: t('e_scope_save') })
+    } finally {
+      setSaving(false)
+    }
   }
 
   const Toggle = ({ on, onClick, label }: { on: boolean; onClick: () => void; label: string }) => (
@@ -148,24 +233,152 @@ export function SettingsDrawer({ open, onClose, onTheme, onRefreshed }: Props) {
         <b className="text-ink">{stats.docs.toLocaleString()}</b>{t('stats_line').split('{m}')[1]}
       </div>
 
-      {/* 索引范围：文件名层扫了哪些盘、正文层收了哪些文件夹、哪些被排除 —— 只读展示，
-          改范围仍走旧界面（POST /api/config 会重扫，误操作代价太大） */}
+      {/* 索引范围：文件名层扫了哪些盘、正文层收了哪些文件夹、哪些被排除。
+          v0.9.46 起可以直接改 —— 之前只有「看」，用户发现范围不对根本改不了。
+          保存只写 scope.json，不自动重扫：误点一下不该让几十万条索引重新跑一遍。 */}
       {cfg?.scope && (
         <div className="mt-3 rounded-lg border border-line/70 bg-card/50 p-2.5">
           <div className="flex items-center justify-between gap-2">
             <span className="text-[12px] font-semibold">{t('scope_title')}</span>
-            {cfg.scope.include_dirs.length > 3 && (
-              <button
-                onClick={() => setScopeOpen((v) => !v)}
-                aria-expanded={scopeOpen}
-                className="text-[11px] text-accent hover:underline"
-              >
-                {scopeOpen ? t('scope_less') : t('scope_more')}
-              </button>
+            {!editing ? (
+              <div className="flex items-center gap-2">
+                {cfg.scope.include_dirs.length > 3 && (
+                  <button
+                    onClick={() => setScopeOpen((v) => !v)}
+                    aria-expanded={scopeOpen}
+                    className="text-[11px] text-accent hover:underline"
+                  >
+                    {scopeOpen ? t('scope_less') : t('scope_more')}
+                  </button>
+                )}
+                <button onClick={beginEdit} className="text-[11px] text-accent hover:underline">
+                  {t('scope_edit')}
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    setEditing(false)
+                    setScopeMsg(null)
+                  }}
+                  className="text-[11px] text-sub hover:underline"
+                >
+                  {t('scope_cancel')}
+                </button>
+                <button
+                  onClick={saveScope}
+                  disabled={saving}
+                  className="rounded bg-accent px-1.5 py-[1px] text-[11px] text-white disabled:opacity-60"
+                >
+                  {saving ? '…' : t('scope_save')}
+                </button>
+              </div>
             )}
           </div>
 
-          <div className="pt-2">
+          {editing && (
+            <div className="pt-2">
+              <div className="text-[11px] text-sub">
+                <span className="font-medium text-ink">{t('scope_docs')}</span>
+                <span className="ml-1.5">{t('scope_folders').replace('{n}', String(eDirs.length))}</span>
+              </div>
+              <ul className="mt-1 space-y-1">
+                {eDirs.map((p) => (
+                  <li key={p} className="flex items-center gap-1.5">
+                    <span className="truncate font-mono text-[10px] leading-4 text-sub" title={p}>
+                      {p}
+                    </span>
+                    <button
+                      onClick={() => setEDirs((cur) => cur.filter((x) => x !== p))}
+                      title={t('scope_remove')}
+                      aria-label={t('scope_remove')}
+                      className="ml-auto shrink-0 rounded px-1 text-[11px] text-sub hover:bg-line/60 hover:text-red-500"
+                    >
+                      ✕
+                    </button>
+                  </li>
+                ))}
+                {!eDirs.length && <li className="text-[10px] text-sub/70">{t('scope_need_one')}</li>}
+              </ul>
+              <div className="mt-1.5 flex gap-1">
+                <input
+                  value={dirIn}
+                  onChange={(e) => setDirIn(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      addDir()
+                    }
+                  }}
+                  placeholder={t('scope_ph_dir')}
+                  className="min-w-0 flex-1 rounded border border-line bg-bg px-1.5 py-[3px] font-mono text-[10px]"
+                />
+                <button
+                  onClick={addDir}
+                  className="shrink-0 rounded border border-line px-1.5 text-[11px] hover:border-accent"
+                >
+                  {t('scope_add_dir')}
+                </button>
+                {hasBridge && (
+                  <button
+                    onClick={pickFolder}
+                    className="shrink-0 rounded border border-line px-1.5 text-[11px] hover:border-accent"
+                  >
+                    {t('scope_pick')}
+                  </button>
+                )}
+              </div>
+
+              <div className="pt-2.5 text-[11px] text-sub">
+                <span className="font-medium text-ink">{t('scope_excl').replace('{n}', String(eExcl.length))}</span>
+              </div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {eExcl.map((w) => (
+                  <span
+                    key={w}
+                    className="flex items-center gap-1 rounded border border-line/60 bg-bg px-1.5 py-[1px] text-[10px] text-sub"
+                  >
+                    {w}
+                    <button
+                      onClick={() => setEExcl((cur) => cur.filter((x) => x !== w))}
+                      title={t('scope_remove')}
+                      aria-label={t('scope_remove')}
+                      className="text-sub hover:text-red-500"
+                    >
+                      ✕
+                    </button>
+                  </span>
+                ))}
+                {!eExcl.length && <span className="text-[10px] text-sub/70">—</span>}
+              </div>
+              <div className="mt-1.5 flex gap-1">
+                <input
+                  value={exclIn}
+                  onChange={(e) => setExclIn(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      addExcl()
+                    }
+                  }}
+                  placeholder={t('scope_ph_excl')}
+                  className="min-w-0 flex-1 rounded border border-line bg-bg px-1.5 py-[3px] text-[10px]"
+                />
+                <button
+                  onClick={addExcl}
+                  className="shrink-0 rounded border border-line px-1.5 text-[11px] hover:border-accent"
+                >
+                  {t('scope_add_excl')}
+                </button>
+              </div>
+              <div className="pt-1.5 text-[10px] leading-4 text-sub/80">{t('scope_edit_tip')}</div>
+            </div>
+          )}
+
+          {!editing && (
+            <>
+              <div className="pt-2">
             <div className="text-[11px] text-sub">
               <span className="font-medium text-ink">{t('scope_names')}</span>
               <span className="ml-1.5">
@@ -230,6 +443,17 @@ export function SettingsDrawer({ open, onClose, onTheme, onRefreshed }: Props) {
               .replace('{e}', String(cfg.scope.rules.ext))
               .replace('{s}', String(Math.round(cfg.scope.rules.size_limit / 1073741824)))}
           </div>
+            </>
+          )}
+
+          {scopeMsg && (
+            <div
+              className={`pt-2 text-[10px] leading-4 ${scopeMsg.ok ? 'text-accent' : 'text-red-500'}`}
+              role="status"
+            >
+              {scopeMsg.text}
+            </div>
+          )}
         </div>
       )}
 
@@ -322,17 +546,19 @@ function donateNote(amount: number): string {
   return DONATE_NOTE[amount] || '谢谢你的支持'
 }
 
-/** 收款码：图片由用户自己{t('donate_drop2')}donate*.png，一张或多张（文件名里的数字就是档位） */
+/** 收款码：图片放在 assets/donate*.png，一张或多张（文件名里的数字就是档位）。
+ *  每张都由后端算 SHA-256 跟编译进 exe 的常量比：
+ *  对不上就**不显示**——有人把安装包拆开换成自己的收款码再发出去时，这里会当场露馅。 */
+type DonateItem = { file: string; amount: number; sha?: string; official?: boolean }
+
 function DonateQR() {
   const [zoom, setZoom] = useState(false)
-  const [items, setItems] = useState<{ file: string; amount: number }[] | null>(null)
+  const [items, setItems] = useState<DonateItem[] | null>(null)
   const [pick, setPick] = useState(0)
   useEffect(() => {
     fetch('/api/donate', { headers: { 'Sec-Fetch-Site': 'same-origin' } })
       .then((r) => r.json())
-      .then((d: { items?: { file: string; amount: number }[] }) =>
-        setItems((d.items || []).slice().sort((a, b) => a.amount - b.amount)),
-      )
+      .then((d: { items?: DonateItem[] }) => setItems((d.items || []).slice().sort((a, b) => a.amount - b.amount)))
       .catch(() => setItems([]))
   }, [])
   if (!items) return <div className="h-[104px] w-[104px] shrink-0 rounded-md bg-card" />
@@ -346,6 +572,19 @@ function DonateQR() {
     )
   const cur = items[Math.min(pick, items.length - 1)]
   const src = `/donate.png?f=${encodeURIComponent(cur.file)}`
+  // official 缺失（后端没配指纹）时不拦；明确 false 才拦
+  const trusted = cur.official !== false
+
+  if (!trusted) {
+    return (
+      <div className="flex w-[180px] shrink-0 flex-col gap-1.5 rounded-md border border-red-300 bg-red-50 p-2 text-[10px] leading-4 text-red-700">
+        <div className="font-semibold">{t('about_fp_bad')}</div>
+        <div>{t('about_fp_bad_hint')}</div>
+        {cur.sha && <div className="font-mono opacity-70">{cur.sha.slice(0, 16)}</div>}
+      </div>
+    )
+  }
+
   return (
     <div className="flex shrink-0 flex-col items-center gap-1.5">
       <button onClick={() => setZoom(true)} title={t('donate_zoom')} className="shrink-0">
@@ -356,6 +595,14 @@ function DonateQR() {
         />
       </button>
       <div className="text-center text-[10px] leading-4 text-sub">{donateNote(cur.amount)}</div>
+      {cur.sha && (
+        <div
+          className="text-center font-mono text-[9px] leading-3 text-sub/70"
+          title={`SHA-256 ${cur.sha}`}
+        >
+          {t('about_fp')} {cur.sha.slice(0, 12)} · {t('about_fp_ok')}
+        </div>
+      )}
       {zoom && (
         <div
           className="fixed inset-0 z-[60] grid place-items-center bg-black/55 p-6"
@@ -365,7 +612,7 @@ function DonateQR() {
           <img src={src} alt="赞赏码" className="max-h-[86vh] max-w-[86vw] rounded-lg bg-white p-3 shadow-2xl" />
         </div>
       )}
-      {items.some((i) => i.amount > 0) && (
+      {items.length > 1 && (
         <div className="flex flex-wrap justify-center gap-1">
           {items.map((it, i) => (
             <button
@@ -385,8 +632,48 @@ function DonateQR() {
   )
 }
 
-export function AboutModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [stats, setStats] = useState<Stats>({ files: 0, docs: 0 })
+/** 官方地址区：地址来自 /api/ping（后端常量），点击走 /api/open_url 白名单 */
+function OfficialLinks({ ping }: { ping: Ping }) {
+  const [copied, setCopied] = useState(false)
+  if (!ping.repo) return null
+  const rows: [string, string][] = [
+    [t('about_repo'), ping.repo],
+    [t('about_releases'), ping.releases || ''],
+    [t('about_issues'), ping.issues || ''],
+  ]
+  const go = async (u: string) => {
+    if (!u) return
+    const ok = await openUrl(u)
+    if (!ok) {
+      copyText(u)
+      setCopied(true)
+    }
+  }
+  return (
+    <div className="mt-3 border-t border-line pt-3">
+      <div className="mb-1.5 text-[12px] text-sub">{t('about_official')}</div>
+      <div className="space-y-1">
+        {rows
+          .filter(([, u]) => !!u)
+          .map(([label, u]) => (
+            <button
+              key={label}
+              onClick={() => go(u)}
+              title={u}
+              className="flex w-full items-center gap-2 rounded-md border border-line/70 px-2 py-1 text-left hover:border-accent"
+            >
+              <span className="shrink-0 text-[12px]">{label}</span>
+              <span className="ml-auto max-w-[60%] truncate font-mono text-[10px] text-sub">{u}</span>
+            </button>
+          ))}
+      </div>
+      {copied && <div className="pt-1 text-[10px] leading-4 text-sub">{t('about_open_fail')}</div>}
+      <div className="pt-1.5 text-[10px] leading-4 text-sub/80">{t('about_only_official')}</div>
+    </div>
+  )
+}
+
+export function AboutModal({ open, onClose }: { open: boolean; onClose: () => void }) {  const [stats, setStats] = useState<Stats>({ files: 0, docs: 0 })
   const [ping, setPing] = useState<Ping>({ ver: '…' })
   // 检查更新：只有点按钮才发请求（要连 GitHub，不能跟着弹窗自动跑）
   const [up, setUp] = useState<{ state: 'idle' | 'busy' | 'done' | 'err'; text?: string; info?: UpdateInfo }>({
@@ -492,7 +779,11 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
         )}
       </div>
 
-      {/* 支持一下：二维码是可选的，assets/donate.png 存在才显示 */}
+      {/* 官方地址：链接本身写在 brain.py 里（跟着 exe 编译），前端只显示。
+          别人改一行 JS 就能换掉写死在前端的链接，但要换这里的得重新打包。 */}
+      <OfficialLinks ping={ping} />
+
+      {/* 支持一下：二维码是可选的，assets/donate.png 存在才显示；指纹对不上就藏起来 */}
       <div className="mt-3 border-t border-line pt-3">
         <div className="mb-1 text-[12px] text-sub">{t('about_support')}</div>
         <div className="flex items-center gap-3">

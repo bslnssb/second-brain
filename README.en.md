@@ -42,7 +42,8 @@ On first launch you pick the folders to index and the database builds itself. **
 - **Real system icons**: each row shows the same icon Explorer would (PDF red, Word blue, Excel green, an exe shows its own icon)
 - **Chinese full-text search**: 3+ characters use an FTS5 trigram index with highlighting; 1–2 characters fall back to `LIKE`
 - **Automatic OCR**: image-only PDFs are recognised on the first 6 pages (20 s per document), offline Chinese OCR
-- **Index scope is visible**: the settings panel shows which drives are indexed, how many entries each holds, which folders feed the document index, and what is excluded
+- **Index scope is visible — and editable**: the settings panel shows which drives are indexed, how many entries each holds, which folders feed the document index, and what is excluded. If the scope is wrong you add or remove folders and exclude words right there, then run an update
+- **Progress follows the interface language**: every maintenance step and every error is rendered in the current language — switching to English no longer leaves Chinese in the progress line
 - **Exclusions apply to both layers**: `exclude_dirs` filters the file-name index and the document index, and whole subtrees are pruned during the walk (on this machine, excluding game libraries took 600k entries down to 200k)
 - **Incremental by default**: changed files are re-indexed, deleted ones are pruned, unchanged ones are skipped; a long index run resumes where it stopped
 - **Five UI languages**: 中文 / English / Español / Português / हिन्दी, following the system or set manually
@@ -199,6 +200,22 @@ Every failure is recorded with a reason (encrypted / corrupted / empty / tempora
 - Opening files and reading thumbnails require a path that is already indexed
 - The index is just `brain.db` in the program folder — delete it and everything is gone
 - `.gitignore` excludes `brain.db`, `scan_raw.csv` and `scope.json`; they contain your text and local paths
+
+### Download only from the official page
+
+The app never goes online, but **an installer someone forwarded to you may not be the one this project publishes**. Two ways to tell:
+
+- The repository and release page are **<https://github.com/bslnssb/second-brain>** — nothing else
+- The About panel lists three official links you can click, so you never have to type a URL
+- About also shows a SHA-256 fingerprint for the donation QR. If it does not match this release, **the QR is hidden automatically** — so you cannot scan someone else's payment code
+
+Fingerprint shipped in v0.9.46:
+
+```
+07710ddf1ccf1d443275df5ffae15820609d7d34160af6438edf50455be835ee
+```
+
+> This is not a cryptographic signature (that needs a code-signing certificate we do not have), but it raises the cost of swapping the QR from "replace one PNG" to "rebuild the exe". To use your own QR you must also change `DONATE_SHA256` in `brain.py` — deliberately so.
 
 ## Quality self-test
 

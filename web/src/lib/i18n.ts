@@ -253,6 +253,67 @@ const ZH: Dict = {
   err_title: '界面出了点问题',
   err_body: '这一屏没能画出来。文件都还在，重新载入一下就好。',
   err_reload: '重新载入',
+
+  /* —— 维护任务的进度与错误 ——
+     后端 _prog(k=..., a={...}) 只发键和参数，文案在这里按当前语言渲染。
+     以前这一整块是写死的中文，切成英文后「已有任务在跑」「扫描 xxx」还是中文。 */
+  maint_busy_scan: '正在找文件夹…',
+  maint_busy_update: '正在读正文…',
+  maint_busy_names: '正在扫文件名…',
+  maint_busy_selftest: '正在跑 20 项自检…',
+  maint_running_hint: '关掉这个抽屉也会继续跑，跑完在界面底部提示。',
+  maint_start_fail: '没启动起来',
+  maint_net_fail: '请求失败，看看程序还在不在',
+  maint_done: '完成',
+  m_names_target: '扫描 {p}',
+  m_names_progress: '扫描 {p}（已 {n} 个文件）',
+  m_names_finish: '整理文件名索引…',
+  m_names_done: '文件名索引完成：{n} 个文件',
+  m_names_fail: '文件名索引失败：{e}',
+  m_names_sync: '同步文件名索引',
+  m_dir_mtime: '更新目录时间（{n}）',
+  m_pruning: '清理失效条目',
+  m_update_done: '更新完成',
+  m_discover_done: '智能扫描完成：{n} 个文档',
+  m_scope_fixed: '索引范围已自动修复：{p}',
+  e_busy: '已经有一个任务在跑了（更新 / 建索引 / 扫描 / 自检），等它跑完再点',
+  e_need_dir: '至少要留一个文件夹',
+  e_scope_save: '索引范围没保存（路径不存在，或写盘失败）',
+  e_no_dir: '没有本机存在的文件夹',
+  e_no_scan: '扫描清单没生成，一篇正文都没读进来。确认程序目录可写，再点一次更新',
+  e_no_scope: '还没有索引范围。先在设置里选要索引的文件夹',
+  e_scope_gone: '要索引的文件夹找不到了：{p}。已停止更新，索引一条没动',
+  e_prune_bulk: '这次要清掉 {n} 条（库内共 {total} 条），已暂停，一条都没删。先确认索引范围里的文件夹都还在',
+  e_prune_scope_loss: '索引范围里的文件夹整块不见了，已暂停清理，一条都没删',
+  e_url: '这个地址不在白名单里，没有打开',
+
+  /* —— 索引范围编辑 —— */
+  scope_edit: '修改',
+  scope_save: '保存',
+  scope_cancel: '取消',
+  scope_add_dir: '添加文件夹',
+  scope_add_excl: '添加排除词',
+  scope_ph_dir: '粘贴文件夹完整路径，例如 D:\\资料',
+  scope_ph_excl: '路径里出现这个词就跳过，例如 游戏',
+  scope_remove: '移除',
+  scope_saved: '索引范围已保存',
+  scope_saved_tip: '接着点下面的「按现有范围更新」，新范围才会生效',
+  scope_dropped: '这些路径本机不存在，已跳过：{p}',
+  scope_need_one: '至少要留一个文件夹',
+  scope_pick: '选择文件夹…',
+  scope_edit_tip: '排除词对文件名索引和正文索引同时生效；改完要更新一次才会重扫',
+
+  /* —— 关于里的官方地址与指纹 —— */
+  about_official: '官方地址',
+  about_repo: '源码仓库',
+  about_releases: '下载 / 发布页',
+  about_issues: '反馈问题',
+  about_open_fail: '打不开浏览器，地址已复制',
+  about_fp: '赞赏码指纹',
+  about_fp_ok: '与发行版一致',
+  about_fp_bad: '与发行版不一致',
+  about_fp_bad_hint: '这张二维码和本程序发布时带的不一样，已隐藏 —— 免得你扫到别人的收款码。请到官方发布页重新下载。',
+  about_only_official: '只从上面这两个地址下载。程序本身不联网，也不会把任何内容发到服务器。',
 }
 
 const EN: Dict = {
@@ -491,6 +552,65 @@ const EN: Dict = {
   err_title: 'Something went wrong',
   err_body: 'This screen could not be drawn. Your files are fine — reload to continue.',
   err_reload: 'Reload',
+
+  /* —— maintenance progress & errors（后端只发 key + 参数） —— */
+  maint_busy_scan: 'Looking for folders…',
+  maint_busy_update: 'Reading document text…',
+  maint_busy_names: 'Scanning file names…',
+  maint_busy_selftest: 'Running the 20 checks…',
+  maint_running_hint: 'It keeps running after you close this panel; the result shows at the bottom of the window.',
+  maint_start_fail: 'It did not start',
+  maint_net_fail: 'Request failed — is the app still running?',
+  maint_done: 'Done',
+  m_names_target: 'Scanning {p}',
+  m_names_progress: 'Scanning {p} ({n} files so far)',
+  m_names_finish: 'Tidying the name index…',
+  m_names_done: 'Name index done: {n} files',
+  m_names_fail: 'Name index failed: {e}',
+  m_names_sync: 'Syncing the name index',
+  m_dir_mtime: 'Updating folder times ({n})',
+  m_pruning: 'Removing dead entries',
+  m_update_done: 'Update finished',
+  m_discover_done: 'Scan finished: {n} documents',
+  m_scope_fixed: 'Index scope repaired: {p}',
+  e_busy: 'Another task is already running (update / index / scan / self-check). Wait for it to finish.',
+  e_need_dir: 'Keep at least one folder',
+  e_scope_save: 'Index scope was not saved (folder missing, or the disk refused the write)',
+  e_no_dir: 'None of those folders exist on this machine',
+  e_no_scan: 'The scan manifest was not written, so no document text was indexed. Make sure the app folder is writable and try again.',
+  e_no_scope: 'No index scope yet — pick the folders to index in Settings first',
+  e_scope_gone: 'The folder to index is gone: {p}. Update stopped; nothing in the index was touched.',
+  e_prune_bulk: 'This run would remove {n} of {total} entries, so it paused and deleted nothing. Check that the folders in your index scope still exist.',
+  e_prune_scope_loss: 'A whole folder from your index scope disappeared — cleanup paused, nothing deleted.',
+  e_url: 'That address is not on the allow-list, so it was not opened',
+
+  /* —— index scope editing —— */
+  scope_edit: 'Edit',
+  scope_save: 'Save',
+  scope_cancel: 'Cancel',
+  scope_add_dir: 'Add folder',
+  scope_add_excl: 'Add exclude word',
+  scope_ph_dir: 'Paste a full folder path, e.g. D:\\Documents',
+  scope_ph_excl: 'Skip anything whose path contains this, e.g. games',
+  scope_remove: 'Remove',
+  scope_saved: 'Index scope saved',
+  scope_saved_tip: 'Now click “Update current scope” below so it takes effect',
+  scope_dropped: 'These paths do not exist on this machine, so they were skipped: {p}',
+  scope_need_one: 'Keep at least one folder',
+  scope_pick: 'Choose folder…',
+  scope_edit_tip: 'Exclude words apply to both the name index and document text. Run an update afterwards to rescan.',
+
+  /* —— official links & fingerprint —— */
+  about_official: 'Official links',
+  about_repo: 'Source code',
+  about_releases: 'Downloads / releases',
+  about_issues: 'Report a problem',
+  about_open_fail: 'Could not open the browser — the address was copied instead',
+  about_fp: 'Donation QR fingerprint',
+  about_fp_ok: 'matches the release',
+  about_fp_bad: 'does NOT match the release',
+  about_fp_bad_hint: 'This QR code is not the one shipped with this build, so it is hidden — otherwise you might scan someone else’s payment code. Please download again from the official release page.',
+  about_only_official: 'Download only from the two links above. The app itself never goes online and never sends your content anywhere.',
 }
 
 const ES: Dict = {
@@ -729,6 +849,65 @@ const ES: Dict = {
   err_title: 'Algo salió mal',
   err_body: 'Esta pantalla no se pudo mostrar. Tus archivos están bien: recarga para continuar.',
   err_reload: 'Recargar',
+
+  /* —— progreso de mantenimiento —— */
+  maint_busy_scan: 'Buscando carpetas…',
+  maint_busy_update: 'Leyendo el texto de los documentos…',
+  maint_busy_names: 'Escaneando nombres de archivo…',
+  maint_busy_selftest: 'Ejecutando las 20 comprobaciones…',
+  maint_running_hint: 'Sigue funcionando aunque cierres este panel; el resultado aparece abajo.',
+  maint_start_fail: 'No llegó a arrancar',
+  maint_net_fail: 'Falló la petición: ¿sigue abierto el programa?',
+  maint_done: 'Listo',
+  m_names_target: 'Escaneando {p}',
+  m_names_progress: 'Escaneando {p} ({n} archivos hasta ahora)',
+  m_names_finish: 'Ordenando el índice de nombres…',
+  m_names_done: 'Índice de nombres listo: {n} archivos',
+  m_names_fail: 'Falló el índice de nombres: {e}',
+  m_names_sync: 'Sincronizando el índice de nombres',
+  m_dir_mtime: 'Actualizando fechas de carpetas ({n})',
+  m_pruning: 'Quitando entradas muertas',
+  m_update_done: 'Actualización terminada',
+  m_discover_done: 'Escaneo terminado: {n} documentos',
+  m_scope_fixed: 'Rango de índice reparado: {p}',
+  e_busy: 'Ya hay una tarea en marcha (actualizar / indexar / escanear / autocomprobación). Espera a que acabe.',
+  e_need_dir: 'Deja al menos una carpeta',
+  e_scope_save: 'No se guardó el rango (la carpeta no existe o el disco rechazó la escritura)',
+  e_no_dir: 'Ninguna de esas carpetas existe en este equipo',
+  e_no_scan: 'No se generó el manifiesto del escaneo, así que no se indexó ningún texto. Comprueba que la carpeta del programa se pueda escribir.',
+  e_no_scope: 'Todavía no hay rango de índice: elige las carpetas en Ajustes',
+  e_scope_gone: 'La carpeta a indexar ya no está: {p}. Se detuvo la actualización sin tocar el índice.',
+  e_prune_bulk: 'Esta vez se borrarían {n} de {total} entradas, así que se detuvo sin borrar nada. Comprueba que las carpetas del rango sigan existiendo.',
+  e_prune_scope_loss: 'Desapareció una carpeta entera del rango: limpieza pausada, no se borró nada.',
+  e_url: 'Esa dirección no está en la lista permitida, no se abrió',
+
+  /* —— editar el rango del índice —— */
+  scope_edit: 'Editar',
+  scope_save: 'Guardar',
+  scope_cancel: 'Cancelar',
+  scope_add_dir: 'Añadir carpeta',
+  scope_add_excl: 'Añadir exclusión',
+  scope_ph_dir: 'Pega la ruta completa, p. ej. D:\\Documentos',
+  scope_ph_excl: 'Se omite lo que tenga esta palabra en la ruta, p. ej. juegos',
+  scope_remove: 'Quitar',
+  scope_saved: 'Rango guardado',
+  scope_saved_tip: 'Ahora pulsa «Actualizar el rango actual» para que surta efecto',
+  scope_dropped: 'Estas rutas no existen en este equipo y se omitieron: {p}',
+  scope_need_one: 'Deja al menos una carpeta',
+  scope_pick: 'Elegir carpeta…',
+  scope_edit_tip: 'Las exclusiones valen para el índice de nombres y para el texto. Después hay que actualizar para reescanear.',
+
+  /* —— enlaces oficiales y huella —— */
+  about_official: 'Enlaces oficiales',
+  about_repo: 'Código fuente',
+  about_releases: 'Descargas / versiones',
+  about_issues: 'Informar de un problema',
+  about_open_fail: 'No se pudo abrir el navegador: la dirección se copió',
+  about_fp: 'Huella del QR de donación',
+  about_fp_ok: 'coincide con la versión',
+  about_fp_bad: 'NO coincide con la versión',
+  about_fp_bad_hint: 'Este QR no es el que trae esta compilación, así que está oculto para que no escanees el código de pago de otra persona. Descárgalo de nuevo desde la página oficial.',
+  about_only_official: 'Descarga solo desde los dos enlaces de arriba. El programa no se conecta a internet ni envía tu contenido a ningún sitio.',
 }
 
 const PT: Dict = {
@@ -966,6 +1145,65 @@ const PT: Dict = {
   err_title: 'Algo deu errado',
   err_body: 'Esta tela não pôde ser exibida. Seus arquivos estão bem — recarregue para continuar.',
   err_reload: 'Recarregar',
+
+  /* —— progresso da manutenção —— */
+  maint_busy_scan: 'Procurando pastas…',
+  maint_busy_update: 'Lendo o texto dos documentos…',
+  maint_busy_names: 'Varrendo nomes de arquivo…',
+  maint_busy_selftest: 'Rodando as 20 verificações…',
+  maint_running_hint: 'Continua rodando mesmo se você fechar este painel; o resultado aparece embaixo.',
+  maint_start_fail: 'Não chegou a começar',
+  maint_net_fail: 'A requisição falhou — o programa ainda está aberto?',
+  maint_done: 'Concluído',
+  m_names_target: 'Varrendo {p}',
+  m_names_progress: 'Varrendo {p} ({n} arquivos até agora)',
+  m_names_finish: 'Organizando o índice de nomes…',
+  m_names_done: 'Índice de nomes pronto: {n} arquivos',
+  m_names_fail: 'Falha no índice de nomes: {e}',
+  m_names_sync: 'Sincronizando o índice de nomes',
+  m_dir_mtime: 'Atualizando datas das pastas ({n})',
+  m_pruning: 'Removendo entradas mortas',
+  m_update_done: 'Atualização concluída',
+  m_discover_done: 'Varredura concluída: {n} documentos',
+  m_scope_fixed: 'Escopo do índice corrigido: {p}',
+  e_busy: 'Já existe uma tarefa rodando (atualizar / indexar / varrer / autoverificação). Espere ela terminar.',
+  e_need_dir: 'Mantenha pelo menos uma pasta',
+  e_scope_save: 'O escopo não foi salvo (a pasta não existe ou o disco recusou a gravação)',
+  e_no_dir: 'Nenhuma dessas pastas existe nesta máquina',
+  e_no_scan: 'O manifesto da varredura não foi gerado, então nenhum texto foi indexado. Verifique se a pasta do programa aceita gravação.',
+  e_no_scope: 'Ainda não há escopo: escolha as pastas nos Ajustes',
+  e_scope_gone: 'A pasta a indexar sumiu: {p}. A atualização parou sem tocar no índice.',
+  e_prune_bulk: 'Esta rodada removeria {n} de {total} entradas, então parou sem apagar nada. Confira se as pastas do escopo continuam existindo.',
+  e_prune_scope_loss: 'Uma pasta inteira do escopo desapareceu — limpeza pausada, nada foi apagado.',
+  e_url: 'Esse endereço não está na lista permitida, não foi aberto',
+
+  /* —— editar o escopo —— */
+  scope_edit: 'Editar',
+  scope_save: 'Salvar',
+  scope_cancel: 'Cancelar',
+  scope_add_dir: 'Adicionar pasta',
+  scope_add_excl: 'Adicionar exclusão',
+  scope_ph_dir: 'Cole o caminho completo, ex.: D:\\Documentos',
+  scope_ph_excl: 'Ignora o que tiver esta palavra no caminho, ex.: jogos',
+  scope_remove: 'Remover',
+  scope_saved: 'Escopo salvo',
+  scope_saved_tip: 'Agora clique em «Atualizar escopo atual» para valer',
+  scope_dropped: 'Estes caminhos não existem nesta máquina e foram ignorados: {p}',
+  scope_need_one: 'Mantenha pelo menos uma pasta',
+  scope_pick: 'Escolher pasta…',
+  scope_edit_tip: 'As exclusões valem para o índice de nomes e para o texto. Depois é preciso atualizar para varrer de novo.',
+
+  /* —— links oficiais e impressão digital —— */
+  about_official: 'Links oficiais',
+  about_repo: 'Código-fonte',
+  about_releases: 'Downloads / versões',
+  about_issues: 'Relatar um problema',
+  about_open_fail: 'Não foi possível abrir o navegador — o endereço foi copiado',
+  about_fp: 'Impressão digital do QR de doação',
+  about_fp_ok: 'confere com a versão',
+  about_fp_bad: 'NÃO confere com a versão',
+  about_fp_bad_hint: 'Este QR não é o que acompanha esta compilação, então foi ocultado — para você não escanear o código de pagamento de outra pessoa. Baixe de novo na página oficial.',
+  about_only_official: 'Baixe apenas pelos dois links acima. O programa não acessa a internet nem envia seu conteúdo a lugar nenhum.',
 }
 
 // 印地语：只覆盖最常看的界面词，没翻译的会回落到中文（总比空白好）
@@ -1146,11 +1384,49 @@ const HI: Dict = {
   err_title: 'कुछ गड़बड़ हो गई',
   err_body: 'यह स्क्रीन नहीं बन सकी। आपकी फ़ाइलें सुरक्षित हैं — दोबारा लोड करें।',
   err_reload: 'फिर से लोड करें',
+
+  /* —— रखरखाव की प्रगति（长句回落英文，短的才翻） —— */
+  maint_busy_scan: 'फ़ोल्डर ढूँढ रहे हैं…',
+  maint_busy_update: 'दस्तावेज़ का टेक्स्ट पढ़ रहे हैं…',
+  maint_busy_names: 'फ़ाइल नाम स्कैन कर रहे हैं…',
+  maint_busy_selftest: '20 जाँच चल रही हैं…',
+  maint_running_hint: 'यह पैनल बंद करने पर भी चलता रहेगा; नतीजा नीचे दिखेगा।',
+  maint_start_fail: 'शुरू ही नहीं हुआ',
+  maint_done: 'पूरा हुआ',
+
+  /* —— इंडेक्स रेंज संपादन —— */
+  scope_edit: 'बदलें',
+  scope_save: 'सहेजें',
+  scope_cancel: 'रद्द करें',
+  scope_add_dir: 'फ़ोल्डर जोड़ें',
+  scope_add_excl: 'छोड़ने वाला शब्द जोड़ें',
+  scope_remove: 'हटाएँ',
+  scope_saved: 'इंडेक्स रेंज सहेजी गई',
+  scope_pick: 'फ़ोल्डर चुनें…',
+
+  /* —— आधिकारिक लिंक और फ़िंगरप्रिंट —— */
+  about_official: 'आधिकारिक लिंक',
+  about_repo: 'सोर्स कोड',
+  about_releases: 'डाउनलोड / रिलीज़',
+  about_issues: 'समस्या बताएँ',
+  about_open_fail: 'ब्राउज़र नहीं खुला, पता कॉपी कर दिया',
+  about_fp: 'दान QR की फ़िंगरप्रिंट',
+  about_fp_ok: 'रिलीज़ से मेल खाती है',
+  about_fp_bad: 'रिलीज़ से मेल नहीं खाती',
+  about_fp_bad_hint: 'यह QR इस बिल्ड के साथ आया वाला नहीं है, इसलिए छिपा दिया गया है — कहीं आप किसी और का भुगतान कोड स्कैन न कर लें। आधिकारिक रिलीज़ पेज से दोबारा डाउनलोड करें।',
 }
 
 const DICTS: Record<Lang, Dict> = { zh: ZH, en: EN, es: ES, pt: PT, hi: HI }
 
 function detect(): Lang {
+  // ?lang=en 强制指定语言（README 里写的快捷方式、给朋友发的链接都靠它）。
+  // 优先级最高：这是一次性的显式要求，比「用户存过偏好」更明确。
+  try {
+    const forced = (new URLSearchParams(location.search).get('lang') || '').toLowerCase()
+    if (forced && DICTS[forced as Lang]) return forced as Lang
+  } catch {
+    /* 非浏览器环境（测试）没有 location，忽略 */
+  }
   // 只有**用户在设置里主动选过**（sb_lang_user=1）才认 localStorage。
   // 早先版本的测试/脚本往这个键里写过 en，结果中文系统的用户一进来就是英文——
   // 光看 sb_lang 分不清「用户选的」还是「别人写进去的」。

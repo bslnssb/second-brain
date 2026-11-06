@@ -19,22 +19,43 @@ type Prog = {
   fail?: number
   msg?: string
   err?: string
+  /** 后端给的文案键 + 参数：有 k 就按当前语言渲染，没有才退回 msg 原文 */
+  k?: string
+  a?: Record<string, string | number>
 }
 
 type Job = 'scan' | 'update' | 'names' | 'selftest'
 
-const LABEL: Record<Job, string> = {
-  scan: '智能扫描全盘',
-  update: '按现有范围更新',
-  names: '重建文件名索引',
-  selftest: '引擎体检',
+/** 按钮名与「正在干什么」都走 i18n；以前这两张表是写死的中文，切成英文后整块不跟着变 */
+const LABEL_KEY: Record<Job, string> = {
+  scan: 'maint_scan',
+  update: 'maint_update',
+  names: 'maint_names',
+  selftest: 'maint_selftest',
 }
 
-const BUSY_TEXT: Record<string, string> = {
-  scan: '正在找文件夹…',
-  update: '正在读正文…',
-  names: '正在扫文件名…',
-  selftest: '正在跑 20 项自检…',
+const BUSY_KEY: Record<Job, string> = {
+  scan: 'maint_busy_scan',
+  update: 'maint_busy_update',
+  names: 'maint_busy_names',
+  selftest: 'maint_busy_selftest',
+}
+
+/** 把 {n} 这类占位符填上：i18n 的 t() 只负责取串，参数在这里补 */
+export function fill(s: string, a?: Record<string, string | number>): string {
+  if (!a) return s
+  return s.replace(/\{(\w+)\}/g, (m, k: string) =>
+    a[k] === undefined || a[k] === null ? m : String(a[k]),
+  )
+}
+
+/** 后端的 k/a 优先，其次是它给的中文原文（异常信息这类没法预翻译） */
+export function say(p: { k?: string; a?: Record<string, string | number>; msg?: string; err?: string }): string {
+  if (p.k) {
+    const s = fill(t(p.k), p.a)
+    if (s && s !== p.k) return s
+  }
+  return p.msg || p.err || ''
 }
 
 async function post<T>(path: string, body: unknown = {}): Promise<T> {
@@ -79,16 +100,16 @@ export function Maintenance({ onDone }: { onDone?: () => void }) {
       setProg({})
       setNote('')
       try {
-        const r = await post<{ ok?: boolean; err?: string }>(
+        const r = await post<{ ok?: boolean; err?: string; k?: string }>(
           which === 'scan' ? '/api/discover' : `/api/${which === 'update' ? 'update' : which}`,
         )
         if (r && r.ok === false) {
-          setNote(r.err || '没启动起来')
+          setNote(say(r) || t('maint_start_fail'))
           setJob(null)
           return
         }
       } catch {
-        setNote('请求失败，看看程序还在不在')
+        setNote(t('maint_net_fail'))
         setJob(null)
         return
       }
@@ -99,7 +120,7 @@ export function Maintenance({ onDone }: { onDone?: () => void }) {
           setProg(p)
           if (p.state && p.state !== 'busy') {
             stop()
-            setNote(p.msg || p.err || (p.state === 'done' ? '完成' : p.state))
+            setNote(say(p) || (p.state === 'done' ? t('maint_done') : p.state))
             onDone?.()
           }
         } catch {
@@ -151,13 +172,13 @@ export function Maintenance({ onDone }: { onDone?: () => void }) {
         <div className="mt-2 text-[11px] text-sub">
           <div className="mb-1 flex items-center gap-1">
             <IconStop size={11} />
-            {LABEL[job]} · {BUSY_TEXT[job]}
+            {t(LABEL_KEY[job])} · {say(prog) || fill(t(BUSY_KEY[job]), prog.a)}
             {prog.done ? ` ${prog.done}${prog.total ? '/' + prog.total : ''}` : ''}
           </div>
           <div className="h-1.5 overflow-hidden rounded-full bg-line">
             <div className="h-full bg-accent transition-all" style={{ width: `${pct}%` }} />
           </div>
-          <div className="mt-1 text-[11px] opacity-70">关掉这个抽屉也会继续跑，跑完在界面底部提示。</div>
+          <div className="mt-1 text-[11px] opacity-70">{t('maint_running_hint')}</div>
         </div>
       )}
 

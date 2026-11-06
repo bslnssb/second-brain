@@ -137,7 +137,16 @@ function Snip({ text }: { text: string }) {
 }
 
 export default function App() {
-  const [q, setQ] = useState('')
+  // 初始关键词来自 URL：exe 的 `SecondBrain.exe 关键词`、托盘「打开详细搜索」、
+  // 以及 README 里写的 ?q= 快捷方式都靠这条。早先只有旧模板读它，换成 React 后
+  // 一路静默失效——命令行带了词，窗口却是空的。
+  const [q, setQ] = useState(() => {
+    try {
+      return new URLSearchParams(location.search).get('q') || ''
+    } catch {
+      return ''
+    }
+  })
   const [rows, setRows] = useState<Row[]>([])
   const [sort, setSort] = useState<SortKey>(() => {
     const saved = localStorage.getItem('sb_sort')
@@ -167,10 +176,14 @@ export default function App() {
   }, [])
   // 托盘「关于/设置/帮助」会带 ?panel= 打开新界面：这里接住并清掉参数
   useEffect(() => {
-    // cfg 是旧模板对「设置」的叫法，这里兼容一下（托盘以前传的就是 cfg）
+    // cfg 是旧模板对「设置」的叫法，这里兼容一下（托盘以前传的就是 cfg）；
+    // 老文档里还有 ?cfg=1 这种写法，一并认下来，别让链接悄悄失效
     const m = /[?&]panel=(help|about|settings|cfg)/.exec(location.search)
-    if (m) {
-      setPanel((m[1] === 'cfg' ? 'settings' : m[1]) as 'help' | 'about' | 'settings')
+    const legacyCfg = /[?&]cfg=1(&|$)/.test(location.search)
+    if (m || legacyCfg) {
+      setPanel(
+        (m && m[1] !== 'cfg' ? m[1] : 'settings') as 'help' | 'about' | 'settings',
+      )
       history.replaceState(null, '', location.pathname)
     }
   }, [])
@@ -320,7 +333,10 @@ export default function App() {
         const seen = new Set<string>()
         const merged: Row[] = []
         for (const r of [...(f.items || []), ...bodyRows]) {
-          const k = r.p.toLowerCase()
+          // 分隔符要先统一：/api/files 给的是 C:\a\b，正文命中来自 docs 表、盘符那段
+          // 是正斜杠（C:/a\b）。只 toLowerCase 的话同一篇会并列两行 ——
+          // 一行带图标、一行带「正文」标签，用户以为库里有两份。
+          const k = r.p.replace(/\//g, '\\').toLowerCase()
           if (seen.has(k)) continue
           seen.add(k)
           merged.push(r)
@@ -379,6 +395,29 @@ export default function App() {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault()
         cycleSort()
+        return
+      }
+      // 帮助面板里写着 Ctrl+F「回到搜索框」，但代码里从来没实现过 —— 用户照着按没反应。
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        qEl.current?.focus()
+        qEl.current?.select()
+        return
+      }
+      // 帮助面板还写着 Ctrl+Enter「在文件夹里定位」，同样没实现过。
+      // 搜索框里按也算：这正是 Listary 用户的肌肉记忆，不该被 typing 守卫吃掉。
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault()
+        const r = shown[picked]
+        if (!r) return
+        const bridge = (
+          window as unknown as { pywebview?: { api?: { reveal?: (p: string) => Promise<boolean> } } }
+        ).pywebview?.api
+        try {
+          void bridge?.reveal?.(r.p)
+        } catch {
+          /* 浏览器里没有「定位」，桌面版才有 */
+        }
         return
       }
       if (e.key === 'Escape') {

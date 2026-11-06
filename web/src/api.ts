@@ -1,7 +1,15 @@
 /** 后端接口的薄封装：只在浏览器里跑（开发时 Vite 代理到 8765）。 */
 
 export type Stats = { files: number; docs: number }
-export type Ping = { ver: string; dir?: string; fallback?: boolean }
+/** 官方地址由后端下发（写在 brain.py 里、跟着 exe 编译），前端只负责显示 */
+export type Ping = {
+  ver: string
+  dir?: string
+  fallback?: boolean
+  repo?: string
+  releases?: string
+  issues?: string
+}
 
 /** 设置抽屉「索引范围」用：后端 scope_report() 的输出 */
 export type ScopeInfo = {
@@ -50,6 +58,35 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 export const getStats = () => api<Stats>('/api/stats')
 export const getConfig = () => api<ConfigInfo>('/api/config')
 export const getPing = () => api<Ping>('/api/ping')
+
+/** 保存索引范围：后端只收本机真实存在的目录（不存在/网络路径会被忽略并在 dropped 里回传） */
+export type SaveScopeResult = {
+  ok: boolean
+  err?: string
+  k?: string
+  include_dirs?: string[]
+  exclude_dirs?: string[]
+  dropped?: string[]
+}
+export const saveConfig = (include_dirs: string[], exclude_dirs: string[]) =>
+  api<SaveScopeResult>('/api/config', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ include_dirs, exclude_dirs }),
+  })
+
+/** 打开官方地址：后端有白名单（只认本仓库），桌面端会用系统浏览器打开 */
+export async function openUrl(u: string): Promise<boolean> {
+  try {
+    const r = await fetch(`/api/open_url?u=${encodeURIComponent(u)}`, {
+      headers: { 'Sec-Fetch-Site': 'same-origin' },
+    })
+    const d = (await r.json()) as { ok?: boolean }
+    return !!d.ok
+  } catch {
+    return false
+  }
+}
 export const getTimeline = (days = 14, kind = 'all', pf = '') => {
   const qs = new URLSearchParams({ days: String(days) })
   if (kind && kind !== 'all') qs.set('t', kind)
