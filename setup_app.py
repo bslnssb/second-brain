@@ -17,7 +17,7 @@ from pathlib import Path
 APP_ZH = '第二大脑'
 APP_EN = 'Second Brain'
 DIR_NAME = 'SecondBrain'   # 安装目录固定英文名，不跟界面语言变
-VERSION = '0.9.47'
+VERSION = '0.9.49'
 
 SILENT = os.environ.get('SB_SILENT') == '1'
 NO_LAUNCH = os.environ.get('SB_NO_LAUNCH') == '1'
@@ -49,6 +49,9 @@ L = {
         'preparing': '准备安装…',
         'done': '装好了：%s',
         'open': '打开第二大脑',
+        'boot': '开机启动（默认开启）',
+        'as_ok': '已设置开机启动',
+        'as_no': '未开启开机启动（可在设置里打开）',
         'sc_ok': '已创建桌面快捷方式',
         'sc_no': '没能创建快捷方式（可以直接双击目录里的 exe）',
         'foot': '装到当前用户，不需要管理员权限',
@@ -76,6 +79,9 @@ L = {
         'preparing': 'Preparing…',
         'done': 'Installed to %s',
         'open': 'Open Second Brain',
+        'boot': 'Start at boot (default on)',
+        'as_ok': 'Start at boot enabled',
+        'as_no': 'Start at boot off (enable it in Settings)',
         'sc_ok': 'Desktop shortcut created',
         'sc_no': 'Could not create a shortcut (you can run the exe in this folder)',
         'foot': 'Installs for the current user, no admin rights needed',
@@ -103,6 +109,9 @@ L = {
         'preparing': 'Preparando…',
         'done': 'Instalado en %s',
         'open': 'Abrir Second Brain',
+        'boot': 'Iniciar al arrancar (activado)',
+        'as_ok': 'Inicio automático activado',
+        'as_no': 'Inicio automático desactivado (actívalo en Ajustes)',
         'sc_ok': 'Acceso directo creado',
         'sc_no': 'No se pudo crear el acceso directo (puedes ejecutar el exe de esta carpeta)',
         'foot': 'Para el usuario actual, sin permisos de admin',
@@ -130,6 +139,9 @@ L = {
         'preparing': 'Preparando…',
         'done': 'Instalado em %s',
         'open': 'Abrir Second Brain',
+        'boot': 'Iniciar com o Windows (padrão)',
+        'as_ok': 'Início automático ativado',
+        'as_no': 'Início automático desativado (ative em Configurações)',
         'sc_ok': 'Atalho criado',
         'sc_no': 'Não foi possível criar o atalho (você pode executar o exe desta pasta)',
         'foot': 'Para o usuário atual, sem direitos de admin',
@@ -157,6 +169,9 @@ L = {
         'preparing': 'तैयारी…',
         'done': 'इंस्टॉल हो गया: %s',
         'open': 'Second Brain खोलें',
+        'boot': 'बूट पर चालू (डिफ़ॉल्ट)',
+        'as_ok': 'ऑटो-स्टार्ट चालू',
+        'as_no': 'ऑटो-स्टार्ट बंद (सेटिंग में चालू करें)',
         'sc_ok': 'डेस्कटॉप शॉर्टकट बन गया',
         'sc_no': 'शॉर्टकट नहीं बन सका (इस फ़ोल्डर का exe चला सकते हैं)',
         'foot': 'मौजूदा उपयोगकर्ता के लिए, एडमिन अधिकार नहीं चाहिए',
@@ -307,6 +322,27 @@ def make_shortcut(exe, name):
     return made
 
 
+def set_autostart(exe, on=True):
+    """装完默认写 HKCU\\...\\Run：开机后台启动（`--silent` 不弹窗）。
+
+    键名 SecondBrain 与程序里「设置 → 开机启动」用的是同一个，用户在设置里
+    关掉再打开时路径仍然指向这次安装的 exe。
+    取消勾选 / SB_NO_AUTOSTART=1（静默安装验收）时什么都不做，尤其**不删**
+    已有的同名值 —— 那可能是别处安装或用户自己配的命令，不该由安装器抹掉。
+    """
+    if not on or os.environ.get('SB_NO_AUTOSTART') == '1':
+        return False
+    try:
+        import winreg
+        sub = r'Software\Microsoft\Windows\CurrentVersion\Run'
+        cmd = '"%s" --silent' % exe
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, sub) as k:
+            winreg.SetValueEx(k, 'SecondBrain', 0, winreg.REG_SZ, cmd)
+        return True
+    except Exception:
+        return False
+
+
 def _launch(exe):
     try:
         subprocess.Popen([str(exe)], cwd=str(exe.parent), close_fds=True)
@@ -332,7 +368,8 @@ def install_cli(payload, dest, lang='zh'):
         return 4
     if os.environ.get('SB_NO_SHORTCUT') != '1':
         make_shortcut(exe, L[lang]['app'])
-    print('installed to %s' % dest, flush=True)
+    auto = set_autostart(exe)
+    print('installed to %s (autostart=%s)' % (dest, auto), flush=True)
     if not NO_LAUNCH:
         _launch(exe)
     return 0
@@ -426,12 +463,23 @@ def install_gui(payload, lang):
     hint_lbl.grid(row=2, column=0, columnspan=4, sticky='w', pady=(0, 12))
     texts.append((hint_lbl, 'hint'))
 
+    opt_row = tk.Frame(body, bg=BG)
+    opt_row.grid(row=3, column=0, columnspan=3, sticky='w')
     keep = tk.BooleanVar(value=True)
-    chk = tk.Checkbutton(body, variable=keep, bg=BG, fg=INK, activebackground=BG,
+    chk = tk.Checkbutton(opt_row, variable=keep, bg=BG, fg=INK, activebackground=BG,
                          activeforeground=INK, selectcolor=BG,
                          font=('Microsoft YaHei UI', 9), bd=0, highlightthickness=0)
-    chk.grid(row=3, column=0, columnspan=3, sticky='w')
+    chk.pack(side='left')
     texts.append((chk, 'keep'))
+    # 开机启动默认勾选：装完就在托盘常驻，双击 Ctrl 随时搜。用户可以取消，
+    # 也可以以后在「设置 → 开机启动」里再打开（同一个注册表键）。
+    boot = tk.BooleanVar(value=True)
+    chk_boot = tk.Checkbutton(opt_row, variable=boot, bg=BG, fg=INK,
+                              activebackground=BG, activeforeground=INK,
+                              selectcolor=BG, font=('Microsoft YaHei UI', 9),
+                              bd=0, highlightthickness=0)
+    chk_boot.pack(side='left', padx=(18, 0))
+    texts.append((chk_boot, 'boot'))
 
     # 程序语言：这一行选的不是安装器语言，而是「装好之后程序用什么语言」
     # （写进 <安装目录>/lang.txt，程序首启读它，免得用户装完看到一屏中文直接卸载）
@@ -532,14 +580,15 @@ def install_gui(payload, lang):
             return
         threading.Thread(target=worker, args=(target,), daemon=True).start()
 
-    def finish_ok(target, exe, sc):
+    def finish_ok(target, exe, sc, auto):
         st['done'] = True
         st['exe'] = exe
         st['sc'] = sc
         last['pct'] = 1.0
         rebar()
         status.configure(text=tr('done') % target, fg='#1a7f37')
-        hint.configure(text=tr('sc_ok') if sc else tr('sc_no'))
+        hint.configure(text=(tr('sc_ok') if sc else tr('sc_no')) + '\n'
+                            + (tr('as_ok') if auto else tr('as_no')))
         go_btn.configure(text=tr('open'), bg=ACC)
         set_busy(False)
         if not NO_LAUNCH:
@@ -575,7 +624,8 @@ def install_gui(payload, lang):
             sc = False
             if keep.get() and os.environ.get('SB_NO_SHORTCUT') != '1':
                 sc = make_shortcut(exe, L[st['lang']]['app'])
-            root.after(0, lambda: finish_ok(target, exe, sc))
+            auto = set_autostart(exe, boot.get())
+            root.after(0, lambda: finish_ok(target, exe, sc, auto))
         except Exception as e:
             root.after(0, lambda err=e: finish_err(err))
 

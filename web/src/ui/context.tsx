@@ -159,32 +159,6 @@ export function ReverseModal({ path, onClose }: { path: string; onClose: () => v
   )
 }
 
-/* -------------------------------- 公告 -------------------------------- */
-
-export type Notice = { title?: string; date?: string; body?: string; url?: string; id?: string }
-
-export function NoticeBar({ items, onClose }: { items: Notice[]; onClose: () => void }) {
-  if (!items.length) return null
-  const n = items[0]
-  return (
-    <div className="mx-3 mt-2 flex items-start gap-2 rounded-lg border border-line bg-card px-3 py-2 text-[12px]">
-      <span className="mt-[1px] rounded bg-accent/15 px-1 text-[10px] font-semibold text-accent">{t('notice')}</span>
-      <div className="min-w-0 flex-1">
-        <div className="font-medium">{n.title || t('notice')}</div>
-        {n.body && <div className="mt-0.5 whitespace-pre-wrap text-sub">{n.body}</div>}
-        {n.url && (
-          <a href={n.url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
-            {t('notice_more')}
-          </a>
-        )}
-      </div>
-      <button onClick={onClose} className="text-sub hover:text-ink" aria-label={t('close')}>
-        <IconClose size={14} />
-      </button>
-    </div>
-  )
-}
-
 /* -------------------------------- 打包提示 ------------------------------ */
 
 export function ZipToast({ text, onClose }: { text: string; onClose: () => void }) {

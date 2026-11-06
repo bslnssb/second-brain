@@ -34,6 +34,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -495,6 +496,56 @@ def _is_visible(hwnd):
         return False
 
 
+def revive_webview(hwnd):
+    """把 hide 之后没跟着 show 的 WebView2 渲染子窗口重新显示（治「整块白窗口」）。
+
+    `--silent` 启动会先 hide 整个主窗口，连 WebView2 的 Chrome_WidgetWin_* 一起
+    设成 WS_VISIBLE=0。之后 pywebview 的 Form.Show() / Win32 SW_RESTORE 只恢复
+    WinForms 外壳，Chromium 的渲染层还藏着 —— 用户看到的是一张白底板，而服务、
+    页面、静态资源其实全都正常（无头浏览器打开同一个 URL 能完整渲染）。
+    2026-11-06 实测：silent 启动后从托盘打开，主窗口 4 个子窗口里 3 个是 hidden。
+
+    只在真的发现隐藏子窗口时才动作并留一行日志，正常显示不产生任何副作用。
+    """
+    if not hwnd:
+        return 0
+    try:
+        u = ctypes.windll.user32
+        u.SetWindowPos.restype = ctypes.c_int
+        u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_uint]
+        PROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        cls = ctypes.create_unicode_buffer(256)
+        hidden = []
+
+        def _cb(h, _l):
+            hh = ctypes.c_void_p(h or 0)
+            u.GetClassNameW(hh, cls, 256)
+            name = cls.value
+            if (name.startswith('Chrome_') or 'D3D' in name) and not u.IsWindowVisible(hh):
+                hidden.append(h)
+            return 1
+
+        u.EnumChildWindows(ctypes.c_void_p(hwnd), PROC(_cb), ctypes.c_void_p(0))
+        if not hidden:
+            return 0
+        # SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED：
+        # FRAMECHANGED 会强制父类向 WebView2 发一次 WM_SIZE，让它重建渲染表面——
+        # 只 ShowWindow 不够，WebView2 在下次合成时又会把刚 show 出来的子窗口藏回。
+        for h in hidden:
+            u.ShowWindow(ctypes.c_void_p(h), 5)          # SW_SHOW
+        u.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, 0, 0,
+                      0x1 | 0x2 | 0x20 | 0x40)
+        # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+        u.RedrawWindow(ctypes.c_void_p(hwnd), None, None, 0x1 | 0x4 | 0x80 | 0x100)
+        _log_always('白屏自愈：唤醒 %d 个隐藏的 WebView2 子窗口' % len(hidden))
+        return len(hidden)
+    except Exception:
+        _log_always('白屏自愈失败\n' + traceback.format_exc())
+        return 0
+
+
 def foreground_desc():
     """谁占了前台——排查「窗口莫名其妙失焦」时唯一有用的线索"""
     try:
@@ -681,6 +732,30 @@ class MiniApi:
         return True
 
 
+# ------------------------------------------------------------------ 命名事件（跨进程激活第一个实例）
+def _kernel32_event():
+    """用 ctypes 直接调 kernel32 建/开命名事件，不依赖 win32event。
+
+    关键：打包 exe 里 pywin32 的 win32event 不在 hiddenimports 中，import 失败会让
+    整个「命名事件激活」机制退化成跨进程 ShowWindow 兜底——而那个会被 WebView2 渲染层
+    重新藏回，白屏依旧。ctypes 调 kernel32 是内建的，不存在这个依赖问题。"""
+    try:
+        k = ctypes.windll.kernel32
+        k.CreateEventW.restype = ctypes.c_void_p
+        k.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+        k.OpenEventW.restype = ctypes.c_void_p
+        k.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_wchar_p]
+        k.SetEvent.restype = ctypes.c_int
+        k.SetEvent.argtypes = [ctypes.c_void_p]
+        k.WaitForSingleObject.restype = ctypes.c_uint
+        k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        k.CloseHandle.restype = ctypes.c_int
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        return k
+    except Exception:
+        return None
+
+
 # ------------------------------------------------------------------ 应用
 class App:
     def __init__(self, url, main_url=None, silent=False, start_mini=False):
@@ -730,10 +805,15 @@ class App:
         # 但 WebView2 在 125%/150% 屏上按窗口真实 DPI 渲染 CSS（DPR>1），CSS 视口被
         # 缩成「物理/DPI」，比设计窄，字号/图标就显得过大。这里先用逻辑尺寸建窗，
         # after_start 里再按实际 DPI 把物理尺寸补成「逻辑 × DPR」（见 _fit_main_dpi）。
+        # 主窗口【不能】hidden 创建：pywebview 的 show()/load_url() 都带
+        # @_shown_call，要先等 WinForms 的 Form.Shown 事件置位；hidden 窗口永远不触发
+        # 这个事件，于是「从快搜窗点展示更多 → show_main」会卡满 20 秒再抛
+        # WebViewException，最后被旧的兜底逻辑丢进系统浏览器。
+        # silent（开机自启）时不显示窗口，改为在 after_start 等窗口真正 shown 之后再 hide。
         self.main = webview.create_window(
             MAIN_TITLE, self.main_url,
             width=MW, height=MH, min_size=(max(760, int(MW * 0.62)), max(520, int(MH * 0.62))),
-            text_select=True, js_api=self.main_api, hidden=self.silent,
+            text_select=True, js_api=self.main_api, hidden=False,
         )
         self.main_api._win = self.main
         self.main.events.closing += self._on_main_closing
@@ -778,6 +858,20 @@ class App:
         _log('_on_main_closing → return True (真退出)')
         return True
 
+    def _hide_after_shown(self):
+        """silent 启动：等 pywebview 的 shown 事件置位（WebView2 也就绪）再隐藏主窗口。
+
+        hidden=True 创建的 WinForms 窗口不触发 Form.Shown，events.shown 永远不置位，
+        之后所有 show() / load_url() / evaluate_js() 都会卡满 20 秒再抛
+        WebViewException —— 这正是「点展示更多却跳到浏览器」的根因之一。"""
+        try:
+            if self.main.events.shown.wait(10):
+                self._safe_hide_main()
+            else:
+                _log_always('主窗口 shown 事件超时，silent 模式未隐藏窗口')
+        except Exception:
+            _log_always('_hide_after_shown 失败\n' + traceback.format_exc())
+
     def _safe_hide_main(self):
         """在 closing 事件之外 hide 主窗口，避开 WinForms FormClosing 的时序陷阱。"""
         try:
@@ -808,6 +902,11 @@ class App:
     def after_start(self):
         self.hwnd_mini = wait_hwnd(MINI_TITLE)
         self.hwnd_main = wait_hwnd(MAIN_TITLE)
+        # silent 模式主窗口按非 hidden 创建（见 create 里的说明），等 Form.Shown
+        # 真正置位、events.shown 可用之后再收起来。用事件而不是固定 sleep：
+        # 窗口只露出一瞬间，开机自启不会闪一大下。
+        if self.silent:
+            threading.Thread(target=self._hide_after_shown, daemon=True).start()
         self._fit_main_dpi()
         self._dbg_autohelp()
         round_corners(self.hwnd_mini)
@@ -823,6 +922,67 @@ class App:
             self.show_mini()
         self.hotkey = self._install_hotkey()
         self.start_tray()
+        self._start_activate_listener()
+
+    def _start_activate_listener(self):
+        """让第一个实例监听一个命名事件：第二个实例启动时只 SetEvent，
+        本进程在自己的线程里跑 show_main()，WebView2 才会正确同步可见性。
+
+        跨进程直接 ShowWindow 会被渲染层（msedgewebview2.exe）立刻重新藏回，
+        正是「silent 启动后唤醒仍白屏」的根因。只有第一个实例自己 show()，
+        WebView2 的控制器才认为窗口可见、不再重藏渲染子窗口。
+
+        事件底层走 ctypes 调 kernel32，不依赖 win32event（打包 exe 里它不在
+        hiddenimports，import 会失败，导致这个监听器根本起不来）。"""
+        k = _kernel32_event()
+        if k is None:
+            _log('activate listener: kernel32 事件接口不可用，跳过（将退回 ShowWindow 兜底）')
+            return
+        try:
+            self._act_event = k.CreateEventW(None, 0, 0, 'SecondBrain_Activate_v1')
+        except Exception as e:
+            _log('activate listener: 创建命名事件失败：%r' % (e,))
+            return
+        if not self._act_event:
+            _log('activate listener: CreateEventW 返回空句柄')
+            return
+
+        def loop():
+            while True:
+                try:
+                    r = k.WaitForSingleObject(self._act_event, 0xFFFFFFFF)  # INFINITE
+                except Exception:
+                    break
+                if r == 0:   # WAIT_OBJECT_0
+                    try:
+                        self.show_main()
+                    except Exception:
+                        _log_always('activate listener: show_main 失败\n'
+                                    + traceback.format_exc())
+
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+        self._act_thread = t
+        _log('activate listener: 命名事件 SecondBrain_Activate_v1 已监听')
+
+    def _force_webview_visible(self):
+        """把 WebView2 控件自身的 Visible 设回 true（根因修复）。
+
+        silent 启动隐藏主窗口时，WebView2 控制器的 IsVisible 被设成 false，渲染层
+        的 Chrome_* 子窗口随之隐藏；光对外层子窗口 ShowWindow 会被控制器在下一次
+        合成时重新藏回，所以必须直接动控件。pywebview 的 Window.native 是
+        BrowserForm，其 .webview 就是 .NET 的 WebView2 控件。属性名跨版本可能变，
+        整段包在 try 里，失败就退回 revive_webview 的治标逻辑。"""
+        try:
+            impl = getattr(self.main, 'native', None)
+            if impl is None:
+                return
+            ctrl = getattr(impl, 'webview', None)
+            if ctrl is None:
+                return
+            ctrl.Visible = True
+        except Exception as e:
+            _log('force webview visible FAILED: %r' % (e,))
 
     def _fit_main_dpi(self):
         """高 DPI 修正：pywebview 基于 .NET WinForms，create_window 的 width 被当作
@@ -945,11 +1105,26 @@ class App:
     def show_main(self, q=None, panel=None):
         """从快搜窗跳过来：show 主窗口 + 设搜索词。
 
-        第一次需要 load_url 加载页面；之后只用 evaluate_js 设置搜索框 + 触发搜索，
-        不再重新加载——每次 load_url 都让 WebView2 重新渲染整页，关闭时如果还在
-        加载中，WebView2 可能进入错误状态，导致后续 show_mini 也跟着失败。"""
+        这里【绝不能】在出错时退回 webbrowser.open。那是「窗口组件加载失败就退到
+        浏览器模式」的老兜底，被滥用在这里之后，用户点一下「展示更多 …」就会
+        冒出一个浏览器标签打开 127.0.0.1:8765/web/ —— 明明装的是 exe，看起来
+        却像突然退化成网页，而且真正的异常被彻底掩盖。出错只记日志，界面必须
+        留在桌面窗口里。
+
+        新界面是 React，只认 /web/?q= 与 ?panel=。旧模板那句
+        `qEl.value=…;go()` 在 React 里必然 ReferenceError，别再注入它。
+        """
+        qs = []
+        if q:
+            qs.append('q=' + quote(q))
+        if panel:
+            qs.append('panel=' + panel)
+        rel = '/web/' + ('?' + '&'.join(qs) if qs else '')
+        target = self.url + rel
+
+        # ① 显示窗口。换深色标题栏、抢前台这类非关键动作各自单独吞异常，
+        #    别让它们把整个流程带进一个「统一 except」再触发跳浏览器。
         try:
-            # 先拿到 hwnd（可能在关闭/重开过程中变了），找不到就等一下
             hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
             if not hwnd:
                 hwnd = wait_hwnd(MAIN_TITLE, 2.0)
@@ -960,59 +1135,79 @@ class App:
 
             self.main.show()
 
-            # pywebview 的 show() 在窗口被 hide 过之后偶尔不生效——Form.Visible 卡在
-            # False。用 Win32 ShowWindow 兜底：直接对原生窗口句柄发 SW_SHOW，绕过
-            # .NET 层。这一步是纯增益，show() 成功了也不冲突。
+            # pywebview 的 show() 在窗口被 hide 过之后偶尔不生效（Form.Visible 卡
+            # 在 False）。用 Win32 ShowWindow 兜底，直接对原生句柄发 SW_SHOW。
             if hwnd:
                 try:
                     import win32con
                     import win32gui
                     if not win32gui.IsWindowVisible(hwnd):
-                        _log(f'show_main: Form.Show() 没生效，用 Win32 SW_SHOW 兜底')
+                        _log('show_main: Form.Show() 没生效，用 Win32 SW_SHOW 兜底')
                         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
                 except Exception as e:
                     _log(f'show_main: SW_SHOW fallback FAILED: {e}')
-
-            if hwnd:
                 try:
                     dark_caption(hwnd, effective_dark())
                 except Exception as e:
                     _log('dark caption on show failed: %r' % (e,))
+                # Win32 强制重排一次：让 WebView2 收到 WM_SIZE 重建渲染表面，
+                # 否则它会在下次合成时把刚 show 出来的渲染子窗口又藏回（白屏）。
+                try:
+                    self.main.resize(self.main.width, self.main.height)
+                except Exception:
+                    pass
+                # 外壳 show 起来了，WebView2 的渲染子窗口却可能还藏着（silent 启动
+                # 必现）：不唤醒的话用户看到的就是一整块白窗口。
+                revive_webview(hwnd)
+                # 根因：WebView2 渲染窗口的可见性由控件自身的 Visible（即
+                # CoreWebView2Controller.IsVisible）决定，表单隐藏时它被设成 false，
+                # 对外层子窗口 ShowWindow 只是治标、控制器下次合成又会藏回。
+                # 必须把 WebView2 控件的 Visible 显式设回 true，渲染层才真正显示。
+                self._force_webview_visible()
+        except Exception:
+            _log_always('show_main: 显示桌面主窗口失败\n' + traceback.format_exc())
+            # MiniApi.detail() 进来之前已经把快搜窗藏了。主窗口起不来时不能让
+            # 界面变成一片空，把快搜窗放回来，用户至少还能继续搜、再试一次。
+            try:
+                self.show_mini()
+            except Exception:
+                _log_always('show_main: 恢复快搜窗也失败\n' + traceback.format_exc())
+            return
 
+        # ② 导航带上搜索词。第一次必须用 load_url（此时 _pywebviewready 还没置位，
+        #    evaluate_js 会一直等到超时）；之后改用整页导航，React 会读 ?q= 直接出结果。
+        try:
             if not getattr(self, '_main_loaded', False):
-                # 首次加载：面板（帮助/关于/设置）直接写进 URL。
-                # 不要再「加载完立刻 evaluate_js」——页面还没 ready，注入必失败；
-                # 用户实测过：窗口出来了但帮助/关于面板没出来，设置干脆没反应。
-                qs = []
-                if q:
-                    qs.append('q=' + quote(q))
-                if panel:
-                    qs.append('panel=' + panel)
-                # 新界面挂在 /web/，面板与搜索词都用 query 传进去（React 自己接）
-                target = self.url + '/web/' + ('?' + '&'.join(qs) if qs else '')
                 self.main.load_url(target)
                 self._main_loaded = True
-            elif panel:
-                # 已加载过：直接改地址栏参数让 React 自己开面板，避免注入时机问题
-                js = "location.href='/web/?panel=%s'" % panel
-                try:
-                    self.main.evaluate_js(js)
-                    _log(f'show_main panel={panel} via url')
-                except Exception as e:
-                    _log(f'show_main panel={panel} url FAILED: {e}')
-            elif q:
+            elif panel or rel != getattr(self, '_main_target', ''):
+                # panel 必须每次都重新导航：React 的 ?panel= 只在挂载时读一次，
+                # 用户关掉抽屉再点同一个托盘菜单，URL 没变也得强制重载才打得开。
                 import json as _j
-                self.main.evaluate_js(f'qEl.value={_j.dumps(q)};go()')
+                self.main.evaluate_js('location.href=' + _j.dumps(rel))
+            self._main_target = rel
+        except Exception:
+            _log_always('show_main: 主窗口导航失败（窗口已显示，可点托盘「打开详细搜索」）\n'
+                        + traceback.format_exc())
 
+        # ③ load_url / 整页导航可能重建渲染窗口，等它稳定后再补一次唤醒，
+        #    避免刚显示的窗口又被新建的 WebView2 视图盖成空白。WebView2 的
+        #    合成是异步的，单点唤醒容易被它自己的布局循环盖掉，所以分两拍。
+        def _late_revive():
+            for delay in (0.3, 0.8):
+                time.sleep(delay)
+                revive_webview(hwnd)
+                self._force_webview_visible()
+
+        threading.Thread(target=_late_revive, daemon=True).start()
+
+        # ④ 抢前台，失败也不影响前面几步
+        try:
             ok = topmost(hwnd)
             _log(f'show_main topmost={ok} visible_now={_is_visible(hwnd)} '
                  f'fg={foreground_desc()}')
-        except Exception as e:
-            _log(f'show_main EXCEPTION: {e}')
-            try:
-                webbrowser.open(self.url)
-            except Exception:
-                pass
+        except Exception:
+            _log_always('show_main: 抢前台失败\n' + traceback.format_exc())
 
     def hide_main(self):
         try:
@@ -1156,26 +1351,9 @@ class App:
         except Exception as e:
             _log(f'open_panel({name}) FAILED: {e}')
 
-    def _main_js(self, code):
-        """在主窗口里跑一小段 JS（目前只是应急口子，托盘三个面板走 open_panel 的 URL 参数）。
-
-        注意：**不要在页面还没加载完的时候调它**。WebView2 在导航过程中调
-        ExecuteScriptAsync 会一直等，实测能把托盘线程卡死十几秒。
-        这里只在窗口已经加载过（_main_loaded 为真）时才注入，失败就记日志。
-        """
-        win = getattr(self, 'main', None)
-        if win is None:
-            _log('_main_js: no main window')
-            return
-        if not getattr(self, '_main_loaded', False):
-            _log('_main_js skipped: main window not loaded yet')
-            return
-        try:
-            self.show_main()
-            win.evaluate_js(code)
-            _log('_main_js ok')
-        except Exception as e:
-            _log(f'_main_js FAILED: {e}')
+    # _main_js() 已删：托盘三个面板早在 v0.9.46 就全改成 open_panel() 走 URL 参数，
+    # 这个「show_main() + evaluate_js 注入」的应急口子没有任何调用者，而且无参
+    # show_main() 会把当前搜索词清掉 —— 留着只会等哪天有人误用。
 
     def tray_settings(self):
         # 设置抽屉就是主窗口里那个，别在托盘里另开一个——两处状态会打架。
@@ -1246,15 +1424,42 @@ _MUTEX_H = None
 
 
 def _activate_running():
-    """把已经在跑的那份叫到前面来。"""
+    """把已经在跑的那份叫到前面来。
+
+    优先用命名事件通知第一个实例**自己**跑 show_main()——只有它自己的线程里
+    show() 才能让 WebView2 正确同步可见性。跨进程 ShowWindow 会被渲染层重新藏回，
+    反而留下白屏。事件底层走 ctypes 调 kernel32（不依赖 win32event，打包 exe 里
+    也能用）；事件机制不可用时才退回裸 Win32 兜底。
+
+    命名事件可能在第二个实例启动那一刻还没被第一个实例建好（after_start 还没跑完），
+    所以 OpenEventW+SetEvent 重试几次——否则会退化成无效的 ShowWindow 兜底。自动
+    重置事件即使「信号发出时还没人 Wait」，等监听器一 Wait 也会立刻返回，不会丢。"""
+    k = _kernel32_event()
+    if k is not None:
+        EVENT_ALL_ACCESS = 0x1F0003
+        for _ in range(6):
+            try:
+                h = k.OpenEventW(EVENT_ALL_ACCESS, 0, 'SecondBrain_Activate_v1')
+                if h:
+                    k.SetEvent(h)
+                    k.CloseHandle(h)
+                    _log('activate running: 已 SetEvent 通知第一个实例自显示')
+                    return True
+            except Exception as e:
+                _log('activate running: 命名事件通知失败：%r' % (e,))
+            time.sleep(0.4)           # 第一个实例的监听器可能还没建好事件
+    # 兜底：命名事件不可用（极旧环境 / 第一个实例还没起好监听器）时，跨进程直接显示，
+    # 并唤醒被 silent hide 掉的 WebView2 子窗口。
     try:
         import ctypes
         u = ctypes.windll.user32
+        u.FindWindowW.restype = ctypes.c_void_p     # 64 位下别把 HWND 截成 int
         for title in ('Second Brain · 第二大脑', '第二大脑（双击 Ctrl 唤出快搜）'):
             hwnd = u.FindWindowW(None, title)
             if hwnd:
-                u.ShowWindow(hwnd, 9)          # SW_RESTORE
-                u.SetForegroundWindow(hwnd)
+                u.ShowWindow(ctypes.c_void_p(hwnd), 9)   # SW_RESTORE
+                revive_webview(hwnd)
+                u.SetForegroundWindow(ctypes.c_void_p(hwnd))
                 return True
     except Exception as e:
         _log(f'activate existing FAILED: {e}')
@@ -1347,7 +1552,22 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
     app = App(url, main_url=target, silent=silent, start_mini=start_mini)
     try:
         app.create()
-        webview.start(func=app.after_start, debug=False)
+        # pywebview 的 start() 默认 private_mode=True —— cookies 与 localStorage
+        # 一律不落盘。症状就是「每次重启都弹欢迎页」，而且语言、深色模式、
+        # 排序、列表/缩略图这些偏好其实每次都在重置，只是没欢迎页那么显眼。
+        # 关掉私有模式，并把 WebView2 的 profile 固定到数据目录：app_dir() 已处理
+        # 「程序目录只读 → 退到 %LOCALAPPDATA%\SecondBrain\data」的回退。
+        # 窗口 URL 都是 http://127.0.0.1，不是本地文件，所以不会额外起 pywebview
+        # 自带的 global server。
+        try:
+            import brain as _b
+            _profile = _b.app_dir() / 'webview-profile'
+            _profile.mkdir(parents=True, exist_ok=True)
+            _storage = str(_profile)
+        except Exception:
+            _storage = None
+        webview.start(func=app.after_start, debug=False,
+                      private_mode=False, storage_path=_storage)
     except Exception as e:
         # pythonnet（pywebview 的 WinForms 后端）在两种环境下会加载失败：
         #   1) 程序放在带 Low 完整性标签的目录里（例如 D:\work\项目\…）；

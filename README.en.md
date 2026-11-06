@@ -210,10 +210,10 @@ The app never goes online, but **an installer someone forwarded to you may not b
 - The About panel lists three official links you can click, so you never have to type a URL
 - About also shows a SHA-256 fingerprint for the donation QR. If it does not match this release, **the QR is hidden automatically** — so you cannot scan someone else's payment code
 
-Fingerprint shipped in v0.9.46:
+Fingerprint shipped with the current release (it only changes when the QR itself changes):
 
 ```
-07710ddf1ccf1d443275df5ffae15820609d7d34160af6438edf50455be835ee
+956fec5ba8786652cae62cbe828450771301320c8c3e40f5e4aad4ed544be38d
 ```
 
 > This is not a cryptographic signature (that needs a code-signing certificate we do not have), but it raises the cost of swapping the QR from "replace one PNG" to "rebuild the exe". To use your own QR you must also change `DONATE_SHA256` in `brain.py` — deliberately so.

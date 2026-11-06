@@ -36,8 +36,8 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-APP_VERSION = 'v0.9.47'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
-BUILD_DATE = '2026-11-06'
+APP_VERSION = 'v0.9.49'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+BUILD_DATE = '2026-11-07'
 PY_VER = sys.version.split()[0]
 SQL_VER = sqlite3.sqlite_version
 
@@ -57,7 +57,7 @@ OFFICIAL_ISSUES = OFFICIAL_REPO + '/issues'
 # 发行版赞赏码的 SHA-256（assets/donate.png）。用途只有一个：
 # 有人把安装包拆开、换掉二维码再发出去时，界面能当场认出「这不是我发出的那张」。
 # 换自己的收款码要同时改这一行 —— 这是故意的，改图比改这行容易得多。
-DONATE_SHA256 = '07710ddf1ccf1d443275df5ffae15820609d7d34160af6438edf50455be835ee'
+DONATE_SHA256 = '956fec5ba8786652cae62cbe828450771301320c8c3e40f5e4aad4ed544be38d'
 
 # /api/open_url 只认本仓库下的地址：这条路由会真的调起系统浏览器，
 # 放开任意 URL 等于给页面一个「随手打开钓鱼站」的按钮。
@@ -1322,7 +1322,7 @@ def start_watcher():
     if _WATCH['on'] or os.environ.get('SB_NO_WATCH'):
         return
     try:
-        if _settings_dict().get('watch') is False:
+        if _settings_read().get('watch') is False:
             return
     except Exception:
         pass
@@ -4982,33 +4982,96 @@ def _first_run_eta(docs_left, names_left):
 
 
 
-def _settings_dict():
-    sp = app_dir() / 'settings.json'
-    try:
-        d = json.loads(sp.read_text(encoding='utf-8')) if sp.exists() else {}
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+# settings.json 存的是全局偏好（主题 / 语言 / 热键 / 欢迎页 / 首启标记）。
+# 写它的有四方：设置抽屉、欢迎页、旧模板、后端首启线程。以前是
+# 「读整个文件 → 改一个键 → write_text 整文件覆盖」，没有锁也不是原子写：
+# 两个并发 POST 实测有 45% 概率互相抹掉 welcome_seen，写一半还会留下半截 JSON，
+# GET 再被 except: pass 吞掉，偏好静默清零、欢迎页每次都弹（2026-11-06 专家审查实证）。
+# 现在统一收口到 _settings_read / _settings_update：进程内锁 + 临时文件 os.replace。
+_SETTINGS_LOCK = threading.RLock()
+
+
+def _settings_path():
+    return app_dir() / 'settings.json'
+
+
+def _settings_read():
+    """带锁读配置。文件损坏 / 不是对象时先备份成 .bad-* 再返回空 dict，
+    绝不把半截 JSON 静默当成「用户没设过偏好」。"""
+    with _SETTINGS_LOCK:
+        sp = _settings_path()
+        try:
+            raw = sp.read_text(encoding='utf-8') if sp.exists() else ''
+        except Exception as e:
+            _log_file('settings.json read failed: %r' % (e,))
+            return {}
+        if not raw.strip():
+            return {}
+        try:
+            d = json.loads(raw)
+        except Exception as e:
+            _log_file('settings.json broken JSON: %r' % (e,))
+            d = None
+        if not isinstance(d, dict):
+            if d is not None:
+                _log_file('settings.json is not an object: %s' % type(d).__name__)
+            try:
+                sp.replace(sp.with_name('settings.json.bad-%d' % int(time.time())))
+            except Exception:
+                pass
+            return {}
+        return d
+
+
+def _settings_update(patch):
+    """合并 patch 并原子落盘，返回 (ok, data)。所有写配置的地方都必须走这里。
+
+    原子性靠「临时文件写完整 → os.replace 一次换名」，读者永远只会看到
+    旧文件或完整的新文件；锁保证同进程内 read-modify-write 不被插队。
+    """
+    with _SETTINGS_LOCK:
+        sp = _settings_path()
+        d = _settings_read()      # RLock 可重入
+        d.update(patch)
+        tmp = sp.with_name('settings.json.tmp-%d' % os.getpid())
+        try:
+            tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+            os.replace(tmp, sp)
+        except Exception as e:
+            _log_file('settings.json write failed: %r' % (e,))
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            return False, d
+        # 读回校验：落盘的必须是可解析的 dict，且本次 patch 真的写进去了
+        try:
+            back = json.loads(sp.read_text(encoding='utf-8'))
+            if not isinstance(back, dict) or any(back.get(k) != v for k, v in patch.items()):
+                raise ValueError('settings.json readback mismatch')
+        except Exception as e:
+            _log_file('settings.json readback failed: %r' % (e,))
+            return False, d
+        return True, back
 
 
 def _settings_mark(key, val):
     """往 settings.json 里写一个标记（保留其它键）。"""
-    d = _settings_dict()
-    d[key] = val
-    try:
-        (app_dir() / 'settings.json').write_text(
-            json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
-        return True
-    except Exception as e:
-        print('[!] 写 settings.json 失败：', e, flush=True)
-        return False
+    ok, _ = _settings_update({key: val})
+    if not ok:
+        print('[!] 写 settings.json 失败：%s=%r' % (key, val), flush=True)
+    return ok
 
 
 def first_run_need():
-    """还没建过库、也没被用户拒绝过 → True。"""
-    done = _settings_dict().get('firstrun_done')
-    # 'error' 不算终态：目录只读、中途关窗这些都会落成 error，下次开还得再试一次。
-    if done and done != 'error':
+    """还没建过库、也没被用户主动拒绝过 → True。"""
+    done = _settings_read().get('firstrun_done')
+    # 'error'（写不进 scope / 抛异常）和 'empty'（当时没找到任何可索引目录）都不是
+    # 终态：换了目录、插了盘、目录不再只读，下次启动就该再试一次。
+    # 'skip' 是用户亲手点的「我自己选文件夹」，尊重它，别每次重启都自动开扫；
+    # 想反悔可以在设置里手动点智能扫描（/api/firstrun 不受这个标记限制）。
+    if done == 'skip' or (done and done not in ('error', 'empty')):
         return False
     try:
         con = init_db()
@@ -6448,7 +6511,19 @@ function open(i){
 }
 function detail(){
   var v=Q.value.trim();
-  if(API&&API.detail)API.detail(v);
+  if(API&&API.detail){
+    /* 桌面窗口：交给原生桥去 show 自带的主窗口。这里必须 catch：
+       pywebview 的 js_api 返回 Promise，宿主一出异常就会 unhandled rejection，
+       页面上看不到任何反馈，用户会以为「点了没反应」。 */
+    try{
+      var r=API.detail(v);
+      if(r&&r.catch)r.catch(function(e){ console.warn('detail failed',e); });
+    }catch(e){ console.warn('detail failed',e); }
+    return;
+  }
+  /* 没有原生桥 = 这个 /mini 是被人在浏览器里直接打开的（调试/截图场景）。
+     只在【当前标签页】跳到完整界面，别新开浏览器窗口。 */
+  if(v)location.href='/web/?q='+encodeURIComponent(v);
 }
 /* 两趟查：
    prefix 走名字索引，157 万行 0.2ms，每次输入都立刻发；
@@ -8254,7 +8329,17 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
             try:
                 with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub) as k:
                     val, _ = winreg.QueryValueEx(k, name)
-                    return True, cmd, val
+                    # 只看「键存在」会骗过设置面板：静默安装验收留下的旧路径
+                    # （测试目录早删了）也会显示「已开启」，实际开机什么都没起来。
+                    # 拆出命令里的 exe，文件还在才算真的开着；用户点一下「开」
+                    # 就会用当前 exe 的路径覆盖掉这条死链。
+                    v = (val or '').strip()
+                    if v.startswith('"') and '"' in v[1:]:
+                        p = v[1:v.find('"', 1)]
+                    else:
+                        p = v.split(' ')[0]
+                    alive = bool(p) and os.path.isfile(p)
+                    return alive, cmd, val
             except FileNotFoundError:
                 return False, cmd, ''
         except Exception:
@@ -8500,13 +8585,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                                   ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/settings'):
-                sp = app_dir() / 'settings.json'
-                d = {}
-                try:
-                    if sp.exists():
-                        d = json.loads(sp.read_text(encoding='utf-8'))
-                except Exception:
-                    pass
+                # 损坏文件由 _settings_read 备份并返回 {}，这里再补默认值，
+                # 绝不会因为 JSON 解析失败/res不是 dict 变成 500 HTML。
+                d = _settings_read()
                 d.setdefault('hotkey', True)
                 d.setdefault('theme', 'auto')
                 body = json.dumps(d, ensure_ascii=False).encode()
@@ -8995,6 +9076,19 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 self.send_header('Location', '/web/')
                 self.end_headers()
                 return
+            elif self.path.startswith('/api/'):
+                # 未知接口绝不能落回旧模板首页（200 + text/html）。前端 r.json()
+                # 解析失败又被 catch 吞掉，于是「拼错路径」「接口已删」全都伪装成
+                # 「请求成功但什么也没发生」——公告下线后残留的 /api/notices
+                # 就是这么静默跑了好几个版本的。给个明确的 JSON 404。
+                body = json.dumps({'ok': False, 'err': 'no such api',
+                                   'path': self.path.split('?')[0][:120]},
+                                  ensure_ascii=False).encode()
+                self.send_response(404)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             else:
                 body = build_page().encode()
                 ctype = 'text/html; charset=utf-8'
@@ -9071,15 +9165,11 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 self.wfile.write(body)
                 return
             if self.path.startswith('/api/settings'):
-                sp = app_dir() / 'settings.json'
-                d = {}
-                try:
-                    if sp.exists():
-                        d = json.loads(sp.read_text(encoding='utf-8'))
-                except Exception:
-                    pass
+                # 先校验再写：非法值不该触发一次落盘。所有键合成一个 patch，
+                # 由 _settings_update 加锁合并 + 原子替换，避免并发互相抹掉。
+                patch = {}
                 if 'hotkey' in req:
-                    d['hotkey'] = bool(req['hotkey'])
+                    patch['hotkey'] = bool(req['hotkey'])
                 if 'theme' in req:
                     if req['theme'] not in ('auto', 'dark', 'light'):
                         body = json.dumps({'ok': False, 'err': 'theme 只能是 auto/dark/light',
@@ -9089,10 +9179,10 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                         self.end_headers()
                         self.wfile.write(body)
                         return
-                    d['theme'] = req['theme']
+                    patch['theme'] = req['theme']
                 if 'welcome_seen' in req:
                     # 欢迎页只该出现一次。存进 settings.json，跟主题/语言一个地方。
-                    d['welcome_seen'] = bool(req['welcome_seen'])
+                    patch['welcome_seen'] = bool(req['welcome_seen'])
                 if 'lang' in req:
                     if req['lang'] not in ('zh', 'en', 'es', 'pt', 'hi'):
                         body = json.dumps({'ok': False, 'err': 'lang 只能是 zh/en/es/pt/hi',
@@ -9102,11 +9192,19 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                         self.end_headers()
                         self.wfile.write(body)
                         return
-                    d['lang'] = req['lang']
+                    patch['lang'] = req['lang']
                     # 用户在设置里亲手选的：以后 boot_lang() 才认这一项
-                    d['lang_user'] = True
-                sp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
-                body = json.dumps({'ok': True}, ensure_ascii=False).encode()
+                    patch['lang_user'] = True
+                ok, d = _settings_update(patch)
+                if not ok:
+                    body = json.dumps({'ok': False, 'err': 'settings.json 写入失败',
+                                       'k': 'e_settings_write'}, ensure_ascii=False).encode()
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = json.dumps({'ok': True, 'settings': d}, ensure_ascii=False).encode()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()

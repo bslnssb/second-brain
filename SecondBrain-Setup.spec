@@ -6,7 +6,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('payload.zip', '.'), ('logo64.png', '.'), ('app.ico', '.')],
-    hiddenimports=[],
+    # winreg 在 set_autostart() 里是函数内 import，PyInstaller 静态分析容易漏；
+    # 漏了安装包就不会写开机启动项，而且报错被 try 吞掉，极难发现。
+    hiddenimports=['winreg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -3,7 +3,7 @@ import { dirName, fmtSize, fmtTime, midName, sortItems, SORT_KEYS, type Hit, typ
 import { parseQSyn } from './lib/qsyn'
 import { AboutModal, HelpModal, Preview, SettingsDrawer, Timeline } from './ui/panels'
 import { setLang, t } from './lib/i18n'
-import { ContextMenu, NoticeBar, ReverseModal, ZipToast, type MenuItem, type Notice } from './ui/context'
+import { ContextMenu, ReverseModal, ZipToast, type MenuItem } from './ui/context'
 import { Onboarding } from './ui/onboarding'
 import {
   IconApp,
@@ -199,7 +199,6 @@ export default function App() {
   )
   const [menu, setMenu] = useState<{ x: number; y: number; row: Row } | null>(null)
   const [reverse, setReverse] = useState<string | null>(null)
-  const [notices, setNotices] = useState<Notice[]>([])
   const [toast, setToast] = useState('')
   const seq = useRef(0)
   const qEl = useRef<HTMLInputElement>(null)
@@ -225,19 +224,6 @@ export default function App() {
     // 版本号别写死在页面里：后端 bump 之后这里自动跟上
     api<{ ver?: string }>('/api/ping')
       .then((d) => d.ver && setVer(d.ver))
-      .catch(() => {})
-  }, [])
-
-  // 公告：只在有新内容时占一条，关掉后记在 localStorage 里
-  useEffect(() => {
-    fetch('/api/notices')
-      .then((r) => r.json())
-      .then((d: { items?: Notice[] }) => {
-        const all = d.items || []
-        const seen = localStorage.getItem('sb_notice_seen') || ''
-        const fresh = all.filter((n) => String(n.id || n.title) !== seen)
-        setNotices(fresh.slice(0, 1))
-      })
       .catch(() => {})
   }, [])
 
@@ -644,15 +630,6 @@ export default function App() {
         </button>
         </div>
       </header>
-
-      <NoticeBar
-        items={notices}
-        onClose={() => {
-          const n0 = notices[0]
-          if (n0) localStorage.setItem('sb_notice_seen', String(n0.id || n0.title))
-          setNotices([])
-        }}
-      />
 
       {/* 语法提示：只在写了语法时出现，避免平时占地方 */}
       {(syn.ext || syn.days || syn.size[0] != null || syn.size[1] != null || syn.excl.length > 0 || syn.folder) && (

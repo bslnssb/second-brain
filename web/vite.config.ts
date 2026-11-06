@@ -27,5 +27,10 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    // WorkBuddy 沙箱里多 worker 并发写 vitest 缓存会 EPERM，症状极隐蔽：
+    // 「Test Files 1 passed」+ 退出码 0，另外 3 个文件根本没跑（假绿）。
+    // 单 fork 串行执行全部测试文件，npm test 才是真的全量。
+    pool: 'forks',
+    poolOptions: { forks: { singleFork: true } },
   },
 })
