@@ -6,12 +6,28 @@
   快搜窗（/mini）  双击 Ctrl 弹出，一个输入框 + 九行结果，Ctrl+1~9 直接开，Esc 收起
   主窗口（/）      原来的完整界面：正文检索、类型/路径过滤、设置、索引维护
 
-快搜窗按大家熟悉的习惯做：无边框、圆角（Win11 的 DWM 圆角）、常驻置顶、
+快搜窗按 Listary 的习惯做：无边框、圆角（Win11 的 DWM 圆角）、常驻置顶、
 失焦自动收起。主窗口关掉只是隐藏，程序在托盘里等着，这样双击 Ctrl 随时能用。
 
 带参数时走命令行（update / selftest / search …），方便打包成 exe 后复用同一入口。
 """
 import ctypes
+
+# 高 DPI 适配：必须在 import webview / 创建任何窗口之前设置。
+# 旧逻辑用 SetProcessDPIAware（System DPI Aware）——在多显示器 / 150% 缩放下，
+# WebView2 会用错误比例渲染，界面元素被整体放大、发虚（表现就是「窗口里一切都很大」）。
+# 改为 Per-Monitor v2：WebView2 在窗口所在显示器上按真实 DPI 渲染，内容清晰、大小正常。
+try:
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_int(-4))  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    except Exception:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)                       # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 import json
 import os
 import socket
@@ -28,8 +44,8 @@ sys.path.insert(0, str(HERE))
 
 # brain.cli 能认的子命令：这些一律走命令行，不当作搜索词。
 # 没列在里面的裸参数（如 SecondBrain.exe 报销）视为「带关键词开窗，直接出结果」，
-# 是配合 PowerToys Run 这类启动器的入口。
-_CLI_CMDS = {'index', 'update', 'search', 'prune', 'serve',
+# 是配合 Listary / PowerToys Run 这类启动器的入口。
+_CLI_CMDS = {'index', 'update', 'search', 'prune', 'serve', 'repair',
              'selftest', 'eval', '_extract', 'scan'}
 
 MINI_W = 760                 # 快搜窗宽度（逻辑像素，CSS px 同尺度）
@@ -37,14 +53,102 @@ MINI_H = 124                 # 初始高度：一行输入框 + 一行提示
 MINI_TITLE = '第二大脑 · 快搜'
 MAIN_TITLE = 'Second Brain · 第二大脑'
 
+
+def icon_file():
+    """找 assets/icon.ico：源码目录 / 打包后的 _MEIPASS / 解包目录都试一遍。
+
+    和 tray.py 的 _icon_path() 是同一个顺序，两个地方别写成不一样。"""
+    cands = [HERE / 'assets' / 'icon.ico']
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        cands.append(Path(meipass) / 'assets' / 'icon.ico')
+    if getattr(sys, 'frozen', False):
+        cands.append(Path(sys.executable).parent / 'assets' / 'icon.ico')
+    cands.append(HERE / '_internal' / 'assets' / 'icon.ico')
+    for p in cands:
+        try:
+            if p.is_file():
+                return str(p)
+        except OSError:
+            pass
+    return None
+
+
+def apply_window_icon(hwnd, ico=None):
+    """把窗口图标换成我们自己的：标题栏 / Alt-Tab / 任务栏三处都读它。
+
+    pywebview 的 create_window 没有 icon 参数（WinForms 外壳不转发），所以只能建完窗
+    再 WM_SETICON。小图标给 16，大图标给 0（让系统按 DPI 自己挑 256 那档）。"""
+    ico = ico or icon_file()
+    if not hwnd or not ico:
+        return False
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        LR_LOADFROMFILE, IMAGE_ICON, WM_SETICON = 0x10, 1, 0x0080
+        u.LoadImageW.restype = ctypes.c_void_p
+        big = u.LoadImageW(0, ico, IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
+        small = u.LoadImageW(0, ico, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        ok = False
+        if big:
+            u.SendMessageW(hwnd, WM_SETICON, 1, ctypes.c_void_p(big))
+            ok = True
+        if small:
+            u.SendMessageW(hwnd, WM_SETICON, 0, ctypes.c_void_p(small))
+        return ok
+    except Exception as e:
+        _log(f'apply_window_icon FAILED: {e}')
+        return False
+
 DEBUG = bool(os.environ.get('SB_DEBUG'))
 
 
 def _log(msg):
     """窗口显隐的时序问题只能靠时间戳看。正常启动不开，排查时设 SB_DEBUG=1。"""
     if DEBUG:
-        print(f'[{time.strftime("%H:%M:%S")}.{int(time.time() * 1000) % 1000:03d}] {msg}',
-              flush=True)
+        line = f'[{time.strftime("%H:%M:%S")}.{int(time.time() * 1000) % 1000:03d}] {msg}'
+        try:
+            with open('debug.log', 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+        except Exception:
+            print(line, flush=True)
+
+
+_LOG_MAX = 512 * 1024
+_START_ERR = ['']          # main() 与 _start_server() 共享：启动阶段的异常
+
+
+def _log_path():
+    try:
+        return brain.app_dir() / 'debug.log'
+    except Exception:
+        return 'debug.log'
+
+
+def _log_always(msg):
+    """出问题时要留痕：不看 SB_DEBUG 也写，超过 512KB 滚动一份 .1。"""
+    try:
+        p = _log_path()
+        try:
+            if p.exists() and p.stat().st_size > _LOG_MAX:
+                p.replace(p.with_suffix('.log.1'))
+        except Exception:
+            pass
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write('[%s] %s%s' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg, chr(10)))
+    except Exception:
+        pass
+
+
+def _fatal(title, text):
+    """窗口起不来时别让用户对着空气——弹一个能读的框，并把详情写进日志。"""
+    _log_always('FATAL %s: %s' % (title, text))
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, ('%s%s%s') % (text[:1200], chr(10), chr(10) + '日志：' + str(_log_path())),
+                                         title, 0x10)
+    except Exception:
+        print(text)
 
 
 def _die(msg):
@@ -103,7 +207,13 @@ def _pick_port():
 def _start_server(port):
     if _port_busy(port):
         return None          # 已有实例在跑，直接复用
-    srv = brain.make_server(port)
+    try:
+        srv = brain.make_server(port)
+    except Exception:
+        import traceback
+        _START_ERR[0] = traceback.format_exc()
+        _log_always('make_server FAILED (port %d):%s%s' % (port, chr(10), _START_ERR[0]))
+        return None
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
@@ -115,7 +225,6 @@ def _win():
         import ctypes
         import ctypes.wintypes as wt
         u = ctypes.WinDLL('user32', use_last_error=True)
-        u.SetProcessDPIAware()
         return u, wt
     except Exception:
         return None, None
@@ -158,6 +267,54 @@ def mini_origin(hwnd=None):
     return max(0, (sw - MINI_W) // 2), max(0, int(sh * 0.17))
 
 
+def system_dark():
+    """跟随系统主题：注册表 AppsUseLightTheme=0 就是深色。"""
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize')
+        v, _ = winreg.QueryValueEx(k, 'AppsUseLightTheme')
+        return int(v) == 0
+    except Exception:
+        return False
+
+
+def effective_dark():
+    """界面主题（auto/dark/light）→ 现在到底是不是深色。"""
+    try:
+        import brain as _b
+        th = (_b._settings_dict() or {}).get('theme', 'auto')
+    except Exception:
+        th = 'auto'
+    if th == 'dark':
+        return True
+    if th == 'light':
+        return False
+    return system_dark()
+
+
+def dark_caption(hwnd, dark=True):
+    """把系统标题栏刷成深色（Win10 1809+ 用属性 19，Win11 用 20）。
+
+    内容区已经是深色、标题栏还是白的那一条，是最扎眼的不一致。
+    设不上就保持系统原样，不影响功能。"""
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        v = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):
+            try:
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(v), 4) == 0:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def round_corners(hwnd):
     """Win11 的 DWM 圆角；Win10 上这个属性号不被识别，返回非 0，忽略即可。
     frameless 窗口是直角矩形，光靠 CSS 圆角会在四角留白，必须让系统裁。"""
@@ -191,6 +348,38 @@ def soft_shadow(hwnd):
         return ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(m)) == 0
     except Exception:
         return False
+
+
+def main_window_size(sw, sh, saved=None):
+    """主窗口默认大小：跟着屏幕走，而不是写死一个数。
+
+    以前按 40%/52% 再夹到 980×660，在 1080p 上只有 860×560 —— 一屏能放下的东西
+    偏偏只给一小块。现在按「宽 55% / 高 66%」算，再夹到 [960×640, 1600×1000]，
+    并且永远不超过屏幕的 92%×90%。1K / 2K / 4K 都能得到合适的一块。
+
+    saved 是上次用户自己拖出来的尺寸（settings.json 的 win_w/win_h），
+    只要它还落在屏幕内就优先用它 —— 别每次启动都把人调好的窗口重置。
+    """
+    try:
+        sw, sh = int(sw), int(sh)
+    except Exception:
+        sw, sh = 1920, 1080
+    if saved:
+        try:
+            w, h = int(saved[0]), int(saved[1])
+            # 存的尺寸限制在「新默认的合理区间」：太窄（旧版 760/1040）和太宽（0.9.23 那版
+            # 默认 1840、被 remember 记下来的）都收进来，否则用户看不到新默认
+            if 1100 <= w <= sw + 40 and 560 <= h <= sh + 40:
+                return min(w, 1400), min(h, 900)
+        except Exception:
+            pass
+    # 「宽一点」但没有占满：默认屏宽 50%、高度 62%，夹到 [1180×720, 1400×900]。
+    # 上一版给到 72%/1840，2560 屏上直接 1840 —— 用户的原话是「我只让你宽一半，这宽了两三倍」。
+    mw = int(min(max(1180, sw * 0.50), 1400))
+    mh = int(min(max(720, sh * 0.62), 900))
+    mw = max(760, min(mw, int(sw * 0.92)))
+    mh = max(520, min(mh, int(sh * 0.90)))
+    return mw, mh
 
 
 def screen_logical_size(hwnd=None):
@@ -289,6 +478,18 @@ def foreground_is(hwnd):
         return False
 
 
+def _is_visible(hwnd):
+    """窗口是不是已显示出来（IsWindowVisible）。用来判断 pywebview 的 show() 有没有生效——
+    hide 之后再 show，.NET Form.Visible 偶尔卡在 False，需要 Win32 ShowWindow 兜底。"""
+    if not hwnd:
+        return False
+    try:
+        import win32gui
+        return bool(win32gui.IsWindowVisible(hwnd))
+    except Exception:
+        return False
+
+
 def foreground_desc():
     """谁占了前台——排查「窗口莫名其妙失焦」时唯一有用的线索"""
     try:
@@ -327,6 +528,23 @@ class Api:
 
     def __init__(self, win=None):
         self._win = win
+        self._open_mini = None      # App 注入：唤出快搜窗（欢迎页按钮用）
+
+    def set_dark(self, dark):
+        """页面切主题时同步系统标题栏，免得「黑内容 + 白标题栏」。"""
+        try:
+            return dark_caption(find_hwnd(MAIN_TITLE), bool(dark))
+        except Exception:
+            return False
+
+    def open_mini(self):
+        """欢迎页「打开快搜窗口」：交给原生去唤，别让 JS 猜窗口在哪。"""
+        try:
+            if self._open_mini:
+                self._open_mini()
+            return True
+        except Exception:
+            return False
 
     def pick_folder(self):
         if webview is None or self._win is None:
@@ -339,6 +557,52 @@ class Api:
             pass
         return ''
 
+    def pick_file(self):
+        """选一个文件拿完整路径（反查用：从浏览器拖进来的文件只有名字，没有路径）。"""
+        if webview is None or self._win is None:
+            return ''
+        try:
+            picked = self._win.create_file_dialog(webview.OPEN_DIALOG)
+            if picked:
+                return picked[0]
+        except Exception:
+            pass
+        return ''
+
+    def open_path(self, p):
+        """打开一个结果（文件、文件夹，或者启动 .exe/.lnk）。
+
+        HTTP 侧的 /open 已经把可执行类拒掉了（那几道门对本地进程可伪造），
+        主窗口双击应用必须从这个原生桥走；白名单口径不变：只能是本次搜索结果里出现过的路径。"""
+        p = str(p or '')
+        if not p or not brain.ev_recent(p):
+            return False
+        try:
+            os.startfile(p)
+        except Exception:
+            return False
+        try:
+            with brain.con_lock:
+                brain.record_open(brain.conn(), p, os.path.isdir(p))
+        except Exception:
+            pass
+        return True
+
+    def reveal(self, p):
+        """在资源管理器里选中这个文件（主窗口 Ctrl+Enter）。
+
+        footer 一直写着「Ctrl+Enter 定位」，但主窗口以前根本没接这个动作——
+        按下去走的是 open_path（直接打开）。补上原生桥。"""
+        p = str(p or '')
+        if not p or not brain.ev_recent(p):
+            return False
+        try:
+            import subprocess
+            subprocess.Popen(['explorer', '/select,', os.path.normpath(p)])
+            return True
+        except Exception:
+            return False
+
 
 class MiniApi:
     """快搜窗的原生能力。打开文件必须过 brain.ev_recent 的白名单——
@@ -348,11 +612,18 @@ class MiniApi:
         self._app = app          # 下划线开头：别让 pywebview 递归展开整个 App
 
     def resize(self, h):
+        """返回 True 表示窗口真的按这个高度改过了。
+
+        窗口还藏着的时候不能 resize（pywebview 会把隐藏窗口弹出来），所以这里要如实
+        告诉页面「这次没改成」——页面那边靠返回值决定要不要记住这个高度，否则一旦在
+        隐藏态算过一次，之后每次打开都按那个旧高度显示，最后一行被切掉。"""
         try:
+            if not self._app.mini_visible:
+                return False
             self._app.resize_mini(int(h))
+            return True
         except Exception:
-            pass
-        return True
+            return False
 
     def hide(self):
         self._app.hide_mini()
@@ -438,33 +709,87 @@ class App:
             text_select=False, focus=True, min_size=(MINI_W, 96),
         )
         self.main_api = Api()
+        self.main_api._open_mini = lambda: self.show_mini()
+        sw, sh = screen_logical_size()
+        saved = None
+        try:
+            import brain as _b
+            _st = _b._settings_dict()
+            if _st.get('win_w') and _st.get('win_h'):
+                saved = (int(_st['win_w']), int(_st['win_h']))
+        except Exception:
+            saved = None
+        MW, MH = main_window_size(sw, sh, saved)
+        self._main_w, self._main_h = MW, MH
+        # WinForms 外壳把 create_window 的 width 当作物理像素，不随 DPI 放大；
+        # 但 WebView2 在 125%/150% 屏上按窗口真实 DPI 渲染 CSS（DPR>1），CSS 视口被
+        # 缩成「物理/DPI」，比设计窄，字号/图标就显得过大。这里先用逻辑尺寸建窗，
+        # after_start 里再按实际 DPI 把物理尺寸补成「逻辑 × DPR」（见 _fit_main_dpi）。
         self.main = webview.create_window(
             MAIN_TITLE, self.main_url,
-            width=1360, height=880, min_size=(900, 600),
+            width=MW, height=MH, min_size=(max(760, int(MW * 0.62)), max(520, int(MH * 0.62))),
             text_select=True, js_api=self.main_api, hidden=self.silent,
         )
         self.main_api._win = self.main
         self.main.events.closing += self._on_main_closing
 
+    def _late_dark_caption(self, tries=6):
+        """窗口刚建好时 DWM 还不接受属性；等一会儿再刷，并随每次显示重刷。"""
+        for _ in range(tries):
+            time.sleep(0.6)
+            try:
+                hw = self.hwnd_main or find_hwnd(MAIN_TITLE)
+                if hw and dark_caption(hw, effective_dark()):
+                    _log('dark caption applied (%s)' % effective_dark())
+                    return
+            except Exception as e:
+                _log('dark caption retry failed: %r' % (e,))
+        _log('dark caption gave up')
+
+    def _remember_size(self):
+        """把用户拖出来的窗口大小记住，下次按这个开（不会因为换分辨率炸掉）。"""
+        try:
+            import brain as _b
+            w, h = self.main.width, self.main.height
+            if 700 <= int(w) <= 4000 and 480 <= int(h) <= 3000:
+                _b._settings_mark('win_w', int(w))
+                _b._settings_mark('win_h', int(h))
+        except Exception:
+            pass
+
     def _on_main_closing(self):
-        """主窗口「关闭」= 收进托盘。托盘没起来就老老实实退出，不留一个看不见的进程。"""
+        """主窗口「关闭」= 收进托盘。托盘没起来就老老实实退出，不留一个看不见的进程。
+
+        不在 closing 事件里直接调 hide()：WinForms 的 FormClosing 里同步调 Hide()
+        偶尔会让消息循环卡住，之后 show() 也不响应。改成延迟 50ms 再 hide，
+        让 FormClosing 先走完 cancel 流程。"""
+        _log(f'_on_main_closing tray={self.tray} ok={getattr(self.tray,"ok",None)}')
+        self._remember_size()
         if self.tray is not None and self.tray.ok:
-            self.main.hide()
+            threading.Timer(0.05, self._safe_hide_main).start()
             self._hint_once()
+            _log('_on_main_closing → return False (收进托盘)')
             return False
+        _log('_on_main_closing → return True (真退出)')
         return True
+
+    def _safe_hide_main(self):
+        """在 closing 事件之外 hide 主窗口，避开 WinForms FormClosing 的时序陷阱。"""
+        try:
+            self.main.hide()
+            _log('_safe_hide_main ok')
+        except Exception as e:
+            _log(f'_safe_hide_main FAILED: {e}')
 
     def _hint_once(self):
         if self._hide_hint_given:
             return
         self._hide_hint_given = True
-        try:
-            self.main.evaluate_js(
-                "window.toast&&window.toast('已收进托盘，双击 Ctrl 随时唤出快搜')")
-        except Exception:
-            pass
+        # 不要在这里调 self.main.evaluate_js —— 关闭中 WebView2 可能还在加载页面，
+        # evaluate_js 会同步等到页面 ready，实测能卡 20 秒（用户感知「点了关闭半天才关掉」）。
+        # 窗口马上要隐藏，toast 没人看，直接用托盘气泡提示就够了。
         try:                     # 窗口都隐藏了就没人看得见提示，用托盘气泡更实在
-            import win32api
+            import win32api      # noqa: F401
             import win32con
             import win32gui
             win32gui.Shell_NotifyIcon(
@@ -478,12 +803,43 @@ class App:
     def after_start(self):
         self.hwnd_mini = wait_hwnd(MINI_TITLE)
         self.hwnd_main = wait_hwnd(MAIN_TITLE)
+        self._fit_main_dpi()
+        self._dbg_autohelp()
         round_corners(self.hwnd_mini)
         soft_shadow(self.hwnd_mini)
+        # 两扇窗都换图标（标题栏 / Alt-Tab / 任务栏读的是同一个 WM_SETICON）
+        apply_window_icon(self.hwnd_main)
+        try:
+            threading.Thread(target=self._late_dark_caption, daemon=True).start()
+        except Exception:
+            pass
+        apply_window_icon(self.hwnd_mini)
         if self.start_mini:
             self.show_mini()
         self.hotkey = self._install_hotkey()
         self.start_tray()
+
+    def _fit_main_dpi(self):
+        """高 DPI 修正：pywebview 基于 .NET WinForms，create_window 的 width 被当作
+        物理像素，不会按显示器 DPI 自动放大；而 WebView2 在 125%/150% 屏上以窗口真实
+        DPI（DPR>1）渲染 CSS，于是 CSS 视口被缩成「物理/DPI」、比设计窄，字号/图标相对
+        就显得过大（即用户看到的「一切都被放大了」）。
+
+        这里把窗口物理尺寸补成「逻辑尺寸 × DPR」，让 CSS 视口回到设计宽度，内容比例
+        恢复正常。dpr==1 时无需调整，直接跳过。"""
+        if not self.hwnd_main:
+            return
+        try:
+            dpi = ctypes.windll.user32.GetDpiForWindow(self.hwnd_main) or 96
+            dpr = dpi / 96.0
+            if dpr == 1.0:
+                return
+            # 实测（150% 屏）：create_window 的尺寸被 WinForms 当物理像素，而 resize()
+            # 自己还会再乘一次 DPR —— 所以这里传「逻辑目标」，CSS 视口才会等于 _main_w。
+            # 旧代码传 _main_w*dpr，等于乘了两次，视口反而被撑到 1.5 倍宽。
+            self.main.resize(int(self._main_w), int(self._main_h))
+        except Exception:
+            pass
 
     def place_mini(self):
         try:
@@ -505,7 +861,7 @@ class App:
         try:
             if not self.hwnd_mini:
                 self.hwnd_mini = wait_hwnd(MINI_TITLE, 2.0)
-            _log('show_mini begin')
+            _log(f'show_mini begin mini={self.mini} hwnd={self.hwnd_mini}')
             self.mini.show()
             self.mini_visible = True
             self.place_mini()          # 位置矫正放在 show 之后：move 本身会触发显示
@@ -527,8 +883,8 @@ class App:
             except Exception:
                 pass
             _log('show_mini done')
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f'show_mini EXCEPTION: {type(e).__name__}: {e}')
 
     def hide_mini(self):
         _log('hide_mini')
@@ -581,14 +937,73 @@ class App:
         threading.Thread(target=_refocus, daemon=True).start()
 
     # -- 主窗口 -------------------------------------------------------
-    def show_main(self, q=None):
+    def show_main(self, q=None, panel=None):
+        """从快搜窗跳过来：show 主窗口 + 设搜索词。
+
+        第一次需要 load_url 加载页面；之后只用 evaluate_js 设置搜索框 + 触发搜索，
+        不再重新加载——每次 load_url 都让 WebView2 重新渲染整页，关闭时如果还在
+        加载中，WebView2 可能进入错误状态，导致后续 show_mini 也跟着失败。"""
         try:
-            target = self.url + ('/?q=' + quote(q) if q else '/')
+            # 先拿到 hwnd（可能在关闭/重开过程中变了），找不到就等一下
+            hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
+            if not hwnd:
+                hwnd = wait_hwnd(MAIN_TITLE, 2.0)
+                if hwnd:
+                    self.hwnd_main = hwnd
+            _log(f'show_main begin q={q!r} hwnd={hwnd} '
+                 f'visible={_is_visible(hwnd)} loaded={getattr(self, "_main_loaded", False)}')
+
             self.main.show()
-            self.main.load_url(target)
-            topmost(self.hwnd_main or find_hwnd(MAIN_TITLE))
-            self.hwnd_main = self.hwnd_main or find_hwnd(MAIN_TITLE)
-        except Exception:
+
+            # pywebview 的 show() 在窗口被 hide 过之后偶尔不生效——Form.Visible 卡在
+            # False。用 Win32 ShowWindow 兜底：直接对原生窗口句柄发 SW_SHOW，绕过
+            # .NET 层。这一步是纯增益，show() 成功了也不冲突。
+            if hwnd:
+                try:
+                    import win32con
+                    import win32gui
+                    if not win32gui.IsWindowVisible(hwnd):
+                        _log(f'show_main: Form.Show() 没生效，用 Win32 SW_SHOW 兜底')
+                        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                except Exception as e:
+                    _log(f'show_main: SW_SHOW fallback FAILED: {e}')
+
+            if hwnd:
+                try:
+                    dark_caption(hwnd, effective_dark())
+                except Exception as e:
+                    _log('dark caption on show failed: %r' % (e,))
+
+            if not getattr(self, '_main_loaded', False):
+                # 首次加载：面板（帮助/关于/设置）直接写进 URL。
+                # 不要再「加载完立刻 evaluate_js」——页面还没 ready，注入必失败；
+                # 用户实测过：窗口出来了但帮助/关于面板没出来，设置干脆没反应。
+                qs = []
+                if q:
+                    qs.append('q=' + quote(q))
+                if panel:
+                    qs.append('panel=' + panel)
+                # 新界面挂在 /web/，面板与搜索词都用 query 传进去（React 自己接）
+                target = self.url + '/web/' + ('?' + '&'.join(qs) if qs else '')
+                self.main.load_url(target)
+                self._main_loaded = True
+            elif panel:
+                # 已加载过：直接改地址栏参数让 React 自己开面板，避免注入时机问题
+                js = "location.href='/web/?panel=%s'" % panel
+                try:
+                    self.main.evaluate_js(js)
+                    _log(f'show_main panel={panel} via url')
+                except Exception as e:
+                    _log(f'show_main panel={panel} url FAILED: {e}')
+            elif q:
+                import json as _j
+                self.main.evaluate_js(f'qEl.value={_j.dumps(q)};go()')
+
+            ok = topmost(hwnd)
+            _log(f'show_main topmost={ok} visible_now={_is_visible(hwnd)} '
+                 f'fg={foreground_desc()}')
+        except Exception as e:
+            _log(f'show_main EXCEPTION: {e}')
             try:
                 webbrowser.open(self.url)
             except Exception:
@@ -602,6 +1017,15 @@ class App:
 
     # -- 钩子 / 托盘 ---------------------------------------------------
     def _install_hotkey(self):
+        """装热键前先看设置：用户可能在前端关掉了双击 Ctrl。
+
+        设置存在 settings.json 的 hotkey 字段，默认开。关掉后 stop hook，
+        再次开启重新 start。前端 /api/hotkey 读写这个文件。"""
+        if not self._hotkey_enabled():
+            _log('双击 Ctrl 热键已被设置关闭，不安装')
+            self._hk_paused = True
+            return None
+        self._hk_paused = False
         try:
             import hotkey
         except Exception:
@@ -615,6 +1039,63 @@ class App:
             print('热键安装失败:', e)
             return None
 
+    @staticmethod
+    def _settings_path():
+        # 必须跟 brain.app_dir() 一致：打包后 __file__ 落在 _internal 里，
+        # 以前写 HERE/settings.json 会写进 _internal，而 brain 从 exe 旁边读，
+        # 表现为"关了热键重启又自己开了"。开发态两者本来就是同一个目录。
+        import brain
+        return brain.app_dir() / 'settings.json'
+
+    @staticmethod
+    def _hotkey_enabled():
+        """读 settings.json 的 hotkey 字段。默认开；文件不存在或格式错也开。"""
+        import json as _j
+        try:
+            p = App._settings_path()
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+                return d.get('hotkey', True)
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _set_hotkey(on):
+        import json as _j
+        p = App._settings_path()
+        d = {}
+        try:
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+        d['hotkey'] = bool(on)
+        p.write_text(_j.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    def set_hotkey(self, on):
+        """前端调 /api/hotkey 切换时，通过 js_api 调到这里，实时启停热键。"""
+        _log(f'set_hotkey on={on}')
+        App._set_hotkey(on)
+        if on and self.hotkey is None:
+            # 重新装
+            import hotkey
+            try:
+                self.hotkey = hotkey.start_double_ctrl(self._hotkey_fired)
+                self._hk_paused = False
+            except Exception as e:
+                _log(f'set_hotkey re-install FAILED: {e}')
+                return False
+            return self.hotkey is not None
+        if not on and self.hotkey is not None:
+            try:
+                self.hotkey.stop()
+            except Exception:
+                pass
+            self.hotkey = None
+            self._hk_paused = True
+        return True
+
     def _hotkey_fired(self):
         with self._lock:
             self.toggle_mini()
@@ -626,15 +1107,100 @@ class App:
             return
         try:
             self.tray = tray.Tray(
-                on_main=lambda: self.show_main(),
+                # 「打开详细搜索」带上快搜窗最后在搜的词，接着刚才的继续查
+                on_main=lambda: self.show_main(brain.LAST_Q or None),
                 on_mini=lambda: self.show_mini(),
                 on_quit=self.quit,
+                on_settings=self.tray_settings,
+                on_about=self.tray_about,
+                on_feedback=self.tray_feedback,
+                on_help=self.tray_help,
                 tip='第二大脑（双击 Ctrl 唤出快搜）',
             )
             if not self.tray.start():
                 self.tray = None
         except Exception:
             self.tray = None
+
+    def _dbg_autohelp(self):
+        """临时诊断：SB_AUTOHELP=1 时 8 秒后自己点一次「使用帮助」，把 traceback 写进日志。"""
+        import os
+        if os.environ.get('SB_AUTOHELP') != '1':
+            return
+
+        def run():
+            import traceback
+            time.sleep(8.0)
+            _log('AUTOHELP: firing tray_help')
+            try:
+                self.tray_help()
+                _log('AUTOHELP: returned ok')
+            except Exception:
+                _log('AUTOHELP EXC: ' + traceback.format_exc().replace(chr(10), ' | '))
+        threading.Thread(target=run, daemon=True).start()
+
+    def open_panel(self, name):
+        """托盘里点「设置 / 关于 / 使用帮助」：把主窗口叫出来并直接摊开对应的面板。
+
+        以前的做法是 show_main() 之后 evaluate_js 注入——那条路有两个坑：
+        页面没加载完注入必然失败；加载中调 evaluate_js 还会把线程卡住。
+        现在面板走 URL 参数，页面自己在启动时摊开，稳。
+        """
+        try:
+            self.show_main(panel=name)
+        except Exception as e:
+            _log(f'open_panel({name}) FAILED: {e}')
+
+    def _main_js(self, code):
+        """在主窗口里跑一小段 JS（目前只是应急口子，托盘三个面板走 open_panel 的 URL 参数）。
+
+        注意：**不要在页面还没加载完的时候调它**。WebView2 在导航过程中调
+        ExecuteScriptAsync 会一直等，实测能把托盘线程卡死十几秒。
+        这里只在窗口已经加载过（_main_loaded 为真）时才注入，失败就记日志。
+        """
+        win = getattr(self, 'main', None)
+        if win is None:
+            _log('_main_js: no main window')
+            return
+        if not getattr(self, '_main_loaded', False):
+            _log('_main_js skipped: main window not loaded yet')
+            return
+        try:
+            self.show_main()
+            win.evaluate_js(code)
+            _log('_main_js ok')
+        except Exception as e:
+            _log(f'_main_js FAILED: {e}')
+
+    def tray_settings(self):
+        # 设置抽屉就是主窗口里那个，别在托盘里另开一个——两处状态会打架。
+        # 注意面板名要跟 React 那边认的一致（settings），写 'cfg' 是旧模板的参数名，
+        # 新界面不认，点了就「什么都没发生」。
+        self.open_panel('settings')
+
+    def tray_help(self):
+        # 快捷键太多，塞不进菜单，统一放进主窗口里的帮助面板
+        self.open_panel('help')
+
+    def tray_about(self):
+        self.open_panel('about')
+
+    def tray_feedback(self):
+        """反馈：打开 GitHub 的 issues 页。
+        没有网络/没装浏览器就退回复制联系方式，别让按钮点了没反应。"""
+        url = 'https://github.com/%s/issues' % getattr(brain, 'REPO_SLUG', 'bslnssb/second-brain')
+        try:
+            import webbrowser
+            ok = webbrowser.open(url)
+        except Exception:
+            ok = False
+        if not ok:
+            try:
+                import tkinter as tk
+                r = tk.Tk(); r.withdraw()
+                r.clipboard_clear(); r.clipboard_append(url); r.update(); r.destroy()
+            except Exception:
+                pass
 
     def quit(self):
         try:
@@ -652,6 +1218,69 @@ class App:
 
 
 # ------------------------------------------------------------------ 入口
+def _start_prune_after_boot():
+    """启动 5 秒后跑一次 prune：把搜索结果里那些已不存在的路径（C 盘旧位置等）
+    从索引里彻底清掉。竞品 Listary/Everything 启动时都会做这事——结果必须可点。
+
+    失败也不影响主程序：只是一次后台清理，没成下次还会再做。"""
+    def _do():
+        try:
+            time.sleep(5)
+            # 不套 con_lock：prune 自己开连接、自己提交，套上这把锁只会让
+            # 启动后头几秒的搜索全排队（实测冻结 3~5 秒）
+            gone = brain.prune()
+            if gone:
+                _log(f'boot prune: removed {gone} stale paths')
+        except Exception as e:
+            _log(f'boot prune FAILED: {e}')
+    threading.Thread(target=_do, daemon=True).start()
+
+
+_MUTEX_NAME = 'Local\\SecondBrain.Desktop.SingleInstance'
+_MUTEX_H = None
+
+
+def _activate_running():
+    """把已经在跑的那份叫到前面来。"""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        for title in ('Second Brain · 第二大脑', '第二大脑（双击 Ctrl 唤出快搜）'):
+            hwnd = u.FindWindowW(None, title)
+            if hwnd:
+                u.ShowWindow(hwnd, 9)          # SW_RESTORE
+                u.SetForegroundWindow(hwnd)
+                return True
+    except Exception as e:
+        _log(f'activate existing FAILED: {e}')
+    return False
+
+
+def _single_instance():
+    """True = 第一个实例，继续；False = 已经有一个在跑（已尝试叫到前面）。
+
+    之前只靠端口判断，第二个实例可能给页面注入自己的 js_api，结果「搜得到点不动」。
+    SB_ALLOW_MULTI=1 可以绕过（调试/测试用）。"""
+    if os.environ.get('SB_ALLOW_MULTI') == '1':
+        return True
+    global _MUTEX_H
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.CreateMutexW(None, False, _MUTEX_NAME)
+        if not h:
+            return True
+        if k.GetLastError() == 183:            # ERROR_ALREADY_EXISTS
+            _log('single instance: another copy is running')
+            _activate_running()
+            return False
+        _MUTEX_H = h                           # 保持句柄，进程退出自动释放
+        return True
+    except Exception as e:
+        _log(f'single instance FAILED: {e}')
+        return True
+
+
 def main(query=None, show_settings=False, lang=None, silent=False, start_mini=False):
     """开窗口。
 
@@ -664,14 +1293,26 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
     这几个参数让 `SecondBrain.exe 关键词`、`SecondBrain.exe --settings`、
     `SecondBrain.exe --silent` 能从快捷方式 / 开机自启直达，省掉双击后再操作。
     """
+    if not _single_instance():
+        print('第二大脑已经在运行了，已把窗口叫到前面。')
+        return
     port = _pick_port()
     if not port:
         print(f'端口 {BASE_PORT}~{BASE_PORT + PORT_TRIES - 1} 都被占用，无法启动。')
         print('请关掉占用端口的程序后重试。')
         return
     url = f'http://127.0.0.1:{port}'
-    _start_server(port)
+    srv = _start_server(port)
+    if srv is None and _START_ERR[0]:
+        tail = _START_ERR[0].strip().splitlines()[-1]
+        _fatal('第二大脑启动失败',
+               ('本地服务没能起来，所以窗口里只会显示「127.0.0.1 未发送任何数据」。'
+                + chr(10) + chr(10) + '错误：' + tail
+                + chr(10) + chr(10) + '常见原因：程序目录写不进去（只读位置 / 安全软件锁定 / 解压不完整）。'
+                + '把整个文件夹挪到桌面或文档下面再试一次。'))
+        return
     brain.start_pinyin_backfill()   # 老库补拼音（11 万条十几秒），后台跑，不挡窗口
+    _start_prune_after_boot()       # 启动后台清理失效路径，跟 Listary/Everything 启动重扫一个思路
 
     params = []
     if query:
@@ -689,9 +1330,40 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
         threading.Event().wait()
         return
 
+    # 给这个进程一个自己的 AppUserModelID：不然源码版跑起来，任务栏把它归到
+    # python.exe 名下，显示的是 Python 的图标（用户反馈过「图标太丑」就是那张）。
+    # 必须在建窗之前设，窗口一创建 Windows 就把任务栏按钮绑到这个 ID 上。
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            'SecondBrain.Desktop')
+    except Exception as e:
+        _log(f'AppUserModelID FAILED: {e}')
     app = App(url, main_url=target, silent=silent, start_mini=start_mini)
-    app.create()
-    webview.start(func=app.after_start, debug=False)
+    try:
+        app.create()
+        webview.start(func=app.after_start, debug=False)
+    except Exception as e:
+        # pythonnet（pywebview 的 WinForms 后端）在两种环境下会加载失败：
+        #   1) 程序放在带 Low 完整性标签的目录里（例如 D:\1\项目\…）；
+        #   2) 机器缺 .NET / WebView2 运行时。
+        # 此时窗口开不出来，但本地服务是好的 —— 退到浏览器模式，至少能继续用。
+        _log(f'webview.start FAILED: {type(e).__name__}: {e}')
+        try:
+            webbrowser.open(target)
+        except Exception:
+            pass
+        _fatal('第二大脑：窗口启动失败，已改用浏览器打开',
+               ('窗口组件（WebView2 / .NET）没能加载，界面已经在默认浏览器里打开：'
+                + chr(10) + target
+                + chr(10) + chr(10) + '错误：' + f'{type(e).__name__}: {e}'
+                + chr(10) + chr(10)
+                + '两条常见原因：'
+                + chr(10) + '1) 程序所在目录被标成了「低完整性」（沙箱/网盘同步目录常见）——'
+                + '把整个文件夹复制到 D:\\ 下再双击；'
+                + chr(10) + '2) 缺 WebView2 运行时 —— https://developer.microsoft.com/microsoft-edge/webview2/'
+                + chr(10) + chr(10) + '这个窗口点确定后，程序会继续在托盘里运行。'))
+        threading.Event().wait()
 
 
 def _parse_window_args(argv):
@@ -762,7 +1434,7 @@ def _run_window(query, show_settings, lang, silent=False, start_mini=False):
              f'https://developer.microsoft.com/microsoft-edge/webview2/')
 
 
-if __name__ == '__main__':
+def _boot():
     argv = sys.argv[1:]
     rest, show_settings, lang, silent, start_mini = _parse_window_args(argv)
     # 第一个剩余 token 是已知子命令（update / search / selftest…）→ 走命令行
@@ -787,3 +1459,14 @@ if __name__ == '__main__':
         _run_window(query, show_settings, lang, silent, start_mini)
     else:
         _run_window(None, False, None)
+
+
+if __name__ == '__main__':
+    try:
+        _boot()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        _fatal('第二大脑启动失败', traceback.format_exc()[-1200:])
+        sys.exit(3)

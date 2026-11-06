@@ -20,6 +20,17 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 <p align="center"><sub>主窗口是「详细搜索」：正文检索、命中原句、类型与路径过滤。右上角可切 EN</sub><br>
 <img src="assets/screenshot-en.png" width="620" alt="第二大脑 exe 窗口的英文界面"></p>
 
+
+## 文档 / Docs
+
+| 语言 | 文件 |
+|---|---|
+| 中文（完整参考） | [使用说明.md](使用说明.md) |
+| English | [使用说明.en.md](使用说明.en.md) |
+| Español | [使用说明.es.md](使用说明.es.md) |
+| Português | [使用说明.pt.md](使用说明.pt.md) |
+| हिन्दी | [使用说明.hi.md](使用说明.hi.md) |
+
 ## 特性
 
 - **双击 Ctrl 快搜**：任何地方连按两下 Ctrl，屏幕上方弹出搜索框，敲两个字出结果，`↑↓` 选、`Enter` 开、`Ctrl+1~9` 直接开第 N 条、`Esc` 收起
@@ -27,9 +38,10 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 - **正文命中进快搜窗**：名字里没有、正文里有的，停手 300ms 后自动补进来，带紫色「正文」标签和命中那句话——这是只看文件名的工具做不到的
 - **真实系统图标**：每行显示该扩展名在资源管理器里的同一张图标（PDF 红、Word 蓝、Excel 绿），不是自绘简笔画
 - **中文全文搜索**：≥3 字走 FTS5 trigram 倒排（快且带高亮），1~2 字自动降级 LIKE 兜底
-- **扫描件自动 OCR**：纯图片 PDF 自动识别前 15 页，离线中文识别（RapidOCR），装好后零联网
+- **扫描件自动 OCR**：纯图片 PDF 自动识别前 6 页（单篇 20 秒预算），离线中文识别（RapidOCR），装好后零联网
 - **格式覆盖广**：PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
 - **增量维护**：改过的文件自动重索引，删掉的自动清理，已索引的秒跳过
+- **索引范围看得见**：设置里一眼看到扫了哪几个盘、各多少条、正文收了哪些文件夹、排除了什么；`exclude_dirs` 对文件名索引和正文索引同时生效（排除游戏库后，本机从 60 万条降到 20 万条）
 - **断点续建**：索引几万篇时中断也不要紧，重跑从断点继续
 - **中英双语界面**：右上角有 中 / EN 切换，默认跟随系统语言，选择会记住
 - **质量自检（少见但重要）**：`python brain.py selftest` 用合成数据独立验证检索准确率、双 PDF 引擎交叉比对、OCR 字符错误率、9 类畸形文件 fuzz、数据库完整性，报告可任何人重跑复核
@@ -39,7 +51,7 @@ Python + SQLite FTS5 实现，一个 `brain.db` 装下所有正文，断网可�
 
 | 方式 | 适合谁 | 怎么开始 |
 |---|---|---|
-| **下载 exe**（免安装） | 不想碰命令行 | 去 [Releases](https://github.com/bslnssb/second-brain/releases/latest) 下 `SecondBrain-Windows.zip`（带 OCR，下载 165MB，解压后约 321MB）或 `SecondBrain-Core-Windows.zip`（不带 OCR，下载 27MB，解压后约 53MB），解压到任意文件夹，双击 `SecondBrain.exe` 即开窗口 |
+| **下载 exe**（免安装） | 不想碰命令行 | 去 [Releases](https://github.com/bslnssb/second-brain/releases) 页面下 `SecondBrain-Windows.zip`（带 OCR，约 165MB，解压后约 340MB）或 `SecondBrain-Core-Windows.zip`（不带 OCR，约 27MB，解压后约 55MB），解压到任意文件夹，双击 `SecondBrain.exe` 即开窗口。**目前还没有正式 Release**（v0.8 只在本机），页面空着就是还没发 |
 | **从源码跑** | 想改代码 / 想看清每一步 | 按下面「安装」走，装好依赖再启动 |
 
 exe 版和源码版读写**同一个** `brain.db`，两者可以混用；把 exe 丢进已有索引库的目录，它会自动认旁边的库。
@@ -96,7 +108,8 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 
 1. 双击 `SecondBrain.exe` 打开主窗口，点右上角「⚙ 设置 / 更新」
 2. 点「🚀 智能扫描全盘」——程序自动找出值得索引的文件夹，列出来让你确认后建库
-3. 扫描完成后点「🗂 重建文件名索引」（约 30 秒~3 分钟，取决于文件数）——这是快搜窗的数据来源，
+3. 扫描完成后点「🗂 重建文件名索引」（约 30 秒~3 分钟，取决于文件数）——这是快搜窗的数据来源；
+   首次打开会自动做这一步，不用手点，
    只记名字不读内容，把全盘的文件名和文件夹名收进索引
 4. **日常维护**：来了新文档，设置里点「🔄 按现有范围更新」；挪动了大批文件，再点一次「🗂 重建文件名索引」
 
@@ -131,7 +144,7 @@ cp scope.example.json scope.json    # Windows: copy scope.example.json scope.jso
 |---|---|---|---|
 | Everything | 最强，实时 | 做不到 | 跟盘实时 |
 | Listary | 强，还带拼音和启动器 | 做不到（要靠搭档 Gety） | 跟盘实时 |
-| **第二大脑** | 够用：全盘 60 万文件名 + 12 万文件夹名，前缀 0.2ms，带拼音 | **快搜窗里就有** | 手动「重建文件名索引」 |
+| **第二大脑** | 够用：全盘文件名 + 文件夹名（可排除游戏库/素材盘，本机 60 万降到 20 万），前缀 0.2ms，带拼音 | **快搜窗里就有** | 手动「重建文件名索引」 |
 
 装过 Everything 的老用户还能用 `/api/files` 那条兜底通道（装 Everything 并开着它的 HTTP 服务时生效），
 但那只是给「已经装了 Everything、还没建过文件名索引」的人准备的过渡路径，正常用不到。
@@ -193,7 +206,7 @@ python brain.py selftest            # 质量自检，报告写入 eval_report.tx
 | 格式 | 支持 | 说明 |
 |---|---|---|
 | .txt / .md | 是 | 自动识别 utf-8 / gbk / utf-16，另有 gb18030 兜底 |
-| .pdf | 是 | pypdf 抽前 20 页；纯扫描件自动 OCR 前 15 页（单篇 60 秒预算） |
+| .pdf | 是 | pypdf 抽前 20 页；纯扫描件自动 OCR 前 6 页（单篇 20 秒预算） |
 | .docx / .pptx / .xlsx / .epub | 是 | zip + XML 解包取文本，无外部依赖 |
 | .html / .htm | 是 | 去标签取正文 |
 | .rtf | 是 | 去控制字取正文；中文按文档自带的 `\ansicpg` 代码页解码，`\'b1\'a3` 这类 GBK 字节转义和 `\uNNNN` 都能正确还原 |

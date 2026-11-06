@@ -20,6 +20,17 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 <p align="center"><sub>Same index, switched to Chinese in the top-right corner — the UI language never changes what gets indexed</sub><br>
 <img src="assets/screenshot-zh.png" width="620" alt="Second Brain exe window, Chinese interface"></p>
 
+
+## 文档 / Docs
+
+| 语言 | 文件 |
+|---|---|
+| 中文（完整参考） | [使用说明.md](使用说明.md) |
+| English | [使用说明.en.md](使用说明.en.md) |
+| Español | [使用说明.es.md](使用说明.es.md) |
+| Português | [使用说明.pt.md](使用说明.pt.md) |
+| हिन्दी | [使用说明.hi.md](使用说明.hi.md) |
+
 ## Features
 
 - **Double-tap Ctrl quick search** — tap Ctrl twice anywhere and a search box drops down from the top of the screen: type two characters, pick with `↑↓`, `Enter` to open, `Ctrl+1`–`Ctrl+9` to open the Nth row, `Esc` to dismiss
@@ -27,7 +38,7 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 - **Content hits in the quick window** — if the keyword isn't in any file *name* but is inside a document, the match still shows up after a 300 ms pause, with a purple "正文/content" tag and the matching sentence. Neither Listary nor Everything does this
 - **Real system icons** — each row shows the actual icon the OS uses for that extension (red PDF, blue Word, green Excel), not a hand-drawn placeholder
 - **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
-- **Automatic OCR for scans** — image-only PDFs get their first 15 pages recognised offline (RapidOCR); no network after install
+- **Automatic OCR for scans** — image-only PDFs get their first 6 pages recognised offline (RapidOCR); no network after install
 - **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
 - **Incremental maintenance** — modified files are re-indexed, deleted files are pruned, unchanged files are skipped instantly
 - **Resumable indexing** — interrupt a 50k-file build and restart it; it continues where it stopped
@@ -39,7 +50,7 @@ Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it work
 
 | Way | Who it's for | How to start |
 |---|---|---|
-| **Download the exe** (no install) | You'd rather not touch a terminal | From [Releases](https://github.com/bslnssb/second-brain/releases/latest) take `SecondBrain-Windows.zip` (with OCR, 165 MB download / ~321 MB unpacked) or `SecondBrain-Core-Windows.zip` (no OCR, 27 MB / ~53 MB), unzip anywhere, double-click `SecondBrain.exe` |
+| **Download the exe** (no install) | You'd rather not touch a terminal | From the [Releases](https://github.com/bslnssb/second-brain/releases) page take `SecondBrain-Windows.zip` (with OCR, ~165 MB / ~340 MB unpacked) or `SecondBrain-Core-Windows.zip` (no OCR, ~27 MB / ~55 MB), unzip anywhere, double-click `SecondBrain.exe`. **There is no public release yet** (v0.8 is local only), so an empty page just means it has not shipped |
 | **Run from source** | You want to read or change the code | Follow *Install* below |
 
 The exe and the source version read and write the **same** `brain.db`, so you can mix them — drop the exe next to an existing library and it picks it up automatically.
@@ -206,7 +217,7 @@ own scan root automatically (since v6.0), so nothing is missed.
 | Format | Supported | Notes |
 |---|---|---|
 | .txt / .md | Yes | Detects utf-8 / gbk / utf-16, gb18030 as a fallback |
-| .pdf | Yes | pypdf reads the first 20 pages; image-only files get OCR on the first 15 (60 s budget) |
+| .pdf | Yes | pypdf reads the first 20 pages; image-only files get OCR on the first 6 (20 s budget) |
 | .docx / .pptx / .xlsx / .epub | Yes | zip + XML unpacking, no external dependencies |
 | .html / .htm | Yes | Tags stripped, body text kept |
 | .rtf | Yes | Control words stripped; Chinese is decoded with the document's own `\ansicpg` codepage, so `\'b1\'a3`-style GBK and `\uNNNN` escapes both survive |

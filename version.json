@@ -1,6 +1,6 @@
 {
-  "version": "v0.9.19",
+  "version": "v0.9.44",
   "published": "2026-11-06",
   "page": "https://github.com/bslnssb/second-brain/releases",
-  "notes": "本地搜索：文件名 + 正文。本文件由发版脚本更新，客户端检查更新时优先读它（国内可直连 jsDelivr）。"
+  "notes": "修安装器在安装目录叫 SecondBrain 时报 [WinError 2]；设置里新增「索引范围」；排除目录对文件名索引同样生效。本文件由发版脚本更新，客户端检查更新时优先读它（国内可直连 jsDelivr）。"
 }

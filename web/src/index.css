@@ -1,0 +1,68 @@
+/* 颜色用 RGB 三元组，Tailwind 才能拼 alpha（bg-card/60） */
+:root {
+  --sb-bg: 244 246 250;
+  --sb-card: 255 255 255;
+  --sb-ink: 26 34 51;
+  --sb-sub: 92 104 128;
+  --sb-line: 226 231 240;
+  --sb-accent: 37 99 235;
+  --sb-side: 107 116 136;
+}
+
+[data-theme='dark'] {
+  --sb-bg: 24 27 33;
+  --sb-card: 31 35 43;
+  --sb-ink: 232 236 244;
+  --sb-sub: 154 164 182;
+  --sb-line: 52 58 70;
+  --sb-accent: 110 141 248;
+  --sb-side: 154 164 182;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: rgb(var(--sb-bg));
+  color: rgb(var(--sb-ink));
+  font-family: 'Microsoft YaHei UI', 'Segoe UI', system-ui, sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 细滚动条：Windows 默认那条太宽，列表里很扎眼 */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgb(var(--sb-line));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--sb-side));
+  background-clip: padding-box;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 正文命中：同一色系的淡底，不做荧光黄——满屏高亮会把「是哪份文件」盖掉 */
+mark.hl {
+  background: rgb(var(--sb-accent) / 0.14);
+  color: rgb(var(--sb-ink));
+  font-weight: 600;
+  border-radius: 3px;
+  padding: 0 2px;
+}
+[data-theme='dark'] mark.hl {
+  background: rgb(var(--sb-accent) / 0.28);
+  color: #eef1f7;
+}
