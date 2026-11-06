@@ -99,11 +99,19 @@ def rotate(keep: int) -> None:
         print(f'[3/3] 备份共 {len(sets)} 份，未超过 {keep} 份，不清理')
         return
     freed = 0
+    stuck = []
     for q in drop:
         freed += tree_size(q)
         shutil.rmtree(q, ignore_errors=True)
+        # ignore_errors 会让「删不掉」彻底静默：2026-11-06 就撞过一次，
+        # 备份攒到 5 份、1.6 GB，日志却一路说清理成功。删完必须复查。
+        if q.exists():
+            stuck.append(q.name)
     print(f'[3/3] 清理 {len(drop)} 份旧备份，释放 {human(freed)}；'
           f'保留 {len(sets) - len(drop)} 份')
+    if stuck:
+        print(f'[!] 有 {len(stuck)} 份没删掉（多半被资源管理器/杀软占用），'
+              f'手动删：{BACKUP_ROOT} → ' + '、'.join(stuck))
 
 
 def main() -> int:

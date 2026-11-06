@@ -91,3 +91,22 @@ git push --force-with-lease origin master
 
 > 为什么词表单独一个文件：脚本自己也在仓库里，词表明文写在脚本里会被脚本自己扫出来
 > （第一版就是这样，自己把自己判成 FAIL）。扫描时会跳过这两个文件。
+
+## 本地目录里什么会膨胀（不影响 git，但会吃掉几个 GB）
+
+`.gitignore` 挡住了它们，所以不会误传，但它们会一直堆：
+
+| 位置 | 每份多大 | 什么时候生成 | 什么时候能删 |
+|---|---|---|---|
+| `dist/SecondBrain-old-*` | 约 330 MB | 打包前 `mv dist/SecondBrain dist/SecondBrain-old-<hhmm>`（见坑 11） | **新版本验收通过后立刻删** |
+| `build/` | 约 210 MB | PyInstaller 每次构建 | 构建成功即可删，下次自动重建 |
+| `payload.zip` | 约 170 MB | `make_payload.py` | 安装器打成功后即可删 |
+| `dist/SecondBrain-Setup.exe` | 约 170 MB | 打安装器的中间产物 | 已 `stage_setup.py` 复制出带版本号的安装包后即可删 |
+| `*.log`、`debug.log` | 几 MB | 调试时重定向的日志 | 随手删 |
+
+`dist/SecondBrain` **本体留着** —— 下次 PyInstaller 能增量复用，比全量重打快几分钟。
+
+> ⚠️ Windows 上 `rm -rf` 可能被资源管理器或安全软件占着 DLL 而删不掉，
+> 而且**退出码可能仍是 0**。删完务必重新 `ls` 确认，别信 `&&` 链。
+> 同理，`stage_app.py` 的备份轮转以前用 `ignore_errors=True`，删失败也不吭声，
+> 攒到 5 份 / 1.6 GB 才发现；现在它会打印 `[!]` 列出没删掉的目录。
