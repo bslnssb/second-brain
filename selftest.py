@@ -394,12 +394,12 @@ def run_all(verbose=True, write_report=True):
         real_jidx = brain._dir_index
         try:
             jroot = Path(tempfile.mkdtemp(prefix='sb-repair-'))
-            jold = jroot / 'DeskBox' / '1' / '我的文件夹'
+            jold = jroot / 'oldplace' / '1' / 'library'
             (jold / 'a').mkdir(parents=True)
             for n in ('doc1.docx', 'doc2.pdf', 'a/x.md'):
-                (jold / n).write_text('渗透测试 ' + n, encoding='utf-8')
+                (jold / n).write_text('测试内容 ' + n, encoding='utf-8')
             (jroot / '1').mkdir()
-            jnew = jroot / '1' / '我的文件夹'
+            jnew = jroot / '1' / 'library'
             shutil.move(str(jold), str(jnew))        # 搬家：旧目录消失
             jscope = jroot / 'scope.json'
 
@@ -431,7 +431,7 @@ def run_all(verbose=True, write_report=True):
 
             # J1：唯一同名目录 + 抽检全中 → 自动平移，且范围配置跟着改、留了备份
             _jfill()
-            brain._dir_index = lambda root: {'我的文件夹': [str(jnew)]}
+            brain._dir_index = lambda root: {'library': [str(jnew)]}
             left = brain._repair_then_recheck([str(jold)], str(jscope))
             moved = _jcount(str(jnew))
             data = json.loads(jscope.read_text(encoding='utf-8'))
@@ -445,9 +445,9 @@ def run_all(verbose=True, write_report=True):
 
             # J2：同名但里面根本不是那批文件 → 一条不改（宁可不动，也不猜）
             _jfill()
-            decoy = jroot / 'decoy' / '我的文件夹'
+            decoy = jroot / 'decoy' / 'library'
             decoy.mkdir(parents=True)
-            brain._dir_index = lambda root: {'我的文件夹': [str(decoy)]}
+            brain._dir_index = lambda root: {'library': [str(decoy)]}
             fixed2 = brain.repair_scope([str(jold)], str(jscope))
             data2 = json.loads(jscope.read_text(encoding='utf-8'))
             ok2 = (fixed2 == [] and _jcount(str(jold)) == 3
@@ -458,14 +458,14 @@ def run_all(verbose=True, write_report=True):
 
             # J3：两个都像 → 不在黑窗里猜，把候选交给界面点选（点完才动库）
             _jfill()
-            d1 = jroot / 'p1' / '我的文件夹'
-            d2 = jroot / 'p2' / '我的文件夹'
+            d1 = jroot / 'p1' / 'library'
+            d2 = jroot / 'p2' / 'library'
             for d in (d1, d2):
                 (d / 'a').mkdir(parents=True)
                 for n in ('doc1.docx', 'doc2.pdf'):
-                    (d / n).write_text('渗透测试', encoding='utf-8')
-                (d / 'a' / 'x.md').write_text('渗透测试', encoding='utf-8')
-            brain._dir_index = lambda root: {'我的文件夹': [str(d1), str(d2)]}
+                    (d / n).write_text('测试内容', encoding='utf-8')
+                (d / 'a' / 'x.md').write_text('测试内容', encoding='utf-8')
+            brain._dir_index = lambda root: {'library': [str(d1), str(d2)]}
             brain.REPAIR_ASK.update(state='idle', old='', items=[], scope='')
             fixed3 = brain.repair_scope([str(jold)], str(jscope))
             ask = dict(brain.REPAIR_ASK)

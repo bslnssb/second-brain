@@ -4595,7 +4595,7 @@ def _drive_root(p):
 
 # 「更新」是一条链：扫清单 → 入库 → 清理。清理这一步是唯一会删数据的，
 # 而它原先只判断「这个文件还在不在」，压根不知道「我索引的那个文件夹本身没了」
-# 意味着地址变了、不是文件被删了。2026-11-04 整块工作目录从 DeskBox\1 搬到 D:\1，
+# 意味着地址变了、不是文件被删了。2026-11-04 整块工作目录换了一次位置，
 # 就是靠这一点一次抹掉了 3967 条文档记录（重扫要一两个小时 + 重跑 OCR）。
 # 下面三个常量/函数是给它补的护栏：
 #   ① 索引范围里的目录不存在 → 它名下整体跳过（对应 prune 里的 ②）
@@ -5032,7 +5032,7 @@ def save_scope(targets, scope_path=None):
 
 # ── 第 2 层：范围搬家了，自己认亲并平移 ──────────────────────────────────
 # 第 1 层只会"停下不动"。可真搬一次家，用户看到的就是"更新用不了、搜索点开全没了"
-# ——2026-11-04 那次 DeskBox\1 → D:\1 就是这个形态。这一层做的是：
+# ——2026-11-04 那次整目录搬迁就是这个形态。这一层做的是：
 #   ① 发现范围目录不在了 → 在本机找同名文件夹当候选；
 #   ② 拿库里那批"旧地址"下的文件做抽检，新位置对上八成以上才算认亲；
 #   ③ 一次事务把 6 个路径列 + 正文库的 path 平移过去，并把 scope.json 里那行改写。
@@ -5126,7 +5126,7 @@ def _candidates_by_suffix(old, con):
             i = ql.rfind(suf)
             if i <= 0:
                 continue
-            cand = os.path.normpath(q[:i + 1 + len(leaf)])   # 带上"我的文件夹"这一级本身
+            cand = os.path.normpath(q[:i + 1 + len(leaf)])   # 带上"资料"这一级本身
             k = os.path.normcase(cand)
             if k in seen or k == os.path.normcase(old):
                 continue
@@ -5442,8 +5442,8 @@ def prune(force=False, scope_path=None):
         _prog(state='error', err=msg, k='e_prune_bulk',
               a={'n': len(gone), 'total': total, 'p': dead[0] if dead else ''})
         return 0
-    # ④-补：全局比例看不见「某个子目录整块被搬走」——实测「我的文件夹」只丢 16%、
-    # 「女子监狱」12.8%，都低于 50% 的全局阈值，可那正是一次搬家。
+    # ④-补：全局比例看不见「某个子目录整块被搬走」——实测单个子目录只丢 16%、
+    # 另一个 12.8%，都低于 50% 的全局阈值，可那正是一次搬家。
     # 但「清桌面、删下载」也会让一批文件消失，只是它们是散着删的，文件夹还在。
     # 所以这里不看比例，看「有没有一整层文件夹连人带文件一起没了」：
     # 某个目录自己已经不存在，且它名下有 >= PRUNE_SCOPE_MIN 条记录同时消失。
@@ -6867,7 +6867,7 @@ body.gridmode .thead{display:none}
 <div class=hrow><span class=hk>size:>10m</span><span class=ht data-i18n="hp_q2">按大小；也支持 &lt; 和区间 1k-2m</span></div>
 <div class=hrow><span class=hk>dm:7d</span><span class=ht data-i18n="hp_q3">最近 7 天改过的；2w 两周、1m 一个月</span></div>
 <div class=hrow><span class=hk>-草稿</span><span class=ht data-i18n="hp_q4">排除路径里带这个词的</span></div>
-<div class=hrow><span class=hk>网安学习/</span><span class=ht data-i18n="hp_q5">只看这个文件夹（末尾加斜杠）</span></div>
+<div class=hrow><span class=hk>资料/</span><span class=ht data-i18n="hp_q5">只看这个文件夹（末尾加斜杠）</span></div>
 <div class=hrow><span class=hk>content:</span><span class=ht data-i18n="hp_q6">只搜正文，不要文件名凑数</span></div>
 </div>
 <div class=hsec><div class=hst data-i18n="hp_s_more">其它好用的</div>

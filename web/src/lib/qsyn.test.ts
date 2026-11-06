@@ -63,8 +63,8 @@ describe('parseQSyn', () => {
   })
 
   it('文件夹用尾斜杠，两种斜杠都认', () => {
-    expect(parseQSyn('网安学习/ 笔记').folder).toBe('网安学习')
-    expect(parseQSyn('网安学习\\ 笔记').folder).toBe('网安学习')
+    expect(parseQSyn('资料/ 笔记').folder).toBe('资料')
+    expect(parseQSyn('资料\\ 笔记').folder).toBe('资料')
   })
 
   it('content: 只搜正文', () => {
