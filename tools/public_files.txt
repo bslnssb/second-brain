@@ -18,9 +18,13 @@
 sync  brain.py
 sync  setup_app.py
 sync  selftest.py
+sync  preflight.py
 sync  tests/test_settings.py
 sync  tests/test_brain_pure.py
+sync  tests/test_brain_pure2.py
 sync  tests/test_autostart_setup.py
+sync  tests/test_apprank.py
+sync  tests/test_scan_docs.py
 sync  app_window.py
 sync  hotkey.py
 sync  tray.py

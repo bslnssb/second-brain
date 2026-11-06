@@ -151,7 +151,7 @@ def check_update(timeout=8):
            'page': info.get('html_url') or ('https://github.com/%s/releases' % REPO_SLUG),
            'published': (info.get('published_at') or '')[:10],
            'newer': False, 'legacy': False, 'asset': None}
-    if latest[0] >= 6:
+    if latest[0] == 6:
         out['legacy'] = True          # 线上最新还是旧版本线 v6.x
         return out
     out['newer'] = latest > cur
@@ -187,7 +187,7 @@ def _ver_from_json(info):
            'page': str(info.get('page') or ('https://github.com/%s/releases' % REPO_SLUG)),
            'published': str(info.get('published') or '')[:10],
            'newer': False, 'legacy': False, 'asset': None}
-    if latest[0] >= 6:
+    if latest[0] == 6:
         out['legacy'] = True
         return out
     out['newer'] = latest > cur
