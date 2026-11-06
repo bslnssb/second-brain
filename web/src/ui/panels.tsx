@@ -567,7 +567,7 @@ function DonateQR() {
       <div className="grid h-[104px] w-[104px] shrink-0 place-items-center rounded-md border border-dashed border-line text-center text-[10px] leading-4 text-sub">
         {t('donate_drop1')}
         <br />
-        放到 assets/
+        {t('donate_put')}
       </div>
     )
   const cur = items[Math.min(pick, items.length - 1)]
@@ -590,7 +590,7 @@ function DonateQR() {
       <button onClick={() => setZoom(true)} title={t('donate_zoom')} className="shrink-0">
         <img
           src={src}
-          alt="赞赏码"
+          alt={t('donate_alt')}
           className="h-[180px] w-[180px] rounded-md border border-line object-contain hover:border-accent"
         />
       </button>
@@ -609,7 +609,7 @@ function DonateQR() {
           onClick={() => setZoom(false)}
           title={t('donate_close')}
         >
-          <img src={src} alt="赞赏码" className="max-h-[86vh] max-w-[86vw] rounded-lg bg-white p-3 shadow-2xl" />
+          <img src={src} alt={t('donate_alt')} className="max-h-[86vh] max-w-[86vw] rounded-lg bg-white p-3 shadow-2xl" />
         </div>
       )}
       {items.length > 1 && (
@@ -688,7 +688,7 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
   }, [open])
 
   const doCheck = async () => {
-    setUp({ state: 'busy', text: '检查中…' })
+    setUp({ state: 'busy', text: t('about_checking') })
     const r = await checkUpdate()
     if (!r.ok) {
       // 国内直连 GitHub 经常超时，这里说人话，并把「手动下载」入口给出来
@@ -708,7 +708,7 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
     const r = await applyUpdate()
     if (!r.ok) {
       setInstalling(false)
-      setUp({ state: 'err', text: '下载失败：' + (r.err || '未知原因') })
+      setUp({ state: 'err', text: t('about_dl_fail').replace('{e}', String(r.err || t('about_unknown'))) })
     }
   }
 
@@ -823,7 +823,7 @@ function Modal({
       >
         <div className="flex items-center justify-between pb-3">
           <span className="text-[15px] font-semibold">{title}</span>
-          <button onClick={onClose} className="text-sub hover:text-ink" aria-label="关闭">
+          <button onClick={onClose} className="text-sub hover:text-ink" aria-label={t('close')}>
             <IconClose size={16} />
           </button>
         </div>
@@ -848,7 +848,7 @@ function iconForName(p: string) {
 function RowIcon({ row }: { row: { p: string; e?: string } }) {
   const [bad, setBad] = useState(false)
   const ext = String(row.e || '').replace(/^\./, '').toLowerCase()
-  if (bad) return <span className="text-[11px] text-sub">{ext ? ext.toUpperCase() : '文件'}</span>
+  if (bad) return <span className="text-[11px] text-sub">{ext ? ext.toUpperCase() : t('kind_file')}</span>
   return (
     <img
       src={`/api/icon?p=${encodeURIComponent(row.p)}&e=${encodeURIComponent(ext)}`}
@@ -914,17 +914,14 @@ export function Timeline({
     [groups, sort],
   )
 
-  if (loading) return <div className="grid h-full place-items-center text-[12px] text-sub">正在读最近改过的文件…</div>
+  if (loading) return <div className="grid h-full place-items-center text-[12px] text-sub">{t('tl_reading')}</div>
   if (!groups.length)
     return (
       <div className="grid h-full place-items-center text-center text-sub">
         <div>
           <div className="text-[14px] text-ink">
-            {kind === 'dir'
-              ? (getLang() === 'zh' ? `最近 ${days} 天没有改过文件夹` : 'Nothing changed in this period')
-              : kind === 'all'
-                ? (getLang() === 'zh' ? `最近 ${days} 天没有改过文件` : 'Nothing changed in this period')
-                : (getLang() === 'zh' ? `最近 ${days} 天没有改过这类文件` : 'Nothing changed in this period')}
+            {t(kind === 'dir' ? 'tl_empty_dir' : kind === 'all' ? 'tl_empty_all' : 'tl_empty_kind')
+              .replace('{n}', String(days))}
           </div>
           <div className="mt-1 text-[12px]">{t('type_to_search')}</div>
         </div>
@@ -1095,8 +1092,8 @@ export function Preview({
   return (
     <aside className="flex h-full w-[300px] shrink-0 flex-col overflow-auto border-l border-line px-3 py-2 text-[12px]">
       <div className="flex items-center justify-between pb-2">
-        <span className="text-[11px] uppercase tracking-wide text-sub">详情</span>
-        <button onClick={onClose} className="text-sub hover:text-ink" aria-label="关闭详情">
+        <span className="text-[11px] uppercase tracking-wide text-sub">{t('dtl_title')}</span>
+        <button onClick={onClose} className="text-sub hover:text-ink" aria-label={t('dtl_close')}>
           <IconClose size={14} />
         </button>
       </div>
@@ -1107,37 +1104,37 @@ export function Preview({
       <div className="break-all rounded-md bg-card px-2 py-1.5 font-mono text-[10px] leading-4 text-sub">{row.p}</div>
       <dl className="mt-3 space-y-1.5">
         <div className="flex gap-2">
-          <dt className="w-14 shrink-0 text-sub">类型</dt>
-          <dd>{row.t === 'dir' ? '文件夹' : (row.e || '文件').toString().replace(/^\./, '').toUpperCase()}</dd>
+          <dt className="w-14 shrink-0 text-sub">{t('dtl_type')}</dt>
+          <dd>{row.t === 'dir' ? t('kind_dir') : (row.e || t('kind_file')).toString().replace(/^\./, '').toUpperCase()}</dd>
         </div>
         <div className="flex gap-2">
-          <dt className="w-14 shrink-0 text-sub">大小</dt>
+          <dt className="w-14 shrink-0 text-sub">{t('dtl_size')}</dt>
           <dd>{fmtSize(row.s)}</dd>
         </div>
         <div className="flex gap-2">
-          <dt className="w-14 shrink-0 text-sub">修改</dt>
+          <dt className="w-14 shrink-0 text-sub">{t('dtl_mtime')}</dt>
           <dd className="font-mono text-[11px]">{fmtTime(row.m)}</dd>
         </div>
       </dl>
       {snip ? (
         <div className="mt-3 rounded-md bg-card px-2 py-1.5 text-[11px] leading-5 text-ink/85">
-          <div className="mb-1 text-[10px] text-sub">命中的正文（为什么它会出现在结果里）</div>
+          <div className="mb-1 text-[10px] text-sub">{t('dtl_hit_body')}</div>
           <Marked text={snip} />
         </div>
       ) : peek?.ok ? (
         <div className="mt-3 rounded-md bg-card px-2 py-1.5 text-[11px] leading-5 text-ink/85">
           <div className="mb-1 text-[10px] text-sub">
-            {peek.matched ? '正文里的命中位置' : '这份文档的正文开头'}
+            {peek.matched ? t('dtl_peek_hit') : t('dtl_peek_head')}
           </div>
           <Marked text={peek.text || ''} />
         </div>
       ) : peek && !peek.ok ? (
         <div className="mt-3 rounded-md bg-card px-2 py-1.5 text-[11px] leading-5 text-sub">
           {peek.why === 'not_indexed'
-            ? '这份文件没有正文（只索引了文件名）'
+            ? t('dtl_no_body')
             : peek.why === 'no_body'
-              ? '这份文档入库时没抽出文字'
-              : '读正文失败，稍后再试'}
+              ? t('dtl_no_text')
+              : t('dtl_peek_fail')}
         </div>
       ) : !canPeek ? null : (
         <button
@@ -1145,21 +1142,21 @@ export function Preview({
           disabled={peeking}
           className="mt-3 w-full rounded-md border border-line px-2 py-1.5 text-[11px] text-sub hover:text-ink disabled:opacity-60"
         >
-          {peeking ? '正在读…' : '读一段正文看看'}
+          {peeking ? t('dtl_reading') : t('dtl_read_body')}
         </button>
       )}
       <div className="mt-4 flex flex-wrap gap-1.5">
         <button onClick={onOpen} className="rounded-md bg-accent px-2.5 py-1 text-[11px] text-white hover:opacity-90">
-          打开
+          {t('ctx_open')}
         </button>
         <button onClick={onReveal} className="rounded-md border border-line px-2.5 py-1 text-[11px] hover:bg-card">
-          定位
+          {t('dtl_reveal')}
         </button>
         <button onClick={onCopy} className="rounded-md border border-line px-2.5 py-1 text-[11px] hover:bg-card">
-          复制路径
+          {t('ctx_copy')}
         </button>
       </div>
-      <div className="mt-3 text-[10px] leading-4 text-sub">提示：双击任意一行直接打开；Esc 清空搜索。</div>
+      <div className="mt-3 text-[10px] leading-4 text-sub">{t('dtl_hint')}</div>
     </aside>
   )
 }

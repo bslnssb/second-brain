@@ -43,6 +43,7 @@ On first launch you pick the folders to index and the database builds itself. **
 - **Chinese full-text search**: 3+ characters use an FTS5 trigram index with highlighting; 1–2 characters fall back to `LIKE`
 - **Automatic OCR**: image-only PDFs are recognised on the first 6 pages (20 s per document), offline Chinese OCR
 - **Index scope is visible — and editable**: the settings panel shows which drives are indexed, how many entries each holds, which folders feed the document index, and what is excluded. If the scope is wrong you add or remove folders and exclude words right there, then run an update
+- **New files show up on their own**: Desktop, Downloads, Documents and the folders in your index scope are watched; a file you create, rename or delete appears (or disappears) in about 2 seconds. Turn it off with `"watch": false` in `settings.json`
 - **Progress follows the interface language**: every maintenance step and every error is rendered in the current language — switching to English no longer leaves Chinese in the progress line
 - **Exclusions apply to both layers**: `exclude_dirs` filters the file-name index and the document index, and whole subtrees are pruned during the walk (on this machine, excluding game libraries took 600k entries down to 200k)
 - **Incremental by default**: changed files are re-indexed, deleted ones are pruned, unchanged ones are skipped; a long index run resumes where it stopped
@@ -71,9 +72,9 @@ When the quick search box is empty it lists recently opened files, so often you 
 |---|---|---|---|
 | **Everything** | Best in class, reads the NTFS file table, real time | No | Live |
 | **Listary** | Strong, with pinyin and a launcher | No | Live |
-| **Second Brain** | Good enough: file and folder names (game libraries excludable — 200k entries here), around 0.2 ms per prefix query, pinyin included | **In the quick window** | Manual "Rebuild name index" |
+| **Second Brain** | Good enough: file and folder names (game libraries excludable — 200k entries here), around 0.2 ms per prefix query, pinyin included | **In the quick window** | Live in watched folders (~2s) + manual full rebuild |
 
-**What it does not do**: Listary can also jump folders inside Open/Save dialogs, select files in Explorer, and keep its index updated from NTFS in real time. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
+**What it does not do**: Listary can also jump folders inside Open/Save dialogs and select files in Explorer. Everything and Listary keep a **volume-wide** index live from the NTFS file table; Second Brain only watches the folders in your scope plus Desktop, Downloads and Documents — other drives still need a manual update, and document text is never re-read automatically. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
 
 > Second Brain is an independent implementation: it uses no code, icons or UI assets from the products above, and has no affiliation with them. Product names appear only to explain the differences.
 
@@ -82,7 +83,7 @@ When the quick search box is empty it lists recently opened files, so often you 
 1. Double-click `SecondBrain.exe` — the main window opens (closing it does not quit; the app stays in the tray waiting for a double Ctrl)
 2. Open **Settings** and click **Scan all drives** — it proposes the folders worth indexing and lets you confirm
 3. Indexing starts on its own; the search box does not wait for it
-4. Day to day: **Update current scope** after adding documents; **Rebuild name index** after moving large numbers of files
+4. Day to day: files created, renamed or deleted on the Desktop, in Downloads, Documents, or inside your scope **appear in about 2 seconds**. Run **Update current scope** when you want the *text inside* new documents searchable; **Rebuild name index** after moving large numbers of files
 
 The index scope lives in `scope.json` next to the program, with two fields:
 

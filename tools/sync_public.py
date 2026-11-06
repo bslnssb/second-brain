@@ -100,7 +100,7 @@ def main():
         raise SystemExit('[!] 找不到开发根：%s（这个脚本只能在项目里跑）' % DEV)
 
     mf = parse_manifest()
-    added, updated, same, missing = [], [], [], []
+    added, updated, same, missing, stale = [], [], [], [], []
 
     for pattern in mf['sync']:
         files = expand(DEV, pattern)
@@ -126,6 +126,22 @@ def main():
         if not files:
             missing.append(pattern + '  （先 `cd web && npm run build`）')
             continue
+        # 构建产物必须按「镜像」同步，不能只覆盖：Vite 每次生成的 hash 文件名都不同，
+        # 上一版的 index-XXXX.js 会永远留在仓库里，最后跟着 payload 被塞进 exe。
+        # 目标目录里凡是源目录没有的文件，一律删掉（只删文件，不整目录 rmtree，
+        # 免得被 safe-delete 拦成批量删除）。
+        if pattern.endswith('/'):
+            dst_root = REPO / pattern.rstrip('/')
+            src_set = set(files)
+            if dst_root.is_dir():
+                for old in sorted(dst_root.rglob('*')):
+                    if not old.is_file():
+                        continue
+                    rel = old.relative_to(REPO).as_posix()
+                    if rel not in src_set:
+                        stale.append(rel)
+                        if not args.dry_run:
+                            old.unlink()
         for rel in files:
             src, dst = DEV / rel, REPO / rel
             if not dst.is_file() or sha(src) != sha(dst):
@@ -146,7 +162,8 @@ def main():
     print('清单：%d 条 sync / %d 条 local / %d 条 build' %
           (len(mf['sync']), len(mf['local']), len(mf['build'])))
     print('开发根：%s\n公开仓库：%s\n' % (DEV, REPO))
-    for label, items in (('新增', added), ('更新', updated), ('缺失', missing),
+    for label, items in (('新增', added), ('更新', updated), ('清掉的旧构建文件', stale),
+                         ('缺失', missing),
                          ('仓库里缺清单要求的', absent), ('仓库里多余的跟踪文件', orphan)):
         if not items:
             continue

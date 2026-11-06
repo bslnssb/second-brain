@@ -522,7 +522,7 @@ export default function App() {
             body: JSON.stringify({ paths: [row.p] }),
           })
           const d = (await r.json()) as { ok?: boolean; zip?: string; n?: number }
-          setToast(d.ok ? `打包好了（${d.n} 个文件），已在文件夹里选中` : '这个路径打不开')
+          setToast(d.ok ? t('zip_done').replace('{n}', String(d.n)) : t('zip_fail'))
         } catch {
           setToast('打包失败')
         }

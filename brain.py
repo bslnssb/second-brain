@@ -36,12 +36,12 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-APP_VERSION = 'v0.9.46'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.47'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 BUILD_DATE = '2026-11-06'
 PY_VER = sys.version.split()[0]
 SQL_VER = sqlite3.sqlite_version
 
-# ---------------------------------------------------------------- 在线更新 / 公告
+# ---------------------------------------------------------------- 在线更新
 # 走 GitHub 的公开接口，不需要任何 token；断网/被墙时一律「安静地失败」，
 # 绝不弹错误框——检查更新失败不该影响搜索。
 REPO_SLUG = 'bslnssb/second-brain'
@@ -323,52 +323,6 @@ def download_update(info=None):
     except Exception as e:
         return {'ok': False, 'k': 'upd_bat', 'err': str(e)[:200]}
     return {'ok': True, 'bat': str(bat), 'version': info.get('latest')}
-
-
-NOTICE_CACHE = {'t': 0.0, 'items': []}
-NOTICE_TTL = 1800.0
-
-
-def notices_get(force=False, timeout=6):
-    """公告：仓库根目录的 notices.json。缓存 30 分钟，并落一份磁盘副本——
-    断网时还能看到上次拉到的公告，不会一片空白。"""
-    now = time.time()
-    if not force and NOTICE_CACHE['items'] and now - NOTICE_CACHE['t'] < NOTICE_TTL:
-        return NOTICE_CACHE['items']
-    # 测试会把 urlopen 换成假数据；不拦的话假公告会被写进真缓存，用户界面上冒出「今天 yw」
-    cache_file = app_dir() / 'notices_cache.json'
-    _cache_ok = not os.environ.get('SB_NO_NOTICE_CACHE')
-    urls = ['https://raw.githubusercontent.com/%s/%s/notices.json' % (REPO_SLUG, br)
-            for br in ('main', 'master')]
-    for u in urls:
-        try:
-            data = json.loads(_http_get(u, timeout=timeout, limit=512 * 1024)
-                              .decode('utf-8', 'replace'))
-            items = data.get('notices') if isinstance(data, dict) else data
-            if not isinstance(items, list):
-                continue
-            today = time.strftime('%Y-%m-%d')
-            items = [n for n in items
-                     if isinstance(n, dict) and str(n.get('date') or '') <= today]
-            items.sort(key=lambda n: str(n.get('date') or ''), reverse=True)
-            NOTICE_CACHE.update(t=now, items=items)
-            if _cache_ok:
-                try:
-                    cache_file.write_text(json.dumps({'notices': items}, ensure_ascii=False),
-                                          encoding='utf-8')
-                except OSError:
-                    pass
-            return items
-        except Exception:
-            continue
-    try:
-        if _cache_ok and cache_file.is_file():
-            data = json.loads(cache_file.read_text(encoding='utf-8'))
-            items = data.get('notices') if isinstance(data, dict) else []
-            NOTICE_CACHE.update(t=now, items=items if isinstance(items, list) else [])
-    except Exception:
-        pass
-    return NOTICE_CACHE['items']
 
 
 _DATA_DIR = []
@@ -851,7 +805,12 @@ def _verinfo_descr(path):
     return None
 
 
-_LNK_SHELL = None
+# WScript.Shell 必须是「每线程一个」，不能全局共享 —— 原因见 _lnk_target 的注释。
+# 名字带下划线：pywebview 会把 js_api 的公开属性递归展开，模块级变量别用裸名字。
+_LNK_TLS = threading.local()
+# .lnk → 目标 的解析缓存。一次搜索里同一路径会被问两遍（隐藏过滤 + 合并去重），
+# 重复走 COM 又慢又容易出事。
+_TGT_CACHE = {}
 
 
 def _local_only(p):
@@ -882,16 +841,22 @@ def _local_only(p):
 def _lnk_target(path):
     """解析 .lnk 快捷方式的目标路径。桌面上用户亲手放的都是常用应用，
     拿到目标才能取它的中文名（VerInfo）和真实图标。
-    COM 的 WScript.Shell 复用一个实例，500 个快捷方式也就一秒内的事；
+
+    **WScript.Shell 不能存成全局单例**：HTTP 服务是多线程的（每个请求一个线程），
+    COM 对象只能在创建它的公寓里用，跨线程调用直接 access violation，整个进程段错误。
+    2026-11-06 实测：`/api/mini` 连着搜第 3、4 个词就把服务打崩，faulthandler 栈顶是
+    `CreateShortcut` → `_lnk_target` → `_target_key` → `merge_same_target`。
+    所以改成「每线程各自 CoInitialize + 各自一个 shell」。
     任何失败都回 None，不阻塞扫描。"""
-    global _LNK_SHELL
     try:
-        if _LNK_SHELL is None:
+        sh = getattr(_LNK_TLS, 'shell', None)
+        if sh is None:
             import pythoncom
-            pythoncom.CoInitialize()    # 扫描跑在后台线程，COM 没初始化会直接炸
+            pythoncom.CoInitialize()    # 同一线程重复调用只是加引用计数，安全
             import win32com.client
-            _LNK_SHELL = win32com.client.Dispatch('WScript.Shell')
-        t = _LNK_SHELL.CreateShortcut(path).TargetPath
+            sh = win32com.client.Dispatch('WScript.Shell')
+            _LNK_TLS.shell = sh
+        t = sh.CreateShortcut(path).TargetPath
         return t if t and _local_only(t) and os.path.exists(t) else None
     except Exception:
         return None
@@ -1187,6 +1152,193 @@ def build_files_index(targets=None):
         NAMES = {'state': 'error', 'err': f'{type(e).__name__}: {e}', 'n': 0}
         _prog(state='error', phase='', msg=f'文件名索引失败：{e}', err=str(e),
               k='m_names_fail', a={'e': str(e)})
+
+# ─────────────────────── 文件系统实时监听（v0.9.47）───────────────────────
+# 为什么要有：以前新建/改名/删掉一个文件，必须点「按现有范围更新」才进库。
+# 用户刚存完文档、回头搜不到，第一反应是「这软件是不是坏了」（第 76 项待办第 2、3 条）。
+#
+# 为什么用 ReadDirectoryChangesW 而不是 USN Journal：后者要 DeviceIoControl 读整卷日志、
+# 处理日志回绕和卷内偏移换算，代码量是前者的十倍；而这里只需要知道「用户工作目录里
+# 发生了什么」，一个递归句柄就够。代价是进程不在时不记录 —— 那本来就得靠常规扫描补齐。
+#
+# 只做**文件名层**的增量：正文索引要解 PDF/OCR，一路自动跑起来会把磁盘吃满，
+# 而且用户感知不到「刚存的 docx 已经能搜正文」这种收益。正文仍走手动更新。
+_WATCH = {'on': False, 'stop': None, 'q': {}, 'lock': threading.Lock(),
+          'threads': [], 'dropped': 0, 'wrote': 0}
+_WATCH_FLAGS = 0x0001 | 0x0002 | 0x0008 | 0x0010   # 文件名/目录名/大小/修改时间
+_WATCH_SHARE_ALL = 0x0001 | 0x0002 | 0x0004
+
+
+def _watch_roots():
+    """要监听的目录：索引范围里的工作目录 + 桌面 / 下载 / 文档。
+
+    刻意**不监听整盘根**：解压一个游戏、跑一次编译就能压出十几万条事件，
+    把监听线程和数据库一起拖死。用户真正在意的是「我自己刚存的那份文件」，
+    而那份文件基本都落在这几个地方。上限 8 个根，每个根一个线程一个句柄。"""
+    out, seen = [], set()
+
+    def push(d):
+        try:
+            d = str(d or '').strip()
+            if not d or not os.path.isdir(d):
+                return
+            k = os.path.normcase(os.path.abspath(d))
+            if k not in seen:
+                seen.add(k)
+                # 用磁盘上的真实大小写：scope.json 里是人手写的 `c:\users\…`，
+                # 原样监听会让每条事件都写成小写路径，和全量索引（真实大小写）分家，
+                # 同一个文件在库里出现两条。
+                out.append(_real_case(d))
+        except OSError:
+            pass
+
+    for d in (_scope_conf().get('include_dirs') or []):
+        push(d)
+    home = os.path.expanduser('~')
+    for sub in ('Desktop', 'Downloads', 'Documents', '桌面', '下载', '文档'):
+        push(os.path.join(home, sub))
+    return out[:8]
+
+
+def _watch_worker(root):
+    """一个目录一棵子树，阻塞读变更。线程是 daemon，进程退出即结束。"""
+    h = None
+    try:
+        import pythoncom
+        import win32file
+        pythoncom.CoInitialize()
+        h = win32file.CreateFileW(
+            root, 0x0001, _WATCH_SHARE_ALL, None, 3, 0x02000000, None)
+        while not _WATCH['stop'].is_set():
+            acts = win32file.ReadDirectoryChangesW(h, 64 * 1024, True, _WATCH_FLAGS, None, None)
+            with _WATCH['lock']:
+                for action, rel in acts:
+                    full = os.path.join(root, rel)
+                    if len(_WATCH['q']) >= 4000:      # 洪水时丢新事件，别把内存吃掉
+                        _WATCH['dropped'] += 1
+                        continue
+                    _WATCH['q'][full] = action
+    except Exception:
+        pass                      # 目录被删/网盘断开/权限不足：这个根就不监听了
+    finally:
+        if h is not None:
+            try:
+                h.Close()
+            except Exception:
+                pass
+
+
+def _watch_flusher():
+    """攒 1.5 秒写一次库，把「一次保存产生十几个事件」压成一条 SQL。"""
+    while not _WATCH['stop'].wait(1.5):
+        with _WATCH['lock']:
+            q = _WATCH['q']
+            _WATCH['q'] = {}
+            batch = list(q.items())
+        if not batch:
+            continue
+        # 全量任务在跑时会 DROP/RENAME files 表，这时写进去也是白写，等它跑完
+        if PROG.get('state') == 'busy' or NAMES.get('state') == 'busy':
+            with _WATCH['lock']:
+                for k, v in batch:
+                    _WATCH['q'].setdefault(k, v)
+            continue
+        try:
+            _WATCH['wrote'] += _watch_apply(batch)
+        except Exception as e:
+            print('[!] 实时索引写入失败：', e, flush=True)
+
+
+def _watch_apply(batch):
+    """把一批变更落到 files / dirs。返回实际写入条数。
+
+    用独立连接：全局 conn() 要套 con_lock，而这里可能连着写几十条，
+    占着锁会卡住搜索。busy_timeout 兜住和后台任务的短暂争用。"""
+    exckw = _scope_excludes()
+    add_f, add_d, gone = [], [], []
+    for full, action in batch:
+        if action in (2, 4):                 # REMOVED / RENAMED_OLD_NAME
+            gone.append(full)
+            continue
+        try:
+            st = os.stat(full)               # 1 ADDED / 3 MODIFIED / 5 RENAMED_NEW
+        except OSError:
+            gone.append(full)                # 事件到得比文件晚（临时文件已删）
+            continue
+        if os.path.isdir(full):
+            base = os.path.basename(full)
+            if not base:
+                continue
+            py, ini = py_keys(base)
+            add_d.append((full, base.lower(), os.path.dirname(full), py, ini, st.st_mtime))
+            continue
+        ext = os.path.splitext(full)[1].lower()
+        if ext not in NAMES_EXTS or st.st_size > NAMES_SIZE_LIMIT:
+            gone.append(full)                # 不该入库的类型，顺手清掉同名旧记录
+            continue
+        if exckw and _excluded(full, exckw):
+            gone.append(full)
+            continue
+        try:
+            if _is_self_noise(full):     # 程序自己的日志/备份/构建产物不入索引
+                gone.append(full)
+                continue
+        except NameError:
+            pass
+        base = os.path.basename(full)
+        # .lnk 的 descr 要解 COM，实时线程里只给 .exe 取（VerInfo 是纯读文件，快）
+        descr = _file_descr(full, ext) if ext == '.exe' else None
+        py, ini = py_keys(base) if any(ord(c) > 127 for c in base) else (None, None)
+        add_f.append((full, base.lower(), os.path.dirname(full), ext,
+                      st.st_size, st.st_mtime, descr, py, ini))
+    if not (add_f or add_d or gone):
+        return 0
+    con = sqlite3.connect(DB, check_same_thread=False)
+    try:
+        con.execute('PRAGMA busy_timeout=3000')
+        if gone:
+            con.executemany('DELETE FROM files WHERE path=?', [(g,) for g in gone])
+            con.executemany('DELETE FROM dirs WHERE path=?', [(g,) for g in gone])
+            con.executemany('DELETE FROM appdesc WHERE path=?', [(g,) for g in gone])
+        if add_f:
+            con.executemany('INSERT OR REPLACE INTO files'
+                            '(path,name,dir,ext,size,mtime,descr,py,ini) '
+                            'VALUES(?,?,?,?,?,?,?,?,?)', add_f)
+            con.executemany('INSERT OR REPLACE INTO appdesc(path,descr,ext,mtime,size) '
+                            "SELECT path,descr,ext,mtime,size FROM files "
+                            "WHERE path=? AND descr IS NOT NULL AND descr<>''",
+                            [(a[0],) for a in add_f])
+        if add_d:
+            con.executemany('INSERT OR REPLACE INTO dirs(path,name,parent,py,ini,mtime) '
+                            'VALUES(?,?,?,?,?,?)', add_d)
+        con.commit()
+        return len(add_f) + len(add_d)
+    finally:
+        con.close()
+
+
+def start_watcher():
+    """启动实时监听。settings.json 里 "watch": false 可关掉（排查问题时有用）。"""
+    if _WATCH['on'] or os.environ.get('SB_NO_WATCH'):
+        return
+    try:
+        if _settings_dict().get('watch') is False:
+            return
+    except Exception:
+        pass
+    roots = _watch_roots()
+    if not roots:
+        return
+    _WATCH['on'] = True
+    _WATCH['stop'] = threading.Event()
+    for r in roots:
+        t = threading.Thread(target=_watch_worker, args=(r,), daemon=True,
+                             name='sb-watch')
+        t.start()
+        _WATCH['threads'].append(t)
+    threading.Thread(target=_watch_flusher, daemon=True, name='sb-watch-flush').start()
+    print('实时索引：监听 %d 个目录' % len(roots), flush=True)
+
 
 # 质量自检（GUI/CLI 共用）；在独立子进程里跑，绝不碰正在服务的真实索引库
 SELFTEST = {'state': 'idle', 'msg': '', 'ok': None, 'k': ''}
@@ -3155,14 +3307,24 @@ def set_app_pref(path, mode):
 
 def _target_key(path):
     """同一个程序的多个入口要合成一条：桌面「微信.lnk」与 Program Files 的 Weixin.exe
-    指向的是同一个东西，用户在结果里看到三行只会犹豫。"""
+    指向的是同一个东西，用户在结果里看到三行只会犹豫。
+
+    结果按路径缓存：`mini_search` 一次调用里这批路径会被问两遍（隐藏过滤 + 合并去重），
+    而解析 .lnk 要走 COM，重复做既慢又增加踩线程问题的机会。"""
     p = str(path or '')
-    low = p.lower()
-    if low.endswith('.lnk'):
+    ck = os.path.normcase(p)
+    hit = _TGT_CACHE.get(ck)
+    if hit is not None:
+        return hit
+    key = ck
+    if ck.endswith('.lnk'):
         t = _lnk_target(p)
         if t:
-            return os.path.normcase(os.path.realpath(t))
-    return os.path.normcase(p)
+            key = os.path.normcase(os.path.realpath(t))
+    if len(_TGT_CACHE) > 20000:      # 全盘几十万文件，别让缓存无限长
+        _TGT_CACHE.clear()
+    _TGT_CACHE[ck] = key
+    return key
 
 
 def _place_boost(path):
@@ -6716,16 +6878,6 @@ nz{display:inline-block;color:#b45309;font-size:11px;border:1px solid #fde68a;ba
 .about .amsg .upd{margin-top:8px;padding:9px 11px;border-radius:9px;background:var(--bg);
   color:var(--ink);font-size:12px;line-height:1.7;white-space:pre-wrap;text-align:left}
 .about .amsg .pbtn{margin-top:9px}
-.notices{width:min(540px,calc(100vw - 90px));text-align:left}
-.nhead{font-size:15px;font-weight:700;margin-bottom:6px;color:var(--ink)}
-.nlist{max-height:min(56vh,400px);overflow:auto;margin:6px 0 14px}
-.nitem{padding:11px 0;border-bottom:1px solid var(--line)}
-.nitem:last-child{border-bottom:0}
-.ntop{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
-.ntt{font-size:13.5px;font-weight:650;color:var(--ink)}
-.ndate{font-size:11px;color:var(--side);font-variant-numeric:tabular-nums;flex:none}
-.nbody{margin-top:5px;font-size:12.5px;line-height:1.75;color:var(--sub);white-space:pre-wrap}
-.nempty{padding:26px 0;text-align:center;color:var(--sub);font-size:13px}
 .rgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,182px));gap:10px;padding:12px 12px 18px;justify-content:start}
 body.gridmode .thead{display:none}
 .gitem{border:1px solid var(--line);border-radius:10px;padding:9px;cursor:pointer;display:flex;flex-direction:column;gap:7px;min-width:0;background:var(--card)}
@@ -6779,9 +6931,6 @@ body.gridmode .thead{display:none}
 [data-theme="dark"] .ctxm .ctxi{color:var(--ink)}
 [data-theme="dark"] .ctxm .ctxi:hover{background:var(--sel)}
 [data-theme="dark"] .toast{background:#2b3140;color:#eef1f6}
-[data-theme="dark"] .nitem{background:var(--bg);border-color:var(--line)}
-[data-theme="dark"] .ntt{color:var(--ink)}
-[data-theme="dark"] .ndate,[data-theme="dark"] .nbody{color:var(--sub)}
 </style></head><body>
 <div class=topbar>
 <span class=logo><svg width=20 height=20 viewBox="0 0 24 24" fill="none"><rect width=24 height=24 rx=6 fill="#4f6ef7"/><circle cx=10 cy=10 r=4.5 stroke="#fff" stroke-width=1.6"/><path d="M13.2 13.2L17 17" stroke="#fff" stroke-width=1.8" stroke-linecap="round"/><path d="M7.5 10h5M10 7.5v5" stroke="#fff" stroke-width=1.2 stroke-linecap="round"/></svg></span>
@@ -6882,7 +7031,6 @@ body.gridmode .thead{display:none}
   <div class=anote id="ab_note" data-i18n="about_note">当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。</div>
   <div class=aurow>
     <button class="pbtn gray" id=ab_chk onclick=checkUpdate() data-i18n="about_check">检查更新</button>
-    <button class="pbtn gray" id=ab_notice onclick=showNotices() data-i18n="about_notice">公告</button>
     <button class="pbtn gray" onclick=hideAbout() data-i18n="about_ok">知道了</button>
   </div>
   <div class=amsg id=ab_msg></div>
@@ -6916,7 +7064,7 @@ body.gridmode .thead{display:none}
 <div class=hrow><span class=hk>拖进来</span><span class=ht data-i18n="hp_m3">把文件拖进窗口，反查有没有被索引、同名版本有几个</span></div>
 <div class=hrow><span class=hk>▦</span><span class=ht data-i18n="hp_m4">列表 / 缩略图 / 右侧详情面板</span></div>
 <div class=hrow><span class=hk>🔎</span><span class=ht data-i18n="hp_m5">选一个文件反查（不会上传任何东西）</span></div>
-<div class=hrow><span class=hk>托盘</span><span class=ht data-i18n="hp_m6">设置、关于、公告、检查更新都在这里</span></div>
+<div class=hrow><span class=hk>托盘</span><span class=ht data-i18n="hp_m6">设置、关于、检查更新都在这里</span></div>
 </div>
  </div>
  <div class=hfoot data-i18n="hp_foot">这些都不需要记，用久了自然会。忘了就右键托盘图标 →「使用帮助」。</div>
@@ -6936,12 +7084,6 @@ body.gridmode .thead{display:none}
    <button class="pbtn gray" onclick=hideWelcome(1) data-i18n="wel_b2">开始搜索</button></div>
  </div>
 </div>
-<div class=amask id=nmask onclick=hideNotices()></div>
-<div class="about notices" id=notices>
-  <div class=nhead data-i18n="notice_title">公告</div>
-  <div class=nlist id=nlist></div>
-  <button class="pbtn gray" onclick=hideNotices() data-i18n="about_ok">知道了</button>
-</div>
 <script>
 const DICT={
 zh:{
@@ -6956,7 +7098,7 @@ d_autostart_on:'已设置开机启动',d_autostart_off:'已取消开机启动',d
 d_hotkey_on:'双击 Ctrl 已开启',d_hotkey_off:'双击 Ctrl 已关闭',
 d_lang:'界面语言',d_theme:'主题',d_theme_tip:'跟随系统 / 浅色 / 深色',
 th_auto:'跟随系统',th_light:'浅色',th_dark:'深色',
-hk_sel:'选择',hk_open:'打开',hk_loc:'定位',hp_title:'使用帮助',hp_foot:'这些都不需要记，用久了自然会。忘了就右键托盘图标 →「使用帮助」。',hp_s_kb:'快捷键',hp_s_q:'搜索框里能直接写',hp_s_more:'其它好用的',hp_kb1:'上下选择',hp_kb2:'打开选中的',hp_kb3:'在文件夹里定位',hp_kb4:'直接打开第 1~9 条',hp_kb5:'换排序：相关度 / 最新 / 最早 / 最大 / 名称',hp_kb6:'回到搜索框',hp_kb7:'清空搜索 / 关掉面板',hp_kb8:'唤出快搜窗（关掉窗口程序还在托盘）',hp_q1:'只看 PDF；写 ext:pdf,docx 看两种',hp_q2:'按大小；也支持 < 和区间 1k-2m',hp_q3:'最近 7 天改过的；2w 两周、1m 一个月',hp_q4:'排除路径里带这个词的',hp_q5:'只看这个文件夹（末尾加斜杠）',hp_q6:'只搜正文，不要文件名凑数',hp_m1:'首页时间轴：不输入时列出最近改过的文件',hp_m2:'打开 / 定位 / 复制路径 / 打包成一个 zip',hp_m3:'把文件拖进窗口，反查有没有被索引、同名版本有几个',hp_m4:'列表 / 缩略图 / 右侧详情面板',hp_m5:'选一个文件反查（不会上传任何东西）',hp_m6:'设置、关于、公告、检查更新都在这里',hk_direct:'直达',hk_sort:'换排序',hk_clr:'清除',
+hk_sel:'选择',hk_open:'打开',hk_loc:'定位',hp_title:'使用帮助',hp_foot:'这些都不需要记，用久了自然会。忘了就右键托盘图标 →「使用帮助」。',hp_s_kb:'快捷键',hp_s_q:'搜索框里能直接写',hp_s_more:'其它好用的',hp_kb1:'上下选择',hp_kb2:'打开选中的',hp_kb3:'在文件夹里定位',hp_kb4:'直接打开第 1~9 条',hp_kb5:'换排序：相关度 / 最新 / 最早 / 最大 / 名称',hp_kb6:'回到搜索框',hp_kb7:'清空搜索 / 关掉面板',hp_kb8:'唤出快搜窗（关掉窗口程序还在托盘）',hp_q1:'只看 PDF；写 ext:pdf,docx 看两种',hp_q2:'按大小；也支持 < 和区间 1k-2m',hp_q3:'最近 7 天改过的；2w 两周、1m 一个月',hp_q4:'排除路径里带这个词的',hp_q5:'只看这个文件夹（末尾加斜杠）',hp_q6:'只搜正文，不要文件名凑数',hp_m1:'首页时间轴：不输入时列出最近改过的文件',hp_m2:'打开 / 定位 / 复制路径 / 打包成一个 zip',hp_m3:'把文件拖进窗口，反查有没有被索引、同名版本有几个',hp_m4:'列表 / 缩略图 / 右侧详情面板',hp_m5:'选一个文件反查（不会上传任何东西）',hp_m6:'设置、关于、检查更新都在这里',hk_direct:'直达',hk_sort:'换排序',hk_clr:'清除',
 side_filter:'筛选',k_all:'全部',k_dir:'文件夹',k_file:'文件',k_doc:'文档',k_img:'图片',k_video:'视频',k_app:'应用',k_audio:'音频',k_zip:'压缩包',path_h:'路径过滤',recent_h:'最近修改',r_all:'全部',r_1d:'最近 1 天',r_7d:'最近 7 天',r_30d:'最近 30 天',r_365d:'最近 365 天',
 col_name:'名称',col_path:'路径',col_mtime:'修改时间',pv_loading:'缩略图生成中…',view_grid:'缩略图视图',view_list:'详情视图',view_menu:'视图',view_panel:'右侧详情面板',vmenu_sort:'排序',sort_rel:'相关度',sort_new:'最新',sort_old:'最早',sort_big:'最大',sort_name:'按名称',sort_now:'排序：',qsyn_tip:'也可以在搜索框里直接写：ext:pdf · size:>10m · dm:7d · -排除词 · 某文件夹/',n_items:'个项目',filter_empty:'这个筛选下没有结果 —— 点左边的「全部」看所有命中',
 f_doc:'文档',f_file:'文件名',pv_empty:'选中文件查看预览',pv_nosnip:'该文件无正文预览（仅命中文件名）',
@@ -7013,7 +7155,7 @@ about_name:'第二大脑 · 本地搜索',
 about_docs:'正文可搜 <b>{t}</b> 篇 · 文件名可搜 <b>{n}</b> 个',
 about_build:'构建日期 <b>{b}</b>',
 about_note:'当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。',
-about_check:'检查更新',about_notice:'公告',
+about_check:'检查更新',
 wel_title:'欢迎使用第二大脑',
 wel_c1:'搜索文件',wel_c1h:'双击 Ctrl 立刻弹出快搜窗，边打边出结果；也可以点托盘图标打开详细搜索。',
 wel_b1:'打开快搜窗口（双击 Ctrl）',
@@ -7042,7 +7184,6 @@ about_page:'打不开自动更新？去发布页手动下载',
 about_apply:'下载并安装（装完自动重开）',
 about_applying:'正在下载…下载完会自动关掉重开，大概十几秒。',
 about_fail:'连不上 GitHub（网络或代理的问题）。可以稍后再试，或去发布页手动下载。',
-notice_title:'公告',notice_loading:'正在取公告…',notice_none:'暂时没有公告。',
 upd_net:'下载没成功（网络断了或文件不对）。可以稍后再试，或在浏览器里手动下载。',
 upd_done:'✅ 已下载 {v}，正在关掉重开完成安装。',
 open:'打开',copy:'复制路径',copied:'已复制',
@@ -7123,7 +7264,7 @@ d_autostart_on:'Will start at boot',d_autostart_off:'Removed from startup',d_hot
 d_hotkey_on:'Double-Ctrl enabled',d_hotkey_off:'Double-Ctrl disabled',
 d_lang:'Language',d_theme:'Theme',d_theme_tip:'System / Light / Dark',
 th_auto:'System',th_light:'Light',th_dark:'Dark',
-hk_sel:'Select',hk_open:'Open',hk_loc:'Locate',hp_title:'Help',hp_foot:'Nothing here needs memorizing. Forgot one? Right-click the tray icon and pick Help.',hp_s_kb:'Shortcuts',hp_s_q:'Type filters in the search box',hp_s_more:'Other things that help',hp_kb1:'Move up / down',hp_kb2:'Open',hp_kb3:'Show in folder',hp_kb4:'Open item 1~9',hp_kb5:'Cycle sort: relevance / newest / oldest / largest / name',hp_kb6:'Back to the search box',hp_kb7:'Clear the search / close this panel',hp_kb8:'Summon the quick window (the tray keeps running)',hp_q1:'PDFs only; ext:pdf,docx for two kinds',hp_q2:'By size; also ranges like 1k-2m',hp_q3:'Changed in the last 7 days; 2w and 1m work too',hp_q4:'Exclude paths containing this word',hp_q5:'Only this folder (trailing slash)',hp_q6:'Body text only, no file-name padding',hp_m1:'Home timeline: recently changed files while the box is empty',hp_m2:'Open / reveal / copy path / zip them together',hp_m3:'Drop a file here to see whether it is indexed and how many versions exist',hp_m4:'List / thumbnails / details panel',hp_m5:'Pick a file to look up (nothing is uploaded)',hp_m6:'Settings, about, notices and update checks live here',hk_direct:'open 1~9',hk_sort:'sort',hk_clr:'Clear',
+hk_sel:'Select',hk_open:'Open',hk_loc:'Locate',hp_title:'Help',hp_foot:'Nothing here needs memorizing. Forgot one? Right-click the tray icon and pick Help.',hp_s_kb:'Shortcuts',hp_s_q:'Type filters in the search box',hp_s_more:'Other things that help',hp_kb1:'Move up / down',hp_kb2:'Open',hp_kb3:'Show in folder',hp_kb4:'Open item 1~9',hp_kb5:'Cycle sort: relevance / newest / oldest / largest / name',hp_kb6:'Back to the search box',hp_kb7:'Clear the search / close this panel',hp_kb8:'Summon the quick window (the tray keeps running)',hp_q1:'PDFs only; ext:pdf,docx for two kinds',hp_q2:'By size; also ranges like 1k-2m',hp_q3:'Changed in the last 7 days; 2w and 1m work too',hp_q4:'Exclude paths containing this word',hp_q5:'Only this folder (trailing slash)',hp_q6:'Body text only, no file-name padding',hp_m1:'Home timeline: recently changed files while the box is empty',hp_m2:'Open / reveal / copy path / zip them together',hp_m3:'Drop a file here to see whether it is indexed and how many versions exist',hp_m4:'List / thumbnails / details panel',hp_m5:'Pick a file to look up (nothing is uploaded)',hp_m6:'Settings, about and update checks live here',hk_direct:'open 1~9',hk_sort:'sort',hk_clr:'Clear',
 side_filter:'Filter',k_all:'All',k_dir:'Folders',k_file:'Files',k_doc:'Documents',k_img:'Images',k_video:'Videos',k_app:'Apps',k_audio:'Audio',k_zip:'Archives',path_h:'Path filter',recent_h:'Modified',r_all:'Any time',r_1d:'Last 1 day',r_7d:'Last 7 days',r_30d:'Last 30 days',r_365d:'Last 365 days',
 col_name:'Name',col_path:'Path',col_mtime:'Modified',pv_loading:'Rendering thumbnail…',view_grid:'Thumbnail view',view_list:'Detail view',view_menu:'View',view_panel:'Details panel',vmenu_sort:'Sort',sort_rel:'Relevance',sort_new:'Newest',sort_old:'Oldest',sort_big:'Largest',sort_name:'Name',sort_now:'Sort: ',qsyn_tip:'You can also type filters: ext:pdf · size:>10m · dm:7d · -exclude · somefolder/',n_items:'items',filter_empty:'Nothing matches this filter — click “All” to see every hit',
 f_doc:'Docs',f_file:'Files',pv_empty:'Select a file to preview',pv_nosnip:'No content preview (filename match only)',
@@ -7180,7 +7321,7 @@ about_name:'Second Brain · local search',
 about_docs:'<b>{t}</b> documents · <b>{n}</b> file names searchable',
 about_build:'Built <b>{b}</b>',
 about_note:'This is a <b>0.x preview</b>: still being polished.<br>Version <b>1.0</b> will be the stable release.',
-about_check:'Check for updates',about_notice:'Notices',
+about_check:'Check for updates',
 wel_title:'Welcome to Second Brain',
 wel_c1:'Find files',wel_c1h:'Press Ctrl twice to pop up the quick search — results appear as you type. You can also click the tray icon.',
 wel_b1:'Open quick search (double Ctrl)',
@@ -7209,7 +7350,6 @@ about_page:'Auto-update failed? Download from the release page',
 about_apply:'Download and install (restarts itself)',
 about_applying:'Downloading… the app will close and reopen by itself, about ten seconds.',
 about_fail:'Cannot reach GitHub (network or proxy). Try again later, or download from the release page.',
-notice_title:'Notices',notice_loading:'Loading notices…',notice_none:'No notices yet.',
 upd_net:'Download failed (network error or bad file). Try again, or download in your browser.',
 upd_done:'✅ Downloaded {v}. Restarting to finish the install.',
 open:'Open',copy:'Copy path',copied:'Copied',
@@ -7789,7 +7929,7 @@ function hideAbout(){$('about').classList.remove('on');$('amask').classList.remo
 function showHelp(){$('about').classList.remove('on');$('amask').classList.remove('on');try{hideWelcome(0)}catch(e){};$('help').classList.add('on');$('hmask').classList.add('on')}
 function hideHelp(){$('help').classList.remove('on');$('hmask').classList.remove('on')}
 function showPanel(n){try{if(n==='help')showHelp();else if(n==='about')showAbout();else if(n==='cfg'){loadSettings();showCfg()}}catch(e){}}
-// —— 关于弹窗里的三件事：数字跟着语言走、检查更新、看公告
+// —— 关于弹窗里的三件事：数字跟着语言走、检查更新
 function tOf(o,k){const en=(LANG==='en');const v=(en&&o[k+'_en'])?o[k+'_en']:o[k];return v||''}
 function openDataDir(){try{fetch('/api/open_dir',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){}}
 function fillAbout(){
@@ -7832,20 +7972,6 @@ async function applyUpdate(){
   if(!d.ok){msg.innerHTML=esc(T(d.k||'upd_net'));return}
   msg.innerHTML=esc(F(T('upd_done'),{v:(d.version||'')}));
 }
-async function showNotices(){
-  hideAbout();
-  $('nmask').classList.add('on');$('notices').classList.add('on');
-  const box=$('nlist');box.innerHTML='<div class=nempty>'+esc(T('notice_loading'))+'</div>';
-  let d=null;
-  try{d=await(await fetch('/api/notices',{cache:'no-store'})).json()}catch(e){d=null}
-  const items=(d&&d.items)||[];
-  if(!items.length){box.innerHTML='<div class=nempty>'+esc(T('notice_none'))+'</div>';return}
-  box.innerHTML=items.map(n=>'<div class=nitem><div class=ntop><span class=ntt>'+esc(tOf(n,'title'))+
-    '</span><span class=ndate>'+esc(n.date||'')+'</span></div><div class=nbody>'+esc(tOf(n,'body'))+
-    '</div></div>').join('');
-  try{localStorage.setItem('sb_notice_seen',items.map(n=>n.id||n.date).join(','))}catch(e){}
-}
-function hideNotices(){$('notices').classList.remove('on');$('nmask').classList.remove('on')}
 async function toggleAuto(){const el=$('tg_auto');const on=!el.classList.contains('on');
 try{const r=await(await fetch('/api/autostart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:on})})).json();
 if(r.ok){el.classList.toggle('on',on);toast(on?T('d_autostart_on'):T('d_autostart_off'))}else{toast(r.err||'failed')}}catch(e){toast('failed')}}
@@ -8342,11 +8468,6 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
             elif self.path.startswith('/api/update_check'):
                 # 检查更新：慢（要连 GitHub），放线程里等，前端显示「检查中…」
                 body = json.dumps(check_update(), ensure_ascii=False).encode()
-                ctype = 'application/json; charset=utf-8'
-            elif self.path.startswith('/api/notices'):
-                items = notices_get(force=('force=1' in self.path))
-                body = json.dumps({'ok': True, 'items': items},
-                                  ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
             elif self.path.startswith('/api/firstrun'):
                 # 首次运行：库里一个文件都没有、也没被标记过 → 界面自动开始建库
@@ -9270,6 +9391,7 @@ def serve(port=8765):
     threading.Timer(1.2, webbrowser.open, args=(f'http://127.0.0.1:{port}',)).start()
     print(f'第二大脑已启动：http://127.0.0.1:{port}（关闭本窗口即停止服务）')
     start_pinyin_backfill()      # 老库补拼音，后台跑，不挡界面
+    start_watcher()              # 新建/改名/删除的文件实时进库，不用再点「更新」
     threading.Thread(target=_thumb_sweep, daemon=True).start()
     srv.serve_forever()
 

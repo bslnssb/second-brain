@@ -45,9 +45,11 @@ if _webdist.is_dir():
 
 # hotkey / tray 是在函数里 import 的（进程起来才装钩子和托盘），
 # 显式列出来省得 PyInstaller 漏掉；win32* 由 pywin32 自带的 hook 收集。
+# win32file 是 v0.9.47 实时索引用的（brain._watch_worker 里函数内 import），
+# 不列出来 PyInstaller 不会收 —— 源码跑得好好的，exe 一启动监听就静默失败。
 hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest',
-                  'hotkey', 'tray', 'pypinyin',
-                  'win32gui', 'win32api', 'win32con', 'win32process']
+                  'hotkey', 'tray', 'pypinyin', 'pythoncom', 'win32com.client',
+                  'win32gui', 'win32api', 'win32con', 'win32process', 'win32file']
 
 # 本机装了一堆和本项目无关的重型包，PyInstaller 顺着 import 链会把 torch 整包拖进来
 # （实测多出 2GB 以上）。这里显式排除，产物只保留 OCR 真正需要的部分。

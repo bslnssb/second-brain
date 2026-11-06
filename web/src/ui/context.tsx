@@ -117,7 +117,7 @@ export function ReverseModal({ path, onClose }: { path: string; onClose: () => v
               {dirName(path)}
             </div>
           </div>
-          <button onClick={onClose} className="text-sub hover:text-ink" aria-label="关闭">
+          <button onClick={onClose} className="text-sub hover:text-ink" aria-label={t('close')}>
             <IconClose size={16} />
           </button>
         </div>

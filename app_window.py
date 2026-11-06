@@ -215,6 +215,11 @@ def _start_server(port):
         _log_always('make_server FAILED (port %d):%s%s' % (port, chr(10), _START_ERR[0]))
         return None
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    # 桌面模式同样要开实时监听：用户不会去点「更新」，新建的文件必须自己进库
+    try:
+        brain.start_watcher()
+    except Exception:
+        _log_always('start_watcher FAILED:%s' % traceback.format_exc())
     return srv
 
 
