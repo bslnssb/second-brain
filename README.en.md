@@ -1,325 +1,240 @@
-# Second Brain
+# Second Brain · Local Document Search
 
 [简体中文](README.md) | **English**
 
-Turn the documents scattered across your hard drive into a local knowledge base you can actually search. **Full-text search, CJK-friendly, completely offline** — no cloud, no indexing service, no account.
+Turn the documents scattered across your drives into a local knowledge base you can actually search. **Full-text search, Chinese-friendly, fully offline** — nothing leaves the machine, no account, no server.
 
-Built with Python + SQLite FTS5. A single `brain.db` holds all the text; it works with the network cable unplugged.
+Python + SQLite FTS5. One `brain.db` holds every extracted document body; it keeps working with the network unplugged.
 
-> Why not Everything? It knows what a file is called, not what's written inside it. Second Brain does both, but the second one is the point — recalling a sentence and not which file holds it is something Everything can never answer.
-> Why not an online note app? Your contracts, medical records and internal training material don't belong on someone else's server.
+> **Why not Everything?** It knows what a file is called, not what it says. You remember a sentence from a document but not which file it lives in — that is the gap this tool fills.
+> **Why not an online notebook?** Contracts, medical records and internal material do not belong on someone else's server.
+
+<p align="center"><img src="assets/screenshot-quick-en.png" alt="Quick search: typing report returns file-name matches first, then content matches tagged Text with the matching sentence"></p>
+
+<p align="center"><sub>Press Ctrl twice and a search box appears. Name matches come first, content matches follow — both searched at once</sub></p>
 
 ---
 
-<p align="center"><img src="assets/screenshot-quick.png" alt="The quick-search window after double-tapping Ctrl: searching 报 lists matching files with their folders, each row labelled Ctrl+1–9"></p>
+## Download
 
-<p align="center"><sub>Double-tap Ctrl anywhere — one character is enough, Ctrl+1–9 opens a row directly</sub></p>
+Grab the latest `SecondBrain-Setup-vX.Y.Z.exe` (about 180 MB) from [Releases](https://github.com/bslnssb/second-brain/releases) and run it.
 
-<p align="center"><img src="assets/screenshot-en.png" alt="The Second Brain exe window searching for a term: 7 matches, each showing the exact lines that matched with the keyword highlighted"></p>
-
-<p align="center"><sub>Same index, switched to Chinese in the top-right corner — the UI language never changes what gets indexed</sub><br>
-<img src="assets/screenshot-zh.png" width="620" alt="Second Brain exe window, Chinese interface"></p>
-
-
-## 文档 / Docs
-
-| 语言 | 文件 |
+| | |
 |---|---|
-| 中文（完整参考） | [使用说明.md](使用说明.md) |
-| English | [使用说明.en.md](使用说明.en.md) |
-| Español | [使用说明.es.md](使用说明.es.md) |
-| Português | [使用说明.pt.md](使用说明.pt.md) |
-| हिन्दी | [使用说明.hi.md](使用说明.hi.md) |
+| OS | Windows 10 / 11 (64-bit) |
+| Installed size | About 330 MB (`SecondBrain.exe` + `_internal/`) |
+| Admin rights | Not required — a per-user install works |
+| Network | After install, **fully offline**; the OCR model ships with the app |
+| Uninstall | Settings → Apps → Uninstall, or just delete the folder |
 
-## Features
+Two things that look like failures but are not:
 
-- **Double-tap Ctrl quick search** — tap Ctrl twice anywhere and a search box drops down from the top of the screen: type two characters, pick with `↑↓`, `Enter` to open, `Ctrl+1`–`Ctrl+9` to open the Nth row, `Esc` to dismiss
-- **Pinyin fuzzy match** — type `azb` for 安装包 (installer), `xzrs` for 行政人事 (HR). Both first-letter and full pinyin work, no need to remember the full spelling
-- **Content hits in the quick window** — if the keyword isn't in any file *name* but is inside a document, the match still shows up after a 300 ms pause, with a purple "正文/content" tag and the matching sentence. Neither Listary nor Everything does this
-- **Real system icons** — each row shows the actual icon the OS uses for that extension (red PDF, blue Word, green Excel), not a hand-drawn placeholder
-- **Full-text search that understands Chinese/Japanese/Korean** — 3+ characters use the FTS5 trigram index (fast, with hit highlighting); 1–2 character queries automatically fall back to `LIKE`
-- **Automatic OCR for scans** — image-only PDFs get their first 6 pages recognised offline (RapidOCR); no network after install
-- **Wide format coverage** — PDF / DOCX / PPTX / XLSX / EPUB / RTF / HTML / TXT / MD
-- **Incremental maintenance** — modified files are re-indexed, deleted files are pruned, unchanged files are skipped instantly
-- **Resumable indexing** — interrupt a 50k-file build and restart it; it continues where it stopped
-- **Bilingual UI** — a 中 / EN switch in the top-right corner; it follows your system language by default and remembers your choice
-- **Quality self-test (rare, but it matters)** — `python brain.py selftest` validates retrieval accuracy, cross-checks two PDF extractors, measures OCR character error rate, fuzzes 9 kinds of malformed files and checks database integrity. The report is reproducible by anyone
-- **Zero upload** — every parser runs locally; the HTTP server binds to `127.0.0.1` only
+1. **The app is not code-signed**, so Windows SmartScreen shows "Windows protected your PC" on first run. Click **More info → Run anyway**. That is what an unsigned binary looks like, not malware.
+2. **Missing WebView2 means no window** (occasional on older Win10 machines). The app prints a download link; after installing it, launch again — or just open `http://127.0.0.1:8765` in a browser.
 
-## Two ways to run it
+On first launch you pick the folders to index and the database builds itself. **Search works immediately**; results grow as the scan progresses.
 
-| Way | Who it's for | How to start |
-|---|---|---|
-| **Download the exe** (no install) | You'd rather not touch a terminal | From the [Releases](https://github.com/bslnssb/second-brain/releases) page take `SecondBrain-Windows.zip` (with OCR, ~165 MB / ~340 MB unpacked) or `SecondBrain-Core-Windows.zip` (no OCR, ~27 MB / ~55 MB), unzip anywhere, double-click `SecondBrain.exe`. **There is no public release yet** (v0.8 is local only), so an empty page just means it has not shipped |
-| **Run from source** | You want to read or change the code | Follow *Install* below |
+## What it does
 
-The exe and the source version read and write the **same** `brain.db`, so you can mix them — drop the exe next to an existing library and it picks it up automatically.
+- **Quick search on double Ctrl**: press Ctrl twice anywhere, a search box drops down from the top. `↑↓` to move, `Enter` to open, `Ctrl+1~9` for the Nth row, `Ctrl+Enter` to reveal in Explorer, `Esc` to dismiss
+- **File names and document text in one place**: name matches come from the index (sub-millisecond); after 300 ms of idle it also adds "this document mentions it" hits, tagged and with the matching sentence
+- **Pinyin search**: type `azb` to find 安装包 (setup package), `xzrs` for 行政人事. Initials and full pinyin both work
+- **Real system icons**: each row shows the same icon Explorer would (PDF red, Word blue, Excel green, an exe shows its own icon)
+- **Chinese full-text search**: 3+ characters use an FTS5 trigram index with highlighting; 1–2 characters fall back to `LIKE`
+- **Automatic OCR**: image-only PDFs are recognised on the first 6 pages (20 s per document), offline Chinese OCR
+- **Index scope is visible**: the settings panel shows which drives are indexed, how many entries each holds, which folders feed the document index, and what is excluded
+- **Exclusions apply to both layers**: `exclude_dirs` filters the file-name index and the document index, and whole subtrees are pruned during the walk (on this machine, excluding game libraries took 600k entries down to 200k)
+- **Incremental by default**: changed files are re-indexed, deleted ones are pruned, unchanged ones are skipped; a long index run resumes where it stopped
+- **Five UI languages**: 中文 / English / Español / Português / हिन्दी, following the system or set manually
+- **No uploads**: parsing, OCR and indexing happen locally; the HTTP server binds `127.0.0.1` only
 
-Both editions are a **folder, not a single file**: `_internal/` next to the exe is part of the program.
-Move the whole folder; pulling the exe out on its own leaves it unable to start.
+## Screens
 
-The core edition gives up OCR and nothing else — image-only PDFs get no text (recorded as “no text” in the
-failure breakdown), while text-based PDFs, Office files, EPUB and the rest behave identically.
+The main window is the detailed view: name and content matches in separate bands, highlighted snippets, filters by type and path, plus a timeline.
 
-## Install
+<p align="center"><img src="assets/screenshot-main-en.png" alt="Main window: name matches on top, content matches below with highlighted keywords"></p>
 
-(Exe users can skip this section — “🚀 Smart scan” in the settings panel does all of it for you.)
+<p align="center"><img src="assets/screenshot-settings-en.png" width="440" alt="Settings panel: index scope shows drives, largest folders, indexed folders and exclusions"></p>
 
-Python 3.10+ required (3.12 recommended).
+When the quick search box is empty it lists recently opened files, so often you do not need to type at all:
 
-```bash
-pip install -r requirements.txt
-```
+<p align="center"><img src="assets/screenshot-quick-empty.png" alt="Quick search empty state: recently opened files with real icons and segmented paths"></p>
 
-Create your scope configuration:
+## How it compares to Everything and Listary
 
-```bash
-cp scope.example.json scope.json    # Windows: copy scope.example.json scope.json
-```
+**If what you want is "press Ctrl twice, type, open a file", Second Brain is enough.** The interaction follows the familiar pattern: double Ctrl to summon, one input, nine rows, `Ctrl+1~9` to jump, `Esc` to dismiss, pinyin matching, real icons, recent files when empty, segmented paths.
 
-Edit `scope.json` and put your folders in `include_dirs` (lowercase paths; backslashes must be doubled).
+**It also shows content matches inside the quick window** — neither of those tools looks inside files, so this part is unique to Second Brain.
 
-## Usage
-
-### Graphical interface (the normal way with the exe — no terminal involved)
-
-**Day to day: double-tap Ctrl.** Tap Ctrl twice anywhere and the quick-search window appears near the top of
-the screen — one input box, nine rows:
-
-| Key | What it does |
-|---|---|
-| Just type | Results appear as you type (prefix hits come from an index, usually 0–2 ms) |
-| Type pinyin | `azb` → 安装包, `xzrs` → 行政人事 — first-letter and full pinyin both work |
-| `↑` `↓` | Move the selection |
-| `Enter` | Open the selected row |
-| `Ctrl+1` – `Ctrl+9` | Open the Nth row without leaving the keyboard |
-| `Ctrl+Enter` | Jump to the main window and run the same query as a full-text search |
-| `Esc` | Dismiss (clicking another window dismisses it too) |
-
-300 ms after you stop typing, a "contains" pass runs automatically: names that contain the query anywhere, plus
-**content matches** — documents whose body text mentions it, shown with a purple "content" tag and the matching
-sentence. When names run out, content fills in.
-
-Closing the main window does not quit the program — it drops to the tray and keeps waiting for your double
-Ctrl. To really quit, right-click the tray icon and choose Quit.
-
-<p align="center"><img src="assets/screenshot-quick-empty.png" width="680" alt="The quick window right after it appears: a single input box plus a list of recently opened files, each with a real system icon"></p>
-
-<p align="center"><sub>What you get on the double tap: recently opened files already listed, no typing needed</sub></p>
-
-**First run:**
-
-1. Double-click `SecondBrain.exe` and click “⚙ Settings” at the top right
-2. Click “🚀 Smart scan” — it picks out the folders worth indexing on its own, asks you to confirm, then builds the library
-3. When that finishes, click “🗂 Rebuild name index” (30 s – 3 min depending on file count) — this is the
-   data behind the quick window: names only, nothing is opened or read
-4. **Routine maintenance**: new documents? click “🔄 Update index”. Moved a lot of files? click
-   “🗂 Rebuild name index” again
-
-The main window is the *detailed* search: hit the body text, read the matching lines, filter by type or path.
-
-The settings panel — scanning, updating and health checks all live here, no commands to remember:
-
-<p align="center"><img src="assets/screenshot-settings-en.png" width="880" alt="The Second Brain exe settings panel: index scope plus the five buttons (smart scan, add folder, save & build index, update index, health check)"></p>
-
-<p align="center"><sub>The same panel switched to Chinese:</sub><br>
-<img src="assets/screenshot-settings-zh.png" width="620" alt="Second Brain settings panel, Chinese"></p>
-
-### How it relates to Listary / Everything
-
-**If all you want is "double-tap Ctrl, type a name, open the file", Second Brain alone is enough — you don't
-need Listary.** The quick window follows the conventions people already know: double-tap Ctrl to summon, one input line, nine rows,
-`Ctrl+1–9` to open, `Esc` to dismiss, **pinyin fuzzy** (`azb` → 安装包), **real system icons** (the same one
-Explorer shows), **recent files in the empty state**, and **breadcrumb paths** (`C: › … › Library › HR`).
-File **and** folder names are searched together — type 报 and files and directories land in the same list;
-`Enter` opens the file, or jumps straight into that folder.
-
-**Content hits show up in the quick window too**: 300 ms after you stop typing, a body-text pass runs
-automatically, and matches appear with a purple "content" tag and the matching sentence. This is what
-Listary and Everything *cannot* do — they only look at names.
-
-**What it does not do, stated plainly**: Listary still has things Second Brain doesn't — jumping to a folder
-from inside an Open/Save dialog, selecting a file in Explorer, and an index that follows NTFS live (ours is a
-snapshot you rescan). So if you use Listary as a *file-dialog accelerator*, the two don't conflict; install both.
-
-**What about Everything?** Its index is built straight from the NTFS file table, so millions of files stay
-instant and it follows the system live. Second Brain's name index is a static snapshot, but it can find things
-whose *name* says nothing and whose *body* says everything.
-
-| | "I know what it's called" | "Which file ever said this?" | Index freshness |
+| | "I know what it is called" | "Which file contains this sentence?" | Index freshness |
 |---|---|---|---|
-| Everything | Best in class, live | Cannot do it | Live |
-| Listary | Strong, plus a launcher | Cannot do it | Live |
-| **Second Brain** | Enough: 1.57M file names + 113k folder names disk-wide, 0.2 ms for prefix hits | **Only this one can** | Manual "Rebuild name index" |
+| **Everything** | Best in class, reads the NTFS file table, real time | No | Live |
+| **Listary** | Strong, with pinyin and a launcher | No | Live |
+| **Second Brain** | Good enough: file and folder names (game libraries excludable — 200k entries here), around 0.2 ms per prefix query, pinyin included | **In the quick window** | Manual "Rebuild name index" |
 
-Older users with Everything installed still have the `/api/files` fallback path (it works when Everything is
-running with its HTTP server on). That exists for people who already run Everything and haven't built a name
-index yet — normal use never touches it.
+**What it does not do**: Listary can also jump folders inside Open/Save dialogs, select files in Explorer, and keep its index updated from NTFS in real time. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
 
-**Command-line entries** (for shortcuts and other launchers):
+> Second Brain is an independent implementation: it uses no code, icons or UI assets from the products above, and has no affiliation with them. Product names appear only to explain the differences.
 
-| Command | Effect |
-|---|---|
-| `SecondBrain.exe 报销标准` | Opens the main window with results already on screen |
-| `SecondBrain.exe --settings` | Opens straight into the settings panel |
-| `SecondBrain.exe --silent` | Stays resident with no window, waiting for the double Ctrl |
-| `SecondBrain.exe --mini` | Shows the quick-search window on startup |
-| `SecondBrain.exe --lang en 报销` | Forces the English interface (`zh` likewise) |
+## First run
 
-**Autostart**: put a shortcut to `SecondBrain.exe` in `shell:startup` with `--silent` appended to the target —
-it then sits quietly in the tray from boot, one double Ctrl away. Quit from the tray icon.
+1. Double-click `SecondBrain.exe` — the main window opens (closing it does not quit; the app stays in the tray waiting for a double Ctrl)
+2. Open **Settings** and click **Scan all drives** — it proposes the folders worth indexing and lets you confirm
+3. Indexing starts on its own; the search box does not wait for it
+4. Day to day: **Update current scope** after adding documents; **Rebuild name index** after moving large numbers of files
 
-> Second Brain is an independent implementation: it uses no code, icons or UI assets from any product
-> mentioned here, and is not affiliated with or endorsed by them. Product names appear only to explain
-> the differences.
-
-**If you already live in Listary's input box**: you can still add a command there (Options → Commands → ➕),
-keyword `sb`, argument `"{query}"`, so `sb 报销流程` opens Second Brain with results. With the quick window
-around, that's now optional.
-
-### Command line (source edition, optional)
-
-```bash
-python brain.py update              # same as “🔄 Update index” in settings: rescan → incremental index → prune
-python brain.py serve               # open the web UI at http://127.0.0.1:8765
-python scan_docs.py                 # scan disks only, write the candidate list (paths only)
-python brain.py index scope.json    # build the index only (resumable, shows count / rate / ETA)
-python brain.py search <keywords> [limit] [ext] [path-contains]   # search from the terminal
-python brain.py prune                                            # only remove entries for vanished files
-python brain.py selftest                                         # quality self-test → eval_report.txt
-```
-
-### Desktop window (source edition)
-
-Don't want a console window? Run `python app_window.py` (or double-click `start.bat` on Windows): it opens a
-**standalone desktop window** via pywebview — not a browser tab — backed by the local HTTP server.
-If pywebview isn't installed it falls back to your default browser.
-
-`update.bat` is the routine maintenance entry point — it's the same as `python brain.py update`.
-
-## Configuring the index scope
-
-Two fields matter in `scope.json`:
+The index scope lives in `scope.json` next to the program, with two fields:
 
 | Field | Meaning |
 |---|---|
-| `include_dirs` | Folders to index, matched by path prefix. Lowercase, doubled backslashes on Windows |
-| `exclude_dirs` | Keywords; any path containing one is skipped |
+| `include_dirs` | Folders to index (prefix match; also the first scan roots for the name index) |
+| `exclude_dirs` | Keywords; any path containing one is skipped (applies to both the name index and the document index) |
 
-`scan_docs.py` adds a second safety net: any directory whose name contains 「小说 / 书城 / 书架 / novel / fiction / 轻小说」 is never touched — it doesn't even appear in the candidate list.
+One more safety net: any subtree whose directory name contains 小说 / 书城 / 书架 / novel / fiction / 轻小说 / 网文 (novel-related words) is never touched — not even scanned.
 
-**If your documents live under a system folder such as `C:\Program Files`** (portable installs, for example):
-those folders are on the scanner's skip list. List them in `include_dirs` and each one is added as its
-own scan root automatically (since v6.0), so nothing is missed.
+## Query syntax
 
-## Supported formats and known limits
+Type plain words. Multiple words are ANDed, and each word is treated as a literal phrase, so `C++`, `node.js`, `a-b`, `"quotes"` and `(parens)` are all searchable without breaking FTS syntax.
+
+The main input also understands a few prefixes, applied as you type:
+
+| Syntax | Meaning |
+|---|---|
+| `ext:pdf` | Only that extension |
+| `size:>10m` | Filter by size (`k` / `m` / `g`) |
+| `dm:7d` | Modified within the last 7 days (`h` / `d` / `w` / `m` / `y`) |
+| `-draft` | Exclude anything containing that word |
+| `folder/` | Folders only |
+| `content:` | Search document text only, ignore file names |
+
+File names take part in retrieval too: a document whose body never mentions the word but whose file name does will still be found, with the hit highlighted in the name.
+
+## Command line and automation
+
+The exe accepts startup arguments, handy for launcher integration:
+
+| Command | Effect |
+|---|---|
+| `SecondBrain.exe reimbursement` | Open the main window with results |
+| `SecondBrain.exe --settings` | Open the main window with settings expanded |
+| `SecondBrain.exe --silent` | Stay in the tray, no window, wait for double Ctrl |
+| `SecondBrain.exe --mini` | Show the quick search box on launch |
+| `SecondBrain.exe --lang en reimbursement` | Force the English UI (`zh` likewise) |
+
+URL parameters for the browser UI:
+
+| Parameter | Effect |
+|---|---|
+| `?q=keyword` | Open with results |
+| `?panel=settings` | Open with settings expanded (legacy `?cfg=1` still works) |
+| `?lang=zh` / `?lang=en` | Force that language for this link |
+
+Example: `http://127.0.0.1:8765/web/?q=report&lang=en`
+
+**Start with Windows**: there is a switch in settings; you can also drop a shortcut into `shell:startup` with `--silent` appended to the target.
+
+## Running from source
+
+Python 3.10+ (3.12 recommended).
+
+```bash
+pip install -r requirements.txt
+python app_window.py          # desktop window (start.bat on Windows)
+python brain.py serve         # or browser UI only: http://127.0.0.1:8765
+```
+
+Prepare the scope file before the first run:
+
+```bash
+cp scope.example.json scope.json        # Windows: copy scope.example.json scope.json
+```
+
+List your folders in `include_dirs` (backslashes must be doubled), then:
+
+```bash
+python brain.py update        # scan → incremental index → prune
+python brain.py index scope.json   # document index only (resumable)
+python brain.py search keyword [count] [ext] [path contains]
+python brain.py prune         # drop entries for deleted files
+python brain.py selftest      # quality self-test, writes eval_report.txt
+python scan_docs.py           # scan only, produce the file list
+```
+
+The frontend lives in `web/` (React + TypeScript + Tailwind). Rebuild it after changes:
+
+```bash
+cd web
+npm install
+npm run build      # output in web/dist, the backend serves it directly
+npm test           # 35 unit tests
+```
+
+Building the exe (Windows, requires PyInstaller):
+
+```bash
+cd release/github
+python -m PyInstaller --noconfirm --clean second-brain-app.spec && python -B stage_app.py
+python -B make_payload.py && python -m PyInstaller --noconfirm --clean SecondBrain-Setup.spec && python -B stage_setup.py
+```
+
+## Supported formats and limits
 
 | Format | Supported | Notes |
 |---|---|---|
-| .txt / .md | Yes | Detects utf-8 / gbk / utf-16, gb18030 as a fallback |
-| .pdf | Yes | pypdf reads the first 20 pages; image-only files get OCR on the first 6 (20 s budget) |
-| .docx / .pptx / .xlsx / .epub | Yes | zip + XML unpacking, no external dependencies |
-| .html / .htm | Yes | Tags stripped, body text kept |
-| .rtf | Yes | Control words stripped; Chinese is decoded with the document's own `\ansicpg` codepage, so `\'b1\'a3`-style GBK and `\uNNNN` escapes both survive |
-| .doc / .xls / .ppt / .wps / .et / .dps / .mobi | No | Legacy binary Office / ebook formats; pure-Python parsing is unreliable. Convert to .docx / .xlsx / .pptx with WPS or LibreOffice first |
-| Vendor-encrypted documents | No | Files with an abnormal header are recorded as “encrypted” and skipped; they never pollute the index |
-| Body length | 2 MB cap | Longer text is truncated so one giant file can't stall the index |
+| `.txt` / `.md` | Yes | Detects UTF-8 / GBK / UTF-16, with a gb18030 fallback |
+| `.pdf` | Yes | pypdf reads the first 20 pages; image-only PDFs are OCR'd (first 6 pages, 20 s budget) |
+| `.docx` / `.pptx` / `.xlsx` / `.epub` | Yes | zip + XML extraction, no external dependency |
+| `.html` / `.htm` | Yes | Tag stripping |
+| `.rtf` | Yes | Control words stripped; Chinese decoded via the document's `\ansicpg` |
+| `.doc` / `.xls` / `.ppt` / `.wps` / `.et` / `.dps` | Machine dependent | Uses a local Office / WPS install; otherwise recorded as "legacy format" and skipped |
+| Encrypted documents | No | Recorded as "encrypted" and skipped, never polluting the index |
+| Document body | 2 MB cap | Longer text is truncated so one huge file cannot stall indexing |
 
-Files that fail to yield text are recorded with a reason in the `meta` table (encrypted / corrupted /
-empty / temp file / legacy format). The end of an index run prints a breakdown by reason, so you can
-tell at a glance whether you need OCR or a format conversion — nothing disappears silently.
-
-## Search syntax
-
-Plain keywords work. Multiple space-separated words are combined with AND, and every word is treated
-as a literal phrase, so `C++`, `node.js`, `a-b`, `"quoted"` and `(parens)` are all safe to type —
-they never trigger an FTS syntax error.
-
-**File names are searched too.** If a keyword appears in a file's name but not in its body, the
-document is still returned, with the name highlighted — so searching “2026 budget” finds
-`2026-budget-draft.xlsx` even when the sheet itself never spells it out.
-
-Filters: the **Type** box takes an extension (`pdf`, `docx`, …), the **Path contains** box filters by
-substring of the full path (case-insensitive).
-
-### URL parameters
-
-Handy for bookmarks and shortcuts:
-
-| Parameter | Effect | Equivalent on the exe |
-|---|---|---|
-| `?q=keyword` | Open with results already rendered | `SecondBrain.exe keyword` |
-| `?cfg=1` | Open with the settings panel expanded | `SecondBrain.exe --settings` |
-| `?lang=zh` / `?lang=en` | Force the interface language for this link | `SecondBrain.exe --lang en` |
-
-Example: `http://127.0.0.1:8765/?q=invoice&lang=en`
-
-## Quality self-test
-
-Output from an actual `python brain.py selftest` run (run it yourself and the full report lands in `eval_report.txt`):
-
-```
-[PASS] A1 retrieval recall@3 = 5/5 —— recall@1=5/5, MRR=1.000
-[PASS] A2 relevance ranking —— bm25 ordering effective
-[PASS] A3 encrypted PDF excluded —— zero leakage confirmed
-[PASS] B  dual extractor agreement pypdf vs pymupdf = 1.00
-[PASS] C  OCR character error rate CER = 7.3%
-[PASS] D  malformed-file fuzz: 9 cases —— zero crashes
-[PASS] E  SQLite/FTS5 integrity check
-[PASS] F  file-change auto re-index
-[PASS] G1 failure attribution / G2 prune
-OVERALL: PASS
-```
-
-The whole run uses synthetic data in a temporary directory — **your real index is never touched**.
-
-### QA suite (before release)
-
-`selftest.py` answers "does it work". `qa_test.py` answers "does it hold up":
-boundary inputs (FTS syntax, wildcards, SQL-injection shapes, 5 000-character queries),
-latency on a real library, concurrent requests, resource leaks, the `/open` endpoint,
-and whether the English UI leaks Chinese. It runs read-only against your own index and
-writes `QA_REPORT.md`.
-
-```
-python qa_test.py            # full run
-python qa_test.py --quick    # skip concurrency / leak sections
-```
-
-Last run on an 8,626-document / 2.37 GB library: **98 pass, 0 fail, 1 warning**.
-The seven defects it caught — and the numbers behind the fixes — are in
-[QA_FINDINGS.md](QA_FINDINGS.md).
+Every failure is recorded with a reason (encrypted / corrupted / empty / temporary / legacy format) and summarised after each run, so nothing disappears silently.
 
 ## Privacy
 
-- Parsing, OCR and indexing all happen locally; no network requests are made
-- The HTTP server binds to `127.0.0.1` only, validates Host/Origin, and accepts `application/json` POSTs only
-- The index is just `brain.db` next to the executable — delete it and everything is gone
-- `.gitignore` excludes `brain.db`, `scan_raw.csv` and `scope.json`: they contain document text and local paths
+- Parsing, OCR and indexing all run locally; no network requests are made
+- The HTTP server binds `127.0.0.1` only, validates `Host` / `Origin`, requires same-origin requests for `/api/*`, and accepts only `application/json` bodies up to 64 KB
+- Opening files and reading thumbnails require a path that is already indexed
+- The index is just `brain.db` in the program folder — delete it and everything is gone
+- `.gitignore` excludes `brain.db`, `scan_raw.csv` and `scope.json`; they contain your text and local paths
 
-## Project layout
+## Quality self-test
+
+`python brain.py selftest` builds a database from synthetic data in a temp folder and checks retrieval accuracy, cross-validation between two PDF extractors, OCR character error rate, malformed-file fuzzing and database integrity — without touching your real index:
 
 ```
-brain.py            core: indexing / search / web server / pruning / self-test dispatch
-scan_docs.py        disk scanner (exclusion rules, fiction-folder safety net)
-app_window.py       desktop window launcher (pywebview)
-selftest.py         quality self-test (synthetic data)
-qa_test.py          QA suite: boundaries / latency / concurrency / leaks
-ocr_backfill.py     re-run indexing for files that previously yielded no text
-gen_icon.py         generates the app icon
-scope.example.json  scope configuration template
-start.bat           Windows: open the desktop window
-update.bat          Windows: rescan → index → prune in one click
-build_exe.bat       Windows: build both executables (needs PyInstaller)
-second-brain-app.spec   PyInstaller config, full edition (with OCR)
-second-brain-core.spec  PyInstaller config, core edition (no OCR)
-assets/             UI screenshots and app icon used by the READMEs
-README.en.md        this document (README.md is the Chinese version)
-QA_FINDINGS.md      the 7 defects the pre-release QA round turned up, with before/after numbers
-brain.db            (generated) SQLite index — docs = FTS5 table, meta = processed files
-scan_raw.csv        (generated) last scan candidate list
-eval_report.txt     (generated) last self-test report
-QA_REPORT.md        (generated) last QA suite report
+[PASS] A1 retrieval recall@3 = 5/5 — recall@1=5/5, MRR=1.000
+[PASS] A2 relevance ranking — bm25 ordering in effect
+[PASS] A3 encrypted PDF never indexed, never searchable
+[PASS] B  extractor agreement pypdf vs pymupdf = 1.00
+[PASS] C  OCR character error rate CER = 7.3%
+[PASS] D  malformed-file fuzz: 9 cases — zero crashes
+[PASS] E  SQLite/FTS5 integrity check
+[PASS] F  changed files are re-indexed automatically
+[PASS] G1 failure attribution / G2 prune cleanup
+OVERALL: PASS
+```
+
+There is also `qa_test.py` for release runs: edge-case input (FTS syntax, wildcards, injection shapes, very long queries), latency on a real library, concurrent requests, `/open` privilege checks, and untranslated strings in the English UI. Read-only; it writes `QA_REPORT.md`. Last run on an 8,626-document / 2.37 GB library: 98 passed / 0 failed / 1 warning, with the 7 defects found documented in [QA_FINDINGS.md](QA_FINDINGS.md).
+
+## Repository layout
+
+```
+brain.py                core: indexing / search / HTTP server / prune / self-test driver
+scan_docs.py            disk scanner (exclusions, novel-directory guard)
+app_window.py           desktop window (pywebview) with high-DPI handling
+hotkey.py               global double-Ctrl hook
+tray.py                 tray icon and menu
+apprank.py              app popularity and Chinese display names
+selftest.py             quality self-test (synthetic data)
+qa_test.py              pre-release QA: edge cases / latency / concurrency / leaks
+ocr_backfill.py         re-runs OCR over previously unreadable files
+web/                    frontend source (React + TypeScript + Tailwind)
+release/github/         packaging scripts and installer (PyInstaller specs)
+assets/                 screenshots and application icons
+scope.example.json      scope template
 ```
 
 ## License

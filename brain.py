@@ -35,7 +35,7 @@ import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-APP_VERSION = 'v0.9.44'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.45'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 BUILD_DATE = '2026-11-06'
 PY_VER = sys.version.split()[0]
 SQL_VER = sqlite3.sqlite_version
@@ -3471,12 +3471,15 @@ def mini_search(con, q, limit=9, deep=False, body=False):
                 out.append(it)
     # 只缓存「有结果」的查询：首启建库时表还很小，这时把空结果缓存下来，
     # 会让用户在接下来的一整段建库时间里反复搜到「没有找到」（实测：png 在 24 秒内一直是 0 条）。
-    if deep and items:
+    # 必须缓存 out 而不是 items：正文命中是后补进 out 的，items 里没有它们。
+    # 早先缓存的是 items，于是同一个词**第一次**搜有 5 条（含 3 条正文），
+    # 第二次只剩 2 条 —— 用户看到的是「正文结果凭空消失」，还以为自己记错了。
+    if deep and out:
         with MINI_LOCK:
             if len(MINI_CACHE) > MINI_CACHE_MAX:
                 for k in sorted(MINI_CACHE, key=lambda k: MINI_CACHE[k][0])[:100]:
                     MINI_CACHE.pop(k, None)
-            MINI_CACHE[ck] = (time.time(), [dict(x) for x in items])
+            MINI_CACHE[ck] = (time.time(), [dict(x) for x in out])
     return {'items': out, 'deep': deep,
             'ms': int((time.perf_counter() - t0) * 1000), 'n': len(items)}
 
@@ -5864,11 +5867,15 @@ def db_reclaim(min_free_mb=AUTO_RECLAIM_MB):
 # 快搜窗底部两行（结果列表下方）也要跟着语言走，单独补两个键，
 # 免得为了两句话去改上面五个字典块的结构。
 MINI_L_EXTRA = {
-    'zh': {'foot_typing': '也可以直接打字，正文一样能搜', 'foot_esc': 'Esc 关闭'},
-    'en': {'foot_typing': 'Type directly — document text is searched too', 'foot_esc': 'Esc to close'},
-    'es': {'foot_typing': 'Escribe directamente: también busca en el texto', 'foot_esc': 'Esc para cerrar'},
-    'pt': {'foot_typing': 'Digite direto: também busca no texto', 'foot_esc': 'Esc para fechar'},
-    'hi': {'foot_typing': 'सीधे टाइप करें — दस्तावेज़ पाठ भी खोजा जाता है', 'foot_esc': 'बंद करने के लिए Esc'},
+    'zh': {'foot_typing': '也可以直接打字，正文一样能搜', 'foot_esc': 'Esc 关闭', 'tag_body': '正文'},
+    'en': {'foot_typing': 'Type directly — document text is searched too', 'foot_esc': 'Esc to close',
+           'tag_body': 'Text'},
+    'es': {'foot_typing': 'Escribe directamente: también busca en el texto', 'foot_esc': 'Esc para cerrar',
+           'tag_body': 'Texto'},
+    'pt': {'foot_typing': 'Digite direto: também busca no texto', 'foot_esc': 'Esc para fechar',
+           'tag_body': 'Texto'},
+    'hi': {'foot_typing': 'सीधे टाइप करें — दस्तावेज़ पाठ भी खोजा जाता है', 'foot_esc': 'बंद करने के लिए Esc',
+           'tag_body': 'पाठ'},
 }
 MINI_L = {
     'zh': {'ph': '搜索文件名、文件夹或正文内容', 'detail': '详细搜索（Ctrl+Enter）', 'search': '搜索',
@@ -6148,7 +6155,7 @@ function rowHtml(it,i,q,withKey){
   return '<div class="row'+(i===cur?' on':'')+'" data-i="'+i+'">'
     +'<span class="ico">'+ico(it)+'</span>'
     +'<span class="txt"><span class="nm">'+(q?hl(it.dn||it.n,q):esc(it.dn||it.n))
-      +(it.b?'<i class="tag">正文</i>':'')+'</span>'+sub+'</span>'
+      +(it.b?'<i class="tag">'+esc(MT('tag_body'))+'</i>':'')+'</span>'+sub+'</span>'
     +(withKey?'<span class="kbd">'+(i<9?'Ctrl+'+(i+1):'')+'</span>':'')+'</div>';
 }
 function render(items,q,keep){
@@ -6181,7 +6188,10 @@ function render(items,q,keep){
     LIST.innerHTML='<div class="empty">'+esc(MT('empty')+' — '+q)+'<i>'+esc(MT('fr'))+'</i></div>';
     bind(); resize(); return;
   }
-  RH.classList.remove('hide');
+  /* 结果态必须把它藏起来：这个表头写的是「最近打开 / Enter 直接打开」，
+     挂在搜索结果上面等于告诉用户「下面这些是你最近开的」——纯误导。
+     只有 renderRecent() 才该让它在场。 */
+  RH.classList.add('hide');
   if(rows.length){
     FT.innerHTML='<span class=mic></span><span>'+esc(MT('more', {q: q}))+'</span>';
     FR.textContent=MT('fr');

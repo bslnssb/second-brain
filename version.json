@@ -1,6 +1,6 @@
 {
-  "version": "v0.9.44",
+  "version": "v0.9.45",
   "published": "2026-11-06",
   "page": "https://github.com/bslnssb/second-brain/releases",
-  "notes": "修安装器在安装目录叫 SecondBrain 时报 [WinError 2]；设置里新增「索引范围」；排除目录对文件名索引同样生效。本文件由发版脚本更新，客户端检查更新时优先读它（国内可直连 jsDelivr）。"
+  "notes": "修快搜窗第二次搜索丢正文命中、结果态误显示「最近打开」标题、英文界面「正文」标签仍是中文；修主窗口同一文件重复两行；?q= / ?lang= 启动参数恢复生效；补上帮助里早就写着却从没实现的 Ctrl+F / Ctrl+Enter。README 与全部界面截图重写重拍。本文件由发版脚本更新，客户端检查更新时优先读它（国内可直连 jsDelivr）。"
 }
