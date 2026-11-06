@@ -10,6 +10,7 @@
 #
 # 产物：dist/SecondBrain/SecondBrain.exe + _internal/
 #   把整个 SecondBrain 文件夹放到 brain.db 旁边即可，数据库就在 exe 同目录。
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
@@ -27,7 +28,20 @@ for pkg in ('rapidocr_onnxruntime',  # 离线 OCR（含 onnx 模型）
     hiddenimports += h
 
 # 托盘图标要读 ico 文件；窗口图标由 exe 资源自带，这里补一份给托盘用
-datas += [('assets/icon.ico', 'assets')]
+# 运行期要读的图片资源：图标（关于弹窗用 icon_preview，托盘/窗口用 icon.ico）
+# 和赞赏码（donate.png / donate-6.png …）。
+# 之前只打了 icon.ico，于是装完「关于」里没有二维码、图标也是通用文件图标 —— 用户实测发现的。
+for _f in ('icon.ico', 'icon_preview.png'):
+    if Path('assets', _f).is_file():
+        datas += [(str(Path('assets') / _f), 'assets')]
+for _d in sorted(Path('assets').glob('donate*')):
+    if _d.is_file():
+        datas += [(str(_d), 'assets')]
+# React 前端（web/dist）跟着走：运行期由 brain.web_ui_dir() 从 _internal/web 找 index.html。
+# 没构建过就跳过，旧的 PAGE_TPL 界面照样能用。
+_webdist = Path('web') / 'dist'
+if _webdist.is_dir():
+    datas += [(str(_webdist), 'web')]
 
 # hotkey / tray 是在函数里 import 的（进程起来才装钩子和托盘），
 # 显式列出来省得 PyInstaller 漏掉；win32* 由 pywin32 自带的 hook 收集。
@@ -96,6 +110,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['assets/icon.ico'],
+    version='version_info.txt',
 )
 
 coll = COLLECT(

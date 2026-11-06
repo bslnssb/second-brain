@@ -4,6 +4,7 @@ setlocal
 cd /d "%~dp0"
 
 echo [1/2] 打包完整版（含 OCR / PDF / Office 解析）...
+python gen_version.py || goto :fail
 python -m PyInstaller --noconfirm --clean second-brain-app.spec || goto :fail
 
 echo [2/2] 打包精简版（只要搜索，体积小）...

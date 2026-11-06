@@ -47,3 +47,17 @@ tmp/
 *.bak
 *.bak-*
 install_update.bat
+
+# 打包生成物（体积大且可复现，别进仓库）
+payload.zip
+version_info.txt
+
+# 前端：依赖装完就删的东西，dist 由 `npm run build` 生成
+node_modules/
+*.tsbuildinfo
+
+# 本机运维脚本（发公告、诊断环境），与使用者无关
+发公告.bat
+发布公告.py
+诊断.bat
+setup_app_v*_backup.py

@@ -312,6 +312,181 @@ def run_all(verbose=True, write_report=True):
                  else f'仍含不可编码字符：{fixed!r}')
         except Exception as e:
             _rec('FAIL', 'H 文件名检索与路径过滤', f'{type(e).__name__}: {e}')
+
+        # ══ I. 「更新」防清空护栏（2026-11-04 搬家事故的回归测试）
+        # 事故形态：索引范围里的文件夹被搬走 → 扫描安静地扫出 0 个 → prune 把
+        # 整库当成"用户把文件删了"。这里把三道护栏逐个钉住。
+        guard = None
+        try:
+            guard = Path(tempfile.mkdtemp(prefix='sb-guard-'))
+            groot = guard / 'root'
+            gscope = guard / 'scope.json'
+
+            def _gfill(dead):
+                gscope.write_text(json.dumps({'scan_csv': 'x.csv',
+                                              'include_dirs': [str(groot)],
+                                              'exclude_dirs': []}, ensure_ascii=False),
+                                  encoding='utf-8')
+                c = brain.init_db()
+                c.execute('DELETE FROM meta')
+                for i in range(100):
+                    p = str(groot / (f'dead{i}.txt' if i < dead else f'live{i}.txt'))
+                    c.execute('INSERT INTO meta(path, indexed_at) VALUES(?,?)', (p, 0))
+                c.commit()
+                c.close()
+
+            def _gcount():
+                c = brain.init_db()
+                n = c.execute('SELECT COUNT(*) FROM meta').fetchone()[0]
+                c.close()
+                return n
+
+            def _gfiles(dead):
+                groot.mkdir(parents=True, exist_ok=True)
+                for i in range(dead, 100):
+                    (groot / f'live{i}.txt').write_text('x')
+
+            # I1：范围目录本身不在了 —— 它名下一条都不许删
+            _gfill(0)
+            _gfiles(0)
+            shutil.rmtree(groot)
+            n1 = brain.prune(scope_path=str(gscope))
+            left1 = _gcount()
+            _rec('PASS' if (n1 == 0 and left1 == 100) else 'FAIL',
+                 'I1 索引范围被搬走 → 一条不删',
+                 f'删了 {n1} 条、剩 {left1} 条' if (n1 or left1 != 100) else
+                 '范围目录不存在时整体跳过（这正是搬家事故的形态）')
+
+            # I2：一次消失过半 —— 停下问人，不删
+            _gfill(60)
+            _gfiles(60)
+            brain._prog(state='busy')
+            n2 = brain.prune(scope_path=str(gscope))
+            left2 = _gcount()
+            blocked = brain.PROG.get('k') == 'e_prune_bulk'
+            _rec('PASS' if (n2 == 0 and left2 == 100 and blocked) else 'FAIL',
+                 'I2 一次要清掉过半 → 暂停并报错',
+                 f'删了 {n2} 条、剩 {left2} 条、k={brain.PROG.get("k")}')
+
+            # I3：人已确认（--force）—— 照清
+            n3 = brain.prune(force=True, scope_path=str(gscope))
+            _rec('PASS' if n3 == 60 and _gcount() == 40 else 'FAIL',
+                 'I3 人工确认后（force）照清',
+                 f'删了 {n3} 条、剩 {_gcount()} 条')
+
+            # I4：少量真删除 —— 照常清理，不许误刹车
+            _gfill(3)
+            _gfiles(3)
+            n4 = brain.prune(scope_path=str(gscope))
+            _rec('PASS' if (n4 == 3 and _gcount() == 97) else 'FAIL',
+                 'I4 少量真删除照常清理',
+                 f'删了 {n4} 条、剩 {_gcount()} 条')
+        except Exception as e:
+            _rec('FAIL', 'I 更新防清空护栏', f'{type(e).__name__}: {e}')
+        finally:
+            if guard is not None:
+                shutil.rmtree(str(guard), ignore_errors=True)
+
+        # ══ J. 范围搬家后「自动认亲」（第 2 层，2026-11-04 事故的正解）
+        # 用户把文件夹整体挪走 → 库里全是旧地址 → 先在本机找同名文件夹，再拿库里的
+        # 旧路径做抽检；对上才平移，对不上一条都不许改。
+        jroot = None
+        real_jidx = brain._dir_index
+        try:
+            jroot = Path(tempfile.mkdtemp(prefix='sb-repair-'))
+            jold = jroot / 'DeskBox' / '1' / '我的文件夹'
+            (jold / 'a').mkdir(parents=True)
+            for n in ('doc1.docx', 'doc2.pdf', 'a/x.md'):
+                (jold / n).write_text('渗透测试 ' + n, encoding='utf-8')
+            (jroot / '1').mkdir()
+            jnew = jroot / '1' / '我的文件夹'
+            shutil.move(str(jold), str(jnew))        # 搬家：旧目录消失
+            jscope = jroot / 'scope.json'
+
+            def _jfill():
+                jscope.write_text(json.dumps({'scan_csv': 'x.csv',
+                                              'include_dirs': [str(jold)],
+                                              'exclude_dirs': []}, ensure_ascii=False),
+                                  encoding='utf-8')
+                c = brain.init_db()
+                c.execute('CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY, '
+                          'name TEXT NOT NULL, parent TEXT, py TEXT, ini TEXT)')
+                c.execute('DELETE FROM meta')
+                c.execute('DELETE FROM files')
+                for n in ('doc1.docx', 'doc2.pdf', 'a/x.md'):
+                    p = str(jold / n)
+                    c.execute('INSERT INTO meta(path, indexed_at) VALUES(?,?)', (p, 0))
+                    c.execute('INSERT OR REPLACE INTO files(path, name, dir, size, mtime) '
+                              'VALUES(?,?,?,?,?)',
+                              (p, os.path.basename(p), os.path.dirname(p), 1.0, 1.0))
+                c.commit()
+                c.close()
+
+            def _jcount(prefix):
+                c = brain.init_db()
+                n = c.execute('SELECT COUNT(*) FROM meta WHERE lower(path) LIKE ?',
+                              (prefix.lower() + os.sep + '%',)).fetchone()[0]
+                c.close()
+                return n
+
+            # J1：唯一同名目录 + 抽检全中 → 自动平移，且范围配置跟着改、留了备份
+            _jfill()
+            brain._dir_index = lambda root: {'我的文件夹': [str(jnew)]}
+            left = brain._repair_then_recheck([str(jold)], str(jscope))
+            moved = _jcount(str(jnew))
+            data = json.loads(jscope.read_text(encoding='utf-8'))
+            baks = list(jroot.glob('scope.json.bak-*'))
+            ok = (left == [] and moved == 3 and _jcount(str(jold)) == 0
+                  and data['include_dirs'][0] == str(jnew) and bool(baks))
+            _rec('PASS' if ok else 'FAIL', 'J1 搬家后自动认亲并平移路径',
+                 '剩余缺目录、平移条数、范围配置、备份都对' if ok else
+                 f'left={left} moved={moved} old={_jcount(str(jold))} '
+                 f'scope={data["include_dirs"]} bak={len(baks)}')
+
+            # J2：同名但里面根本不是那批文件 → 一条不改（宁可不动，也不猜）
+            _jfill()
+            decoy = jroot / 'decoy' / '我的文件夹'
+            decoy.mkdir(parents=True)
+            brain._dir_index = lambda root: {'我的文件夹': [str(decoy)]}
+            fixed2 = brain.repair_scope([str(jold)], str(jscope))
+            data2 = json.loads(jscope.read_text(encoding='utf-8'))
+            ok2 = (fixed2 == [] and _jcount(str(jold)) == 3
+                   and data2['include_dirs'][0] == str(jold))
+            _rec('PASS' if ok2 else 'FAIL', 'J2 同名但抽检对不上 → 一条不改',
+                 '抽检不够就退回第 1 层的"停下"' if ok2 else
+                 f'fixed={fixed2} old={_jcount(str(jold))} scope={data2["include_dirs"]}')
+
+            # J3：两个都像 → 不在黑窗里猜，把候选交给界面点选（点完才动库）
+            _jfill()
+            d1 = jroot / 'p1' / '我的文件夹'
+            d2 = jroot / 'p2' / '我的文件夹'
+            for d in (d1, d2):
+                (d / 'a').mkdir(parents=True)
+                for n in ('doc1.docx', 'doc2.pdf'):
+                    (d / n).write_text('渗透测试', encoding='utf-8')
+                (d / 'a' / 'x.md').write_text('渗透测试', encoding='utf-8')
+            brain._dir_index = lambda root: {'我的文件夹': [str(d1), str(d2)]}
+            brain.REPAIR_ASK.update(state='idle', old='', items=[], scope='')
+            fixed3 = brain.repair_scope([str(jold)], str(jscope))
+            ask = dict(brain.REPAIR_ASK)
+            ok3a = (fixed3 == [] and ask.get('state') == 'wait'
+                    and len(ask.get('items') or []) == 2)
+            ok3b, _rep = brain.repair_choose(0)
+            data3 = json.loads(jscope.read_text(encoding='utf-8'))
+            ok3 = (ok3a and ok3b and brain.REPAIR_ASK.get('state') == 'idle'
+                   and _jcount(str(d1)) == 3 and _jcount(str(jold)) == 0
+                   and data3['include_dirs'][0] == str(d1))
+            _rec('PASS' if ok3 else 'FAIL', 'J3 两个候选都像 → 交界面点选，点完才动',
+                 '候选记下、按选中的那条平移、待确认清掉' if ok3 else
+                 f'ask={ask.get("state")}/{len(ask.get("items") or [])} '
+                 f'ok3b={ok3b} d1={_jcount(str(d1))} old={_jcount(str(jold))} '
+                 f'scope={data3["include_dirs"]}')
+        except Exception as e:
+            _rec('FAIL', 'J 范围搬家自动认亲', f'{type(e).__name__}: {e}')
+        finally:
+            brain._dir_index = real_jidx
+            if jroot is not None:
+                shutil.rmtree(str(jroot), ignore_errors=True)
     finally:
         brain.DB = old_db
         brain._prog(state='idle')
