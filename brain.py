@@ -74,7 +74,7 @@ from pathlib import Path
 
 
 
-APP_VERSION = 'v0.9.51'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.52'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 
 BUILD_DATE = '2026-11-07'
 
@@ -8056,6 +8056,24 @@ def parse_qsyn(q):
 
         low = tok.lower()
 
+        # 不带冒号的写法也认：size>10m / size>=10m / size<1g / size10m、dm<30d。
+        # 用户的第一反应就是写 `size>10m`（不是 `size:>10m`），而原来只认后者 ——
+        # 认不出来的片段会原样当关键词，于是「微信 size>10m」一条都搜不到，
+        # 用户只会得出「搜索坏了」的结论（2026-11-07 用户实测反馈）。
+        # 判据收紧到「前缀后面紧跟运算符或数字」，免得把 sizechart、filesize、
+        # dmg 这类正常词吞成语法。
+        if low.startswith('size') and len(tok) > 4 and low[4] in '<>=0123456789.':
+
+            tok = 'size:' + tok[4:]
+
+            low = 'size:' + low[4:]
+
+        elif low.startswith('dm') and len(tok) > 2 and low[2] in '<>=0123456789':
+
+            tok = 'dm:' + tok[2:]
+
+            low = 'dm:' + low[2:]
+
         if len(tok) > 1 and low[0] in '-－':
 
             syn['excl'].append(low[1:])
@@ -8143,6 +8161,24 @@ def parse_qsyn(q):
     syn['q'] = ' '.join(rest).strip()
 
     return syn
+
+
+
+def _sz_of(it):
+    """取一条结果的字节大小。
+
+    **结果字典里这个字段叫 z，不叫 s**（`files_rows()`、`mini_search()`、
+    `/api/recent` 三处产出都是 `'m': mtime, 'z': size`）。而 `syn_ok()` 的形参叫
+    size，调用方历史上写的是 `it.get('s')` —— 恒为 None，于是 syn_ok 里
+    「信息不全就不拦」那条兜底把条件整个放行，`size:` 过滤从来没真正生效过。
+    症状：`微信 size:>10m` 会把 958 字节的「微信.lnk」也列出来（2026-11-07 用户实测）。
+
+    这里统一成一个取值口，新增结果来源时只要字段是 z 就自动生效。
+    """
+    v = it.get('s')
+    if v is None:
+        v = it.get('z')
+    return v
 
 
 
@@ -18179,7 +18215,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     items = [it for it in items
 
-                             if syn_ok(it.get('p'), it.get('s'), it.get('m'), syn)]
+                             if syn_ok(it.get('p'), _sz_of(it), it.get('m'), syn)]
 
                     items = sort_items(items, srt)
 
@@ -18249,7 +18285,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     d['items'] = [x for x in d['items']
 
-                                  if syn_ok(x.get('p'), x.get('s'), x.get('m'), syn_m)]
+                                  if syn_ok(x.get('p'), _sz_of(x), x.get('m'), syn_m)]
 
                     allow_open([x['p'] for x in d['items']])
 
@@ -18655,7 +18691,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         # size:/dm:/-排除 在这里收口：结果集只有一屏，过滤比改 SQL 便宜
 
-                        hits = [h for h in hits if syn_ok(h['p'], h.get('s'), h.get('m'), syn)]
+                        hits = [h for h in hits if syn_ok(h['p'], _sz_of(h), h.get('m'), syn)]
 
                         hits = sort_items(hits, srt)
 

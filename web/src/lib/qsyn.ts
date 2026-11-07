@@ -42,9 +42,21 @@ export function parseQSyn(raw: string): QSyn {
   }
   const rest: string[] = []
   // 用 [ \t\u3000] 切：中文输入法常带全角空格，JS 的 split(' ') 会把它留在词里
-  for (const tok of String(raw ?? '').split(/[ \t\u3000]+/)) {
+  for (let tok of String(raw ?? '').split(/[ \t\u3000]+/)) {
     if (!tok) continue
-    const low = tok.toLowerCase()
+    let low = tok.toLowerCase()
+
+    // 不带冒号的写法也认：size>10m / size>=1g / size10m / dm<30d。
+    // 用户第一反应就是写 `size>10m`，不认的话这段会掉进关键词、结果一条都没有。
+    // 判据收紧到「前缀后面紧跟运算符或数字」，免得把 resize2、dmg 这类词吞成语法。
+    // 必须和 brain.parse_qsyn 保持一致，否则提示条和后端行为会打架。
+    if (/^size[<>=0-9.]/.test(low)) {
+      tok = 'size:' + tok.slice(4)
+      low = tok.toLowerCase()
+    } else if (/^dm[<>=0-9]/.test(low)) {
+      tok = 'dm:' + tok.slice(2)
+      low = tok.toLowerCase()
+    }
 
     // -排除（全角减号也认）
     if (tok.length > 1 && (low[0] === '-' || low[0] === '－')) {

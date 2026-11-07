@@ -42,6 +42,31 @@ describe('parseQSyn', () => {
     expect(parseQSyn('a size:1k-2m').size).toEqual([1024, 2 * 1024 * 1024])
   })
 
+  // 2026-11-07 用户实测：写 `微信 size>10m`（不带冒号）一条都搜不到 ——
+  // 那段认不出来，按设计原样当关键词去匹配文件名了。现在两种写法等价。
+  it('size 不带冒号也认', () => {
+    for (const q of ['a size>10m', 'a size>=10m', 'a size10m']) {
+      expect(parseQSyn(q).size).toEqual([10 * 1024 * 1024, null])
+    }
+    expect(parseQSyn('微信 size>10m').q).toBe('微信')
+    expect(parseQSyn('a size<1g').size).toEqual([null, 1024 ** 3])
+    expect(parseQSyn('a size5m-10m').size).toEqual([5 * 1024 * 1024, 10 * 1024 * 1024])
+  })
+
+  it('size 出现在普通单词里不被吞', () => {
+    for (const w of ['filesize', 'sizechart', 'resize2', 'size']) {
+      const s = parseQSyn(w)
+      expect(s.q).toBe(w)
+      expect(s.size).toEqual([null, null])
+    }
+  })
+
+  it('dm 不带冒号也认', () => {
+    expect(parseQSyn('a dm<30d').days).toBe(30)
+    expect(parseQSyn('a dm7d').days).toBe(7)
+    expect(parseQSyn('dmg').q).toBe('dmg')
+  })
+
   it('size: 写坏时当普通词', () => {
     const s = parseQSyn('size:abc')
     expect(s.size).toEqual([null, null])

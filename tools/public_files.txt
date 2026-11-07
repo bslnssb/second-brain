@@ -32,6 +32,7 @@ sync  tests/test_env_matrix.py
 sync  tests/test_fs_safety.py
 sync  tests/test_db_recovery.py
 sync  tests/test_env_check.py
+sync  tests/test_qsyntax.py
 sync  env_check.py
 sync  app_window.py
 sync  hotkey.py
