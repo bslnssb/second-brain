@@ -119,6 +119,80 @@ def check_license():
         '; '.join(bad) or ('公钥 %s…' % (m.group(1)[:12] if m else '?')))
 
 
+# 公开仓库 assets/ 里允许出现的素材，全部是自制：截图、演示 GIF、赞赏码、图标。
+# 新增图片不在这个集合里就出 WARN —— 不是不让加，是提醒确认来源。
+# 从网上下载的图标/插画是这一行代码唯一能拦住的那类侵权。
+KNOWN_ASSETS = {
+    'donate.png', 'icon.ico', 'icon_preview.png',
+    'demo-contract.gif', 'demo-invoice.gif', 'demo-note.gif',
+    'screenshot-main.png', 'screenshot-main-dark.png', 'screenshot-main-en.png',
+    'screenshot-quick.png', 'screenshot-quick-empty.png', 'screenshot-quick-en.png',
+    'screenshot-settings.png', 'screenshot-settings-en.png',
+}
+
+
+def check_ip():
+    """知识产权边界（第 138 项）：只学功能，不碰标识。
+
+    功能与交互从来不受著作权保护 —— 《计算机软件保护条例》第六条写明
+    「不延及开发软件所用的思想、处理过程、操作方法」；界面布局也有判例支持
+    （北京知产法院九宫格案：3×3 摆放方式属通用表达、应保留于公有领域）。
+    所以「参考 Listary 做快搜窗」本身没有法律问题，这也是这个项目能继续做的前提。
+
+    真正会出事的是另外三件事，而且全是「以后顺手一干」的类型，靠记性记不住，
+    所以写成门禁。词表刻意不含单独的「替代」二字：README 里「X 无法替代」这类
+    正常对比不该被拦，只拦「平替 / 汉化版 / 破解 / 替代品」这种自认搭便车的说法。
+
+      1. 宣传里自称「某软件的平替 / 汉化版 / 破解」—— 反不正当竞争法第 6 条的入口
+      2. 打包商业字体 —— 中国字体侵权索赔比界面纠纷常见得多，一套字库动辄数万
+      3. 来源不明的图片素材 —— 顺手抓个图标进 assets，是最容易犯的一次
+
+    注意：本文件通过 `public_files.txt` 的 `sync preflight.py` 同步进 release/github，
+    所以扫描时必须跳过自己，否则下面的词表会把自己判成违规（CI 词表自指的经典坑，
+    和 `public_files.txt` 注释自指是同一类）。以后加词只加正则，别在别的行里
+    让竞品名和攀附词同现 —— 那样即使跳过了自己也会误伤。
+    """
+    bad, warn = [], []
+    rivals = r'Listary|Everything|TextSeek|AnyTXT|Gety'
+    hitch = r'平替|汉化版|汉化|破解|克隆|山寨|仿制|仿冒|替代品|免费替代|完美替代'
+    pat = re.compile(r'(?:%s)[^\n]{0,12}(?:%s)|(?:%s)[^\n]{0,12}(?:%s)'
+                     % (rivals, hitch, hitch, rivals), re.I)
+
+    for p in REPO.rglob('*'):
+        if not p.is_file() or p.suffix.lower() not in ('.md', '.py', '.ts', '.tsx', '.txt'):
+            continue
+        if '.git' in p.parts or 'node_modules' in p.parts or 'dist' in p.parts:
+            continue
+        if p.name == 'preflight.py':
+            continue
+        for i, line in enumerate(text(p).splitlines(), 1):
+            m = pat.search(line)
+            if m:
+                bad.append('%s:%d「%s」' % (p.relative_to(REPO), i, m.group(0)))
+
+    # 字体只认系统字体栈（随 OS 授权，不随安装包分发）。一旦出现 @font-face
+    # 或字体文件，就等于在分发别人的字库，得先有授权。
+    for p in (ROOT / 'web/src').rglob('*.css'):
+        if '@font-face' in text(p):
+            bad.append('%s 用了 @font-face（先确认字体授权）' % p.relative_to(ROOT))
+    for base in (ROOT, ROOT / 'assets', REPO, REPO / 'assets'):
+        if not base.is_dir():
+            continue
+        for p in base.glob('*'):
+            if p.suffix.lower() in ('.ttf', '.otf', '.woff', '.woff2'):
+                bad.append('%s 打包了字体文件' % p.relative_to(ROOT))
+
+    if (REPO / 'assets').is_dir():
+        for p in (REPO / 'assets').glob('*'):
+            if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico'):
+                if p.name not in KNOWN_ASSETS:
+                    warn.append('新增素材 assets/%s（确认自制或已获授权）' % p.name)
+
+    rec('FAIL' if bad else ('WARN' if warn else 'PASS'),
+        '知识产权边界（不攀附 / 不打包他人字体）',
+        '; '.join(bad + warn) or '无攀附措辞、仅系统字体、素材全自制')
+
+
 def check_spec():
     need = ('win32file', 'pythoncom', 'win32com.client', 'pypinyin', 'hotkey', 'tray')
     bad = []
@@ -614,6 +688,7 @@ def main():
     check_i18n()
     check_donate()
     check_license()
+    check_ip()
     check_spec()
     check_legacy()
     check_persistence()
