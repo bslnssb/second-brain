@@ -107,6 +107,10 @@ local qa_test.py
 local .gitignore
 local .gitattributes
 local LICENSE
+# 落地页（GitHub Pages 从 /docs 发布）：只在这个仓库维护。
+# 图片是从 assets/ 复制过去的，让 docs 自包含 —— 将来搬到别的托管（Netlify、
+# 自己的域名）不用改路径。preflight 的 check_landing() 会核每个 src 指向的文件在不在。
+local docs/
 local QA_FINDINGS.md
 local requirements.txt
 local scope.example.json
