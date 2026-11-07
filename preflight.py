@@ -128,6 +128,8 @@ KNOWN_ASSETS = {
     'screenshot-main.png', 'screenshot-main-dark.png', 'screenshot-main-en.png',
     'screenshot-quick.png', 'screenshot-quick-empty.png', 'screenshot-quick-en.png',
     'screenshot-settings.png', 'screenshot-settings-en.png',
+    # 落地页 docs/img/ 里用到的（logo 从仓库根复制，og.png 由 tmp/make_og.py 生成）
+    'logo40.png', 'logo64.png', 'logo256.png', 'og.png',
 }
 
 
@@ -159,7 +161,8 @@ def check_ip():
                      % (rivals, hitch, hitch, rivals), re.I)
 
     for p in REPO.rglob('*'):
-        if not p.is_file() or p.suffix.lower() not in ('.md', '.py', '.ts', '.tsx', '.txt'):
+        if not p.is_file() or p.suffix.lower() not in (
+                '.md', '.py', '.ts', '.tsx', '.txt', '.html', '.htm', '.css'):
             continue
         if '.git' in p.parts or 'node_modules' in p.parts or 'dist' in p.parts:
             continue
@@ -182,11 +185,16 @@ def check_ip():
             if p.suffix.lower() in ('.ttf', '.otf', '.woff', '.woff2'):
                 bad.append('%s 打包了字体文件' % p.relative_to(ROOT))
 
-    if (REPO / 'assets').is_dir():
-        for p in (REPO / 'assets').glob('*'):
+    # 素材白名单：assets/（README 用）和 docs/img/（落地页用）都要过一遍。
+    # 落地页的图是从 assets 复制过去的，将来单独加图也得走同一个白名单。
+    for adir in (REPO / 'assets', REPO / 'docs' / 'img'):
+        if not adir.is_dir():
+            continue
+        for p in adir.glob('*'):
             if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico'):
                 if p.name not in KNOWN_ASSETS:
-                    warn.append('新增素材 assets/%s（确认自制或已获授权）' % p.name)
+                    warn.append('新增素材 %s（确认自制或已获授权）'
+                                % p.relative_to(REPO).as_posix())
 
     rec('FAIL' if bad else ('WARN' if warn else 'PASS'),
         '知识产权边界（不攀附 / 不打包他人字体）',
@@ -229,6 +237,87 @@ def check_terms():
 
     rec('PASS' if not bad else 'FAIL', '许可证表述一致（PolyForm / 不自称开源）',
         '; '.join(bad) or 'LICENSE、两份 README、五语言界面均已同步')
+
+
+def check_landing():
+    """落地页完整性（第 141 项）：页面能打开 ≠ 页面是对的。
+
+    线上最不容易发现的一类错误是**图片路径写错**：HTML 照常渲染，
+    只是图的位置是空的，而且本地用 file:// 打开往往还是好的（相对路径不同），
+    只有真到 Pages 上才 404。发版前把每个 src 核一遍，比上线后盯着看强。
+
+    另外两条守住的是「以后顺手一干」：
+      - 引外部资源（CDN 字体 / 图标库）：断网或域名被墙时整页变白板，
+        而且很可能把别人的素材打包进了自己的宣传页 —— 和第 138 项同一个坑
+      - 下载链接写死版本号：下次发版忘了改，用户点到的是旧安装包
+    """
+    bad, warn = [], []
+    doc = REPO / 'docs' / 'index.html'
+    if not doc.is_file():
+        rec('FAIL', '落地页（docs/index.html）', '文件不存在')
+        return
+    s = text(doc)
+
+    for m in re.finditer(r'\ssrc="((?:https?:)?//[^"]+)"', s):
+        bad.append('外部资源 %s' % m.group(1))
+    if '@font-face' in s:
+        bad.append('用了 @font-face')
+
+    # 本地图片要真的在（这是本条检查的主要目的）
+    for m in re.finditer(r'(?:src|content)="(img/[^"]+)"', s):
+        rel = m.group(1)
+        if not (doc.parent / rel).is_file():
+            bad.append('缺文件 %s' % rel)
+
+    # 下载入口指向 latest，别写死 vX.Y.Z
+    if 'releases/latest' not in s:
+        warn.append('下载链接没有指向 releases/latest')
+
+    if not re.search(r'<title>[^<]{4,}</title>', s):
+        bad.append('缺 <title>')
+    if 'og:image' not in s:
+        warn.append('缺 og:image（转发到群里没有预览图）')
+
+    rec('FAIL' if bad else ('WARN' if warn else 'PASS'),
+        '落地页（资源齐全 / 无外部依赖）',
+        '; '.join(bad + warn) or '图片齐全、无外部资源、下载指向 latest')
+
+
+def check_pro_features():
+    """Pro 功能必须真的挂在授权门控上（第 140 / 143 项）。
+
+    最容易出的事故不是「忘了写门控」，而是**后来重构时顺手删掉**：
+    导出按钮还在、队列还能跑，只是谁都能用。所以逐个 API 分支查一遍，
+    而不是 grep 一下文件里有没有 license_feature 就算数。
+    """
+    bad = []
+    s = text(ROOT / 'brain.py')
+    for route in ('/api/export', '/api/ocr_batch'):
+        blocks = s.split("elif self.path.startswith('%s'):" % route)[1:]
+        if not blocks:
+            bad.append('%s 分支找不到' % route)
+            continue
+        for b in blocks:
+            # 只看这个分支自身，别把下一个 elif 的门控算进来
+            seg = b.split('\n            elif ', 1)[0]
+            if 'license_feature(' not in seg:
+                bad.append('%s 有个分支没检查授权' % route)
+    if "OCRQ_FEATURE = 'ocr_batch'" not in s:
+        bad.append('批量 OCR 的功能位名被改了，签发工具对不上')
+    mod = text(ROOT / 'ocr_batch.py')
+    # 只认**真正的 import 行**：这个文件自己的文档里就写着「不 import brain」，
+    # 用子串匹配会把说明文字判成违规（和 138 项词表自指是同一类坑）。
+    heavy = re.findall(r'^\s*(?:from|import)\s+'
+                       r'(brain|rapidocr_onnxruntime|pymupdf|sqlite3)\b', mod, re.M)
+    if not mod or heavy:
+        bad.append('ocr_batch.py 不再是纯状态机（别把 DB / OCR 引擎塞进去）')
+    man = '\n'.join(l for l in text(REPO / 'tools/public_files.txt').splitlines()
+                    if l.strip() and not l.lstrip().startswith('#'))
+    for f in ('ocr_batch.py', 'xlsx_writer.py', 'tests/test_ocr_batch.py'):
+        if ('sync  %s' % f) not in man:
+            bad.append('public_files.txt 缺 %s' % f)
+    rec('PASS' if not bad else 'FAIL', 'Pro 功能门控（导出 / 批量 OCR）',
+        '; '.join(bad) or '两个新 API 的每个分支都检查授权，模块在公开清单里')
 
 
 def check_spec():
@@ -489,14 +578,14 @@ def check_tests():
             if name == '后端 unittest':
                 m = re.search(r'Ran (\d+) tests', out)
                 ok = (r.returncode == 0 and any(x.startswith('OK') for x in lines)
-                      and m and int(m.group(1)) >= 92)
-                want = '>= 92 项'
+                      and m and int(m.group(1)) >= 242)
+                want = '>= 242 项'
             else:
                 mf = re.search(r'Test Files\s+(\d+) passed', out)
                 mt = re.search(r'Tests\s+(\d+) passed', out)
                 ok = (r.returncode == 0 and mf and mt and
-                      int(mf.group(1)) >= 6 and int(mt.group(1)) >= 56)
-                want = '>= 6 文件 / >= 56 用例'
+                      int(mf.group(1)) >= 7 and int(mt.group(1)) >= 74)
+                want = '>= 7 文件 / >= 74 用例'
             detail = '' if ok else '%s（要求 %s）' % (
                 (lines[-1] if lines else '?')[:100], want)
             rec('PASS' if ok else 'FAIL', '测试全绿：' + name, detail)
@@ -728,6 +817,8 @@ def main():
     check_license()
     check_ip()
     check_terms()
+    check_landing()
+    check_pro_features()
     check_spec()
     check_legacy()
     check_persistence()

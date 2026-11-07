@@ -46,6 +46,7 @@ SELF_SKIP = {
 BAD_NAMES = [
     '*.db', '*.db-wal', '*.db-shm', '*.sqlite', '*.sqlite3',
     'scan_raw.csv', 'scope.json', 'settings.json', 'apps.json',
+    'ocr_batch.json', 'ocr_batch.json.tmp',   # Pro 2 队列断点，属于运行期数据
     '交接文档.md', 'HANDOFF.md', '代码审查*.md', '界面审查*.md',
     '架构评审*.md', '前端架构审查*.md',
     'debug.log', '*.log', 'eval_report.txt', 'QA_REPORT.md',

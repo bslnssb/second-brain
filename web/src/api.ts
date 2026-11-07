@@ -43,6 +43,8 @@ type Bridge = {
   /** 顶栏/标题栏「快搜」按钮：收起详情窗（快搜窗由 open_mini 唤起） */
   hide_main?: () => Promise<boolean>
   open_mini?: () => Promise<boolean>
+  /** 原生目录选择框。浏览器里拿不到绝对路径，批量 OCR 必须走这个桥 */
+  pick_folder?: () => Promise<string>
 }
 
 function bridge(): Bridge | undefined {
@@ -79,6 +81,55 @@ export type ExportResult = {
 
 export const exportResults = (rows: unknown[], q: string) =>
   api<ExportResult>('/api/export', { method: 'POST', body: JSON.stringify({ rows, q }) })
+
+/* --------------------- Pro 2：批量 OCR 队列（第 143 项） --------------------- */
+/** 免费索引只识别扫描件前几页；这个队列逐页跑完整本，写回同一个正文索引。 */
+export type OcrBatchItem = {
+  p: string
+  st: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  chars: number
+  pages: number
+  err: string
+}
+export type OcrBatchStatus = {
+  ok?: boolean
+  pro?: boolean
+  run?: 'idle' | 'running' | 'paused' | 'done'
+  total?: number
+  done?: number
+  failed?: number
+  skipped?: number
+  pending?: number
+  pct?: number
+  current?: string
+  current_path?: string
+  page_done?: number
+  page_total?: number
+  note?: string
+  items?: OcrBatchItem[]
+  added?: number
+  retried?: number
+}
+export type OcrOp = 'add' | 'pause' | 'resume' | 'cancel' | 'retry' | 'clear'
+
+/** 面板每 1 秒轮询；关掉面板后 5 秒一次，只为让工具栏那个小圆点还准 */
+export const getOcrBatch = () => api<OcrBatchStatus>('/api/ocr_batch')
+
+export const ocrBatchOp = (op: OcrOp, extra?: { paths?: string[]; dirs?: string[] }) =>
+  api<OcrBatchStatus>('/api/ocr_batch', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ op, ...(extra || {}) }),
+  })
+
+/** 选文件夹拿完整路径；浏览器里没有原生桥时返回空串 */
+export async function pickFolder(): Promise<string> {
+  try {
+    return (await bridge()?.pick_folder?.()) || ''
+  } catch {
+    return ''
+  }
+}
 
 /** 授权状态。字段与后端 license_core.parse_code 的返回一致，未激活时 edition='free'。 */
 export type LicenseState = {

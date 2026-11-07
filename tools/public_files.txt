@@ -20,11 +20,14 @@ sync  brain.py
 # 签发工具在开发根 tools/make_license.py，**不进本仓库**（私钥更不进）
 sync  license_core.py
 sync  xlsx_writer.py
+# Pro 2 批量 OCR 队列的状态机（第 143 项）：纯标准库，不 import brain
+sync  ocr_batch.py
 sync  setup_app.py
 sync  selftest.py
 sync  preflight.py
 sync  tests/test_settings.py
 sync  tests/test_xlsx.py
+sync  tests/test_ocr_batch.py
 sync  tests/test_brain_pure.py
 sync  tests/test_brain_pure2.py
 sync  tests/test_autostart_setup.py

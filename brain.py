@@ -52,6 +52,8 @@ import apprank
 
 import license_core
 
+import ocr_batch
+
 import scan_docs
 
 import sqlite3
@@ -298,7 +300,9 @@ def license_state(recheck=False):
 
 def license_feature(name):
 
-    """Pro 功能开关。**当前没有任何功能接在这里** —— 先把地基铺好。"""
+    """Pro 功能开关。已接入：export（导出 Excel）、ocr_batch（批量 OCR 队列）。
+
+    只在**新增**的 API 上调用；已有 28 个免费 API 一律不上锁（第 136 项定论）。"""
 
     st = license_state()
 
@@ -961,6 +965,173 @@ def _export_slug(s):
     """把搜索词变成能当文件名的片段。Windows 文件名不许 \\ / : * ? " < > |。"""
     s = re.sub(r'[\\/:*?"<>|\s]+', '_', str(s or '')).strip('._')
     return (s or '结果')[:40]
+
+
+# ------------------------------------------------ Pro 2：批量 OCR 队列（第 143 项）
+# 免费索引对扫描件只抽前 OCR_PAGES 页 / OCR_BUDGET 秒 —— 建搜索特征够用，
+# 但一本 60 页的影印合同，后 54 页是搜不到的。这个队列做**全页** OCR 并写回
+# 同一张 docs 表：搜索框、语法、快搜窗全都不用改，结果立刻可搜。
+# 门控只挂在新增的 /api/ocr_batch 上，现有 28 个 API 一个都没上锁。
+OCRQ_FEATURE = 'ocr_batch'
+OCRQ_EXTS = frozenset(('.pdf', '.png', '.jpg', '.jpeg', '.bmp',
+                       '.webp', '.tif', '.tiff'))
+OCRQ_MAX_FILES = 2000
+OCRQ_MAX_BYTES = 80 * 1024 * 1024
+OCRQ_PAGE_BUDGET = 240.0      # 单篇 4 分钟；超了就交出已识别部分，别让队列挂死
+_OCRQ = None
+_OCRQ_LOCK = threading.Lock()
+_OCRQ_RIDS = {}
+
+
+def _ocrq_allowed(p):
+    """只认扫描件格式的真实文件。别让「选了整个 D 盘」变成几千个无关文件。"""
+    try:
+        if Path(p).suffix.lower() not in OCRQ_EXTS:
+            return False
+        return os.path.isfile(p) and os.stat(p).st_size <= OCRQ_MAX_BYTES
+    except (OSError, ValueError):
+        return False
+
+
+def _ocrq_expand(d):
+    """枚举目录。必须剪 reparse point —— junction 会让 os.walk 成环（第 122 项踩过）。"""
+    out = []
+    try:
+        raw = str(d or '').strip()
+        if not raw or raw.startswith('\\\\') or len(raw) > 400:
+            return out                       # UNC 网络路径可能挂几十秒，不碰
+        root = str(Path(raw).resolve())
+        if not os.path.isdir(root):
+            return out
+        for base, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs
+                       if not x.startswith('.')
+                       and not _is_reparse_dir(os.path.join(base, x))]
+            for name in files:
+                p = os.path.join(base, name)
+                if Path(name).suffix.lower() in OCRQ_EXTS and _ocrq_allowed(p):
+                    out.append(p)
+                    if len(out) >= OCRQ_MAX_FILES:
+                        return out
+    except Exception:
+        pass
+    return out
+
+
+def _pdf_text_chars(path, limit=3):
+    """前几页有没有文字层。有文字层的 PDF 不值得花几分钟做全页 OCR。"""
+    try:
+        import pymupdf
+        doc = pymupdf.open(str(path))
+        try:
+            if doc.needs_pass and not doc.authenticate(''):
+                return -1
+            n = 0
+            for i in range(min(limit, doc.page_count)):
+                n += len((doc[i].get_text() or '').strip())
+            return n
+        finally:
+            doc.close()
+    except Exception:
+        return -1
+
+
+def ocr_image_file(path, on_page=None):
+    """单张图片 OCR。和 ocr_pdf 一样把长边压到 2200px，防超大位图在 C 层卡死。"""
+    import io
+    from PIL import Image
+    ocr = _get_ocr()          # 顺带解除 PIL 的 MAX_IMAGE_PIXELS 限制
+    with Image.open(str(path)) as src:
+        w, h = src.size
+        z = min(1.0, 2200 / max(w, h)) if max(w, h) else 1.0
+        im = src.resize((max(1, int(w * z)), max(1, int(h * z)))) if z < 1.0 else src
+        try:
+            buf = io.BytesIO()
+            im.convert('RGB').save(buf, 'PNG')
+            res, _ = ocr(buf.getvalue())
+        finally:
+            if im is not src:
+                im.close()
+    if on_page:
+        on_page(1, 1)
+    if not res:
+        return None
+    return '\n'.join(line[1] for line in res).strip() or None
+
+
+def _ocrq_run(path, on_page):
+    p = Path(path)
+    if p.suffix.lower() == '.pdf':
+        if _pdf_text_chars(p) > 80:
+            return {'skip': '已有文字层，不需要 OCR'}
+        return {'text': ocr_pdf(p, pages=None, budget=OCRQ_PAGE_BUDGET,
+                                on_page=on_page) or ''}
+    try:
+        return {'text': ocr_image_file(p, on_page) or ''}
+    except Exception as e:
+        return {'err': '图片识别失败：%s' % e}
+
+
+def _ocrq_begin():
+    """开工前缓存一次 path→rowid。每篇都重扫全表（UNINDEXED 列）要 1.4 秒，
+    2000 篇就是 47 分钟白等；缓存过期时 _doc_del 自己有慢路径兜底。"""
+    global _OCRQ_RIDS
+    with con_lock:
+        _OCRQ_RIDS = {os.path.normcase(p): r
+                      for p, r in _doc_rids(conn()).items()}
+
+
+def _ocrq_sink(path, text):
+    """把全页 OCR 结果写回正文索引，写完这一刻就能搜到。
+
+    三张表必须成对：docs（FTS5 正文）、bigram（2 字中文倒排）、
+    meta（记 size/mtime，否则下次「按范围更新」会拿 6 页 OCR 覆盖掉全页结果）。
+    """
+    text = (text or '').encode('utf-8', 'ignore').decode('utf-8').strip()[:MAX_BODY]
+    if not text:
+        return '正文为空'
+    try:
+        st = os.stat(path)
+    except OSError:
+        return '文件已不存在'
+    with con_lock:
+        con = conn()
+        try:
+            _doc_del(con, _OCRQ_RIDS, path)
+            cur = con.execute('INSERT INTO docs VALUES(?,?,?)',
+                              (path, Path(path).suffix.lower(), text))
+            _OCRQ_RIDS[os.path.normcase(path)] = cur.lastrowid
+            _bigram_add(con, cur.lastrowid, text)
+            con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
+                        'VALUES(?,?,?,?,?)',
+                        (path, time.time(), st.st_size, st.st_mtime, None))
+            con.commit()
+        except Exception as e:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            return str(e)
+    return None
+
+
+def ocr_batch_queue():
+    """惰性构造：软件启动时不加载状态、更不自动续跑，等用户打开面板才动。"""
+    global _OCRQ
+    with _OCRQ_LOCK:
+        if _OCRQ is None:
+            _OCRQ = ocr_batch.Queue(
+                state_path=app_dir() / 'ocr_batch.json',
+                runner=_ocrq_run,
+                sink=_ocrq_sink,
+                expand=_ocrq_expand,
+                allowed=_ocrq_allowed,
+                begin=_ocrq_begin,
+                may_run=lambda: not _job_busy(),
+                authorized=lambda: license_feature(OCRQ_FEATURE),
+                max_items=OCRQ_MAX_FILES,
+            )
+        return _OCRQ
 
 
 def app_dir():
@@ -3380,9 +3551,9 @@ def _get_ocr():
 
 
 
-def ocr_pdf(path: Path, budget=OCR_BUDGET):
+def ocr_pdf(path: Path, budget=OCR_BUDGET, pages=OCR_PAGES, on_page=None):
 
-    """纯扫描版 PDF：渲染前 OCR_PAGES 页逐页 OCR；失败返回 None。
+    """纯扫描版 PDF：逐页 OCR；失败返回 None。
 
 
 
@@ -3390,7 +3561,10 @@ def ocr_pdf(path: Path, budget=OCR_BUDGET):
 
     好几分钟，一篇就能拖住整轮索引；给个预算，到点就把已识别的部分交出来——
 
-    建搜索特征用不着整本。"""
+    建搜索特征用不着整本。
+
+    pages=None 表示**不限页数**（Pro 批量 OCR 队列用），默认仍是前 OCR_PAGES 页，
+    免费索引的行为一个字都不变。on_page(i, total) 每页回调一次报进度。"""
 
     try:
 
@@ -3410,11 +3584,31 @@ def ocr_pdf(path: Path, budget=OCR_BUDGET):
 
             t0 = time.time()
 
+            try:
+
+                n_pages = doc.page_count
+
+            except Exception:
+
+                n_pages = 0
+
             for i, page in enumerate(doc):
 
-                if i >= OCR_PAGES or time.time() - t0 > budget:
+                if (pages is not None and i >= pages) or (budget is not None
+
+                                                          and time.time() - t0 > budget):
 
                     break
+
+                if on_page:
+
+                    try:
+
+                        on_page(i + 1, n_pages or i + 1)
+
+                    except Exception:
+
+                        pass
 
                 r = page.rect
 
@@ -18431,6 +18625,25 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/ocr_batch'):
+
+                # Pro 2（第 143 项）：批量 OCR 队列状态，面板每 1 秒轮询一次。
+                # 只读，所以不写状态文件、不加载 OCR 引擎。
+
+                if not license_feature(OCRQ_FEATURE):
+
+                    body = json.dumps({'ok': False, 'pro': True},
+
+                                      ensure_ascii=False).encode()
+
+                else:
+
+                    body = json.dumps(ocr_batch_queue().status(),
+
+                                      ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/firstrun'):
 
                 # 首次运行：库里一个文件都没有、也没被标记过 → 界面自动开始建库
@@ -20069,6 +20282,77 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                         except Exception as e:
                             body = json.dumps({'ok': False, 'err': str(e)},
                                               ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/ocr_batch'):
+
+                # Pro 2（第 143 项）：所有动作走**同一个路径**、由 body 的 op 区分。
+                # 刻意不拆 /api/ocr_batch_add 之类：POST 分发是 startswith 链，
+                # 多一个前缀就多一次「顺序写反被上一个分支吃掉」的机会 ——
+                # /api/license_clear 必须排在 /api/license 前，就是这么来的。
+
+                if not license_feature(OCRQ_FEATURE):
+
+                    body = json.dumps({'ok': False, 'pro': True},
+
+                                      ensure_ascii=False).encode()
+
+                else:
+
+                    q = ocr_batch_queue()
+
+                    op = str(req.get('op') or '').strip()
+
+                    paths = req.get('paths') if isinstance(req.get('paths'), list) else []
+
+                    dirs = req.get('dirs') if isinstance(req.get('dirs'), list) else []
+
+                    extra = {}
+
+                    if op == 'add':
+
+                        extra['added'] = q.add(
+
+                            paths=[str(x)[:400] for x in paths[:500]],
+
+                            dirs=[str(x)[:400] for x in dirs[:8]])
+
+                    elif op == 'pause':
+
+                        q.pause()
+
+                    elif op == 'resume':
+
+                        q.resume()
+
+                    elif op == 'cancel':
+
+                        q.cancel()
+
+                    elif op == 'retry':
+
+                        extra['retried'] = q.retry_failed()
+
+                    elif op == 'clear':
+
+                        q.clear()
+
+                    else:
+
+                        op = ''
+
+                    st = q.status()
+
+                    st.update(extra)
+
+                    st['ok'] = bool(op)
+
+                    if not op:
+
+                        st['k'] = 'e_bad_op'
+
+                    body = json.dumps(st, ensure_ascii=False).encode()
+
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/update_apply'):

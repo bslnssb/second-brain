@@ -1026,7 +1026,7 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
   )
 }
 
-function Modal({
+export function Modal({
   title,
   onClose,
   width,

@@ -49,6 +49,7 @@ if _webdist.is_dir():
 # 不列出来 PyInstaller 不会收 —— 源码跑得好好的，exe 一启动监听就静默失败。
 hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest', 'env_check',
                   'hotkey', 'tray', 'pypinyin', 'license_core',
+                  'xlsx_writer', 'ocr_batch',   # Pro：导出 Excel / 批量 OCR 队列
                   'pythoncom', 'win32com.client',
                   'win32gui', 'win32api', 'win32con', 'win32process', 'win32file']
 

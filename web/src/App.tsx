@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { dirName, fmtSize, fmtTime, midName, sortItems, SORT_KEYS, type Hit, type SortKey } from './lib/hits'
 import { parseQSyn } from './lib/qsyn'
 import { AboutModal, HelpModal, Preview, QS, SettingsDrawer, Timeline } from './ui/panels'
+import { OcrBatchModal } from './ui/ocrbatch'
 import { setLang, t } from './lib/i18n'
 import { ContextMenu, ReverseModal, ZipToast, type MenuItem } from './ui/context'
 import { Onboarding } from './ui/onboarding'
-import { exportResults } from './api'
+import { exportResults, getOcrBatch, type OcrBatchStatus } from './api'
 import {
   IconApp,
   IconClock,
@@ -162,9 +163,11 @@ export default function App() {
   const [days, setDays] = useState(0)
   // `?panel=about` 直接打开某个面板：截图、演示录屏、排查「关于面板打不开」时用，
   // 正常使用没有任何人会带这个参数（和 /mini 的 ?q= 预填同一类调试入口）。
-  const [panel, setPanel] = useState<null | 'settings' | 'help' | 'about'>(() => {
+  const [panel, setPanel] = useState<null | 'settings' | 'help' | 'about' | 'ocr'>(() => {
     const want = new URLSearchParams(location.search).get('panel')
-    return want === 'about' || want === 'settings' || want === 'help' ? want : null
+    return ['about', 'settings', 'help', 'ocr'].includes(want || '')
+      ? (want as 'settings' | 'help' | 'about' | 'ocr')
+      : null
   })
   // 语言切换后整棵界面要跟着换字：监听 i18n 派发的事件，用 key 强制重挂子组件
   const [langTick, setLangTick] = useState(0)
@@ -183,11 +186,12 @@ export default function App() {
   useEffect(() => {
     // cfg 是旧模板对「设置」的叫法，这里兼容一下（托盘以前传的就是 cfg）；
     // 老文档里还有 ?cfg=1 这种写法，一并认下来，别让链接悄悄失效
-    const m = /[?&]panel=(help|about|settings|cfg)/.exec(location.search)
+    const m = /[?&]panel=(help|about|settings|ocr|cfg)/.exec(location.search)
     const legacyCfg = /[?&]cfg=1(&|$)/.test(location.search)
     if (m || legacyCfg) {
       setPanel(
-        (m && m[1] !== 'cfg' ? m[1] : 'settings') as 'help' | 'about' | 'settings',
+        (m && m[1] !== 'cfg' ? m[1] : 'settings') as
+          'help' | 'about' | 'settings' | 'ocr',
       )
       history.replaceState(null, '', location.pathname)
     }
@@ -206,6 +210,9 @@ export default function App() {
   const [reverse, setReverse] = useState<string | null>(null)
   const [toast, setToast] = useState('')
   const [exporting, setExporting] = useState(false)
+  const [ocr, setOcr] = useState<OcrBatchStatus | null>(null)
+  const [ocrPro, setOcrPro] = useState(false)
+  const ocrOpen = panel === 'ocr'
   const seq = useRef(0)
   const qEl = useRef<HTMLInputElement>(null)
 
@@ -226,6 +233,23 @@ export default function App() {
       setExporting(false)
     }
   }
+
+  /** 批量 OCR 队列状态（Pro 2）。面板开着 1 秒一刷，关着 5 秒一刷 ——
+   *  后者只为让工具栏那个小圆点还准，关掉面板任务本身一直在后台跑。 */
+  const refreshOcr = useCallback(() => {
+    getOcrBatch()
+      .then((d) => {
+        if (d.pro) { setOcrPro(true); setOcr(null) }
+        else { setOcrPro(false); setOcr(d) }
+      })
+      .catch(() => {})
+  }, [])
+  useEffect(() => {
+    if (document.visibilityState === 'hidden') return
+    refreshOcr()
+    const id = window.setInterval(refreshOcr, ocrOpen ? 1000 : 5000)
+    return () => window.clearInterval(id)
+  }, [ocrOpen, refreshOcr])
 
   // 主题：跟系统（auto）或跟用户设置
   useEffect(() => {
@@ -608,6 +632,18 @@ export default function App() {
         )}
         <button
           className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-sub hover:text-ink"
+          onClick={() => setPanel('ocr')}
+          title={t('ocr_title')}
+          data-act="ocr-open"
+        >
+          <IconDoc size={14} />
+          {t('ocr_btn')}
+          {ocr?.run === 'running' && (
+            <span className="ml-0.5 inline-block h-1.5 w-1.5 rounded-full bg-accent" />
+          )}
+        </button>
+        <button
+          className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-sub hover:text-ink"
           onClick={cycleSort}
           title={t('act_sort')}
         >
@@ -962,6 +998,15 @@ export default function App() {
 
       <HelpModal open={panel === 'help'} onClose={() => setPanel(null)} />
       <AboutModal open={panel === 'about'} onClose={() => setPanel(null)} />
+      <OcrBatchModal
+        open={ocrOpen}
+        onClose={() => setPanel(null)}
+        status={ocr}
+        pro={ocrPro}
+        rows={shown}
+        onRefresh={refreshOcr}
+        onOpenAbout={() => setPanel('about')}
+      />
 
       {/* 首启引导：装完第一次打开自动建库（老用户 need=false，完全无感） */}
       <Onboarding onOpenSettings={() => setPanel('settings')} onIndexed={onFirstIndexed} />
