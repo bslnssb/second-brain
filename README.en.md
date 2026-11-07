@@ -2,16 +2,18 @@
 
 [简体中文](README.md) | **English**
 
-Turn the documents scattered across your drives into a local knowledge base you can actually search. **Full-text search, Chinese-friendly, fully offline** — nothing leaves the machine, no account, no server.
+**Scanned documents are searchable too.**
 
-Python + SQLite FTS5. One `brain.db` holds every extracted document body; it keeps working with the network unplugged.
+Photocopied contracts, photographed invoices, PDFs exported as images, phone shots of paper notices — there is not a single character in them your system can find. Second Brain recognises the text, indexes it locally, then puts it in the same double-tap-Ctrl search box as the file names.
 
-> **Why not Everything?** It knows what a file is called, not what it says. You remember a sentence from a document but not which file it lives in — that is the gap this tool fills.
+Fully offline: nothing leaves the machine, no account, no server. Python + SQLite FTS5. One `brain.db` holds every extracted document body; it keeps working with the network unplugged.
+
+<p align="center"><img src="assets/demo-contract.gif" alt="A scanned PDF with no text layer: typing the penalty clause in the quick search box lands on that sentence"></p>
+
+<p align="center"><sub>This PDF is a single image — nothing in it can be selected or copied. Typing the clause still finds the sentence on that page</sub></p>
+
+> **How it relates to Everything / Listary / TextSeek**: they search file names and the text that is already there. Scans, photos and image-only PDFs have no text layer, so they fall outside what those tools do — not a flaw, just a different job.
 > **Why not an online notebook?** Contracts, medical records and internal material do not belong on someone else's server.
-
-<p align="center"><img src="assets/screenshot-quick-en.png" alt="Quick search: typing report returns file-name matches first, then content matches tagged Text with the matching sentence"></p>
-
-<p align="center"><sub>Press Ctrl twice and a search box appears. Name matches come first, content matches follow — both searched at once</sub></p>
 
 ---
 
@@ -64,19 +66,23 @@ When the quick search box is empty it lists recently opened files, so often you 
 
 <p align="center"><img src="assets/screenshot-quick-empty.png" alt="Quick search empty state: recently opened files with real icons and segmented paths"></p>
 
-## How it compares to Everything and Listary
+## How it compares to Everything, Listary and TextSeek
 
-**If what you want is "press Ctrl twice, type, open a file", Second Brain is enough.** The interaction follows the familiar pattern: double Ctrl to summon, one input, nine rows, `Ctrl+1~9` to jump, `Esc` to dismiss, pinyin matching, real icons, recent files when empty, segmented paths.
+**If what you want is "press Ctrl twice, type, open a file", Everything + Listary already do it well.**
+Second Brain is only "good enough" at that: file and folder name index (game libraries excludable — 200k entries here, around 0.2 ms per prefix query), pinyin, real icons, recent files when empty, segmented paths.
 
-**It also shows content matches inside the quick window** — neither of those tools looks inside files, so this part is unique to Second Brain.
+**The extra step it takes is scanned paper.**
 
-| | "I know what it is called" | "Which file contains this sentence?" | Index freshness |
+| | "I know what it is called" | "Which file contains this sentence?" | Scans and photos with no text layer |
 |---|---|---|---|
-| **Everything** | Best in class, reads the NTFS file table, real time | No | Live |
-| **Listary** | Strong, with pinyin and a launcher | No | Live |
-| **Second Brain** | Good enough: file and folder names (game libraries excludable — 200k entries here), around 0.2 ms per prefix query, pinyin included | **In the quick window** | Live in watched folders (~2s) + manual full rebuild |
+| **Everything** | Best in class, reads the NTFS file table, live | Live `content:` matching only; the 1.5 content index has to be switched on | No |
+| **Listary V7** | Strong, with pinyin, launcher and Quick Switch | Yes, through the companion app Gety (hooked up in the V7 beta) | Gety claims it; needs a second app installed |
+| **TextSeek** | Average | Strong — good Chinese tokenising, regex support | Parses the text layer only; scans need separate OCR |
+| **Second Brain** | Good enough | **In the quick window, with the sentence highlighted** | **Chinese OCR built in — one exe, nothing else to install** |
 
-**What it does not do**: Listary can also jump folders inside Open/Save dialogs and select files in Explorer. Everything and Listary keep a **volume-wide** index live from the NTFS file table; Second Brain only watches the folders in your scope plus Desktop, Downloads and Documents — other drives and anything that changed while the app was closed still need a manual update. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
+In one line: searching inside text is no longer anyone's exclusive feature. **"Double-tap Ctrl + scanned paper + nothing else to install" is still a fairly empty spot.**
+
+**What it does not do**: slower than Everything (which reads the file table volume-wide; Second Brain keeps a scoped index plus folder watching, so other drives and anything that changed while it was closed need one manual update); no Listary Quick Switch or Open/Save dialog jumping; Windows only; about 330 MB installed. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
 
 > Second Brain is an independent implementation: it uses no code, icons or UI assets from the products above, and has no affiliation with them. Product names appear only to explain the differences.
 
