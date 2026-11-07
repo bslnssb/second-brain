@@ -68,6 +68,57 @@ def check_donate():
     rec('PASS' if ok else 'FAIL', '赞赏码指纹 = 两张 donate.png', (want or '?')[:12])
 
 
+def check_license():
+    """离线授权（第 137 项）：公钥合法 + Ed25519 自检 + **私钥/签发工具没混进公开仓库**。
+
+    最后一条是这个检查存在的全部理由：签发工具一旦进了 release/github，
+    谁都能量产授权码，整套商业化就白做了 —— 它比任何功能都值得卡一道。
+    顺带确认 license_core 的 Ed25519 没在某次重构里被改坏（拿 RFC 8032 向量验）。
+    """
+    bad = []
+    m = re.search(r"LICENSE_PUBKEY_HEX\s*=\s*'([0-9a-f]{64})'", text(ROOT / 'brain.py'))
+    if not m:
+        bad.append('brain.py 缺合法 LICENSE_PUBKEY_HEX（要 64 位 hex）')
+    else:
+        try:
+            if len(bytes.fromhex(m.group(1))) != 32:
+                bad.append('公钥不是 32 字节')
+        except ValueError:
+            bad.append('公钥含非法 hex 字符')
+
+    try:
+        import license_core
+
+        seed = bytes.fromhex('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60')
+        if license_core.public_key(seed).hex() != \
+                'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a':
+            bad.append('Ed25519 实现自检失败（RFC 8032 向量对不上）')
+    except Exception as e:
+        bad.append('license_core 导入/自检失败：%s' % e)
+
+    # 公开仓库里绝对不能有的东西
+    forbidden = {'make_license.py', 'seed.txt', 'pubkey.txt', 'license.json',
+                 'licenses.tsv', 'private_key.txt'}
+    for base in (REPO, REPO / 'tools', REPO / 'assets'):
+        if not base.is_dir():
+            continue
+        for p in base.glob('*'):
+            if p.is_file() and (p.name in forbidden or p.name.startswith('license-')
+                                or p.suffix == '.pem'):
+                bad.append('公开仓库里有 %s' % p.relative_to(REPO))
+
+    # 只查真正的条目：清单的注释里正大光明写着「make_license.py 不进本仓库」，
+    # 整段子串匹配会把这句提醒本身判成违规（和 CI 词表自指是同一类坑）。
+    man = '\n'.join(l for l in text(REPO / 'tools/public_files.txt').splitlines()
+                    if l.strip() and not l.lstrip().startswith('#'))
+    for w in ('make_license', 'seed.txt', 'private', '.pem'):
+        if w in man:
+            bad.append('public_files.txt 的条目里出现了「%s」' % w)
+
+    rec('PASS' if not bad else 'FAIL', '授权模块（公钥合法 / 私钥未入库）',
+        '; '.join(bad) or ('公钥 %s…' % (m.group(1)[:12] if m else '?')))
+
+
 def check_spec():
     need = ('win32file', 'pythoncom', 'win32com.client', 'pypinyin', 'hotkey', 'tray')
     bad = []
@@ -562,6 +613,7 @@ def main():
     check_version()
     check_i18n()
     check_donate()
+    check_license()
     check_spec()
     check_legacy()
     check_persistence()

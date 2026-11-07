@@ -62,6 +62,38 @@ export const getStats = () => api<Stats>('/api/stats')
 export const getConfig = () => api<ConfigInfo>('/api/config')
 export const getPing = () => api<Ping>('/api/ping')
 
+/** 授权状态。字段与后端 license_core.parse_code 的返回一致，未激活时 edition='free'。 */
+export type LicenseState = {
+  valid: boolean
+  reason: string
+  edition: 'free' | 'pro'
+  kind: string
+  name: string
+  ident: string
+  exp: string
+  issued: string
+  features: string[]
+  days_left: number | null
+  code_masked: string
+  clock_warn: boolean
+  activated: string
+}
+
+export const getLicense = () => api<{ ok: boolean; state: LicenseState }>('/api/license')
+
+/** 激活：校验不过后端不会落盘，所以这里失败是「安全」的，原授权保持可用。 */
+export const activateLicense = (code: string) =>
+  api<{ ok: boolean; reason: string; state: LicenseState }>('/api/license', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  })
+
+export const clearLicense = () =>
+  api<{ ok: boolean; state: LicenseState }>('/api/license_clear', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+
 /** 保存索引范围：后端只收本机真实存在的目录（不存在/网络路径会被忽略并在 dropped 里回传） */
 export type SaveScopeResult = {
   ok: boolean

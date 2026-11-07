@@ -16,6 +16,9 @@
 
 # ─────────────────────────── 内核（开发根是唯一维护地） ───────────────────────────
 sync  brain.py
+# 离线授权（第 137 项）：纯标准库 Ed25519，只有公钥进 exe；
+# 签发工具在开发根 tools/make_license.py，**不进本仓库**（私钥更不进）
+sync  license_core.py
 sync  setup_app.py
 sync  selftest.py
 sync  preflight.py
@@ -33,6 +36,7 @@ sync  tests/test_fs_safety.py
 sync  tests/test_db_recovery.py
 sync  tests/test_env_check.py
 sync  tests/test_qsyntax.py
+sync  tests/test_license.py
 sync  env_check.py
 sync  app_window.py
 sync  hotkey.py
@@ -79,6 +83,10 @@ local assets/screenshot-main-dark.png
 local assets/screenshot-main-en.png
 local assets/screenshot-settings.png
 local assets/screenshot-settings-en.png
+# 演示 GIF：扫描件里搜「违约金」→ 定位到原文那一句。README 首屏在用，
+# 素材只有本仓库有（开发根由 tmp/make_gifs.py 现生成，不复用这个文件）
+local assets/demo-contract.gif
+local assets/demo-invoice.gif
 
 # ─────────────────────────── 打包脚本（只在这里维护） ───────────────────────────
 local second-brain-app.spec

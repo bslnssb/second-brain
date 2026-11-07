@@ -48,7 +48,8 @@ if _webdist.is_dir():
 # win32file 是 v0.9.47 实时索引用的（brain._watch_worker 里函数内 import），
 # 不列出来 PyInstaller 不会收 —— 源码跑得好好的，exe 一启动监听就静默失败。
 hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest', 'env_check',
-                  'hotkey', 'tray', 'pypinyin', 'pythoncom', 'win32com.client',
+                  'hotkey', 'tray', 'pypinyin', 'license_core',
+                  'pythoncom', 'win32com.client',
                   'win32gui', 'win32api', 'win32con', 'win32process', 'win32file']
 
 # 本机装了一堆和本项目无关的重型包，PyInstaller 顺着 import 链会把 torch 整包拖进来

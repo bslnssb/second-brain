@@ -50,6 +50,8 @@ import re
 
 import apprank
 
+import license_core
+
 import scan_docs
 
 import sqlite3
@@ -120,6 +122,24 @@ DONATE_SHA256 = '956fec5ba8786652cae62cbe828450771301320c8c3e40f5e4aad4ed544be38
 
 
 
+# 授权码校验用的 Ed25519 公钥。私钥只在作者本机（~/.second-brain-license/seed.txt），
+
+# **不进仓库、不进 exe**。这里只有公钥，只能验签、签不出码。
+
+# 换私钥 = 所有已发出的授权码一起失效，换之前想清楚。
+
+LICENSE_PUBKEY_HEX = 'b4f5b91a3530e1b670fee5c92f50ca0b1ea43209ded00c265f9958979e3ed2ad'
+
+
+
+# 授权码和「上次见到的时间」都存在数据目录里。存明文码而不是解析结果：
+
+# 换公钥/改解析逻辑后老码还能重新解释，解析结果一旦落盘就固化了。
+
+LICENSE_FILE = 'license.json'
+
+
+
 # /api/open_url 只认本仓库下的地址：这条路由会真的调起系统浏览器，
 
 # 放开任意 URL 等于给页面一个「随手打开钓鱼站」的按钮。
@@ -167,6 +187,170 @@ def file_sha256(p, limit=8 * 1024 * 1024):
     except Exception:
 
         return ''
+
+
+
+
+def _license_blank(reason='none'):
+
+    """没有授权时的默认状态。字段和 license_core.parse_code 的返回保持一致。"""
+
+    return {'valid': False, 'reason': reason, 'edition': 'free', 'kind': '',
+
+            'name': '', 'ident': '', 'exp': '', 'issued': '', 'features': [],
+
+            'days_left': None, 'code_masked': '', 'clock_warn': False,
+            'activated': ''}
+
+
+
+
+_LIC = {'loaded': False, 'state': None}
+
+
+
+
+def license_path():
+
+    return app_dir() / LICENSE_FILE
+
+
+
+
+def license_state(recheck=False):
+
+    """读 + 校验本机授权码。结果缓存，`recheck=True` 强制重算。
+
+    验一次约 4ms，但 /api/license 会被前端反复拉，缓存是必要的。
+    任何 IO/解析异常都降级成 free —— **授权读不出来不能连带软件不能用**。
+    """
+
+    if _LIC['loaded'] and not recheck:
+
+        return _LIC['state']
+
+    st = _license_blank()
+
+    try:
+
+        p = license_path()
+
+        if p.is_file():
+
+            data = json.loads(p.read_text(encoding='utf-8') or '{}')
+
+            code = (data.get('code') or '').strip()
+
+            if code:
+
+                res = license_core.parse_code(code, LICENSE_PUBKEY_HEX)
+
+                for k in ('valid', 'reason', 'edition', 'kind', 'name', 'ident',
+
+                          'exp', 'issued', 'features'):
+
+                    st[k] = res[k]
+
+                st['code_masked'] = license_core.mask_code(code)
+
+                st['activated'] = data.get('activated') or ''
+
+                st['days_left'] = license_core.days_left(res['exp']) if res['valid'] else None
+
+                # 时钟回拨：只提示不改判。系统时间同步、双系统、虚拟机时区都会造成
+
+                # 「今天比上次早」，一律拦下会误伤；真过期了 parse_code 已经判过了。
+
+                last = str(data.get('last_seen') or '')
+
+                today = time.strftime('%Y-%m-%d')
+
+                if last and today < last:
+
+                    st['clock_warn'] = True
+
+                elif today != last:
+
+                    data['last_seen'] = today
+
+                    try:
+
+                        p.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+
+                                     encoding='utf-8')
+
+                    except OSError:
+
+                        pass
+
+    except Exception:
+
+        st = _license_blank('io')
+
+    _LIC['loaded'] = True
+
+    _LIC['state'] = st
+
+    return st
+
+
+
+
+def license_feature(name):
+
+    """Pro 功能开关。**当前没有任何功能接在这里** —— 先把地基铺好。"""
+
+    st = license_state()
+
+    return bool(st['valid']) and name in (st.get('features') or [])
+
+
+
+
+def license_activate(code):
+
+    """保存并校验授权码。校验不过不落盘，避免把一个坏码留在机器上。"""
+
+    code = (code or '').strip().replace('\n', '').replace('\r', '').replace(' ', '')
+
+    res = license_core.parse_code(code, LICENSE_PUBKEY_HEX)
+
+    if not res['valid']:
+
+        return {'ok': False, 'reason': res['reason'], 'state': license_state()}
+
+    p = license_path()
+
+    payload = {'code': code, 'activated': time.strftime('%Y-%m-%d %H:%M'),
+
+               'last_seen': time.strftime('%Y-%m-%d')}
+
+    try:
+
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    except OSError as e:
+
+        return {'ok': False, 'reason': 'readonly', 'detail': str(e), 'state': license_state()}
+
+    return {'ok': True, 'reason': 'ok', 'state': license_state(recheck=True)}
+
+
+
+
+def license_clear():
+
+    """清除本机授权（换码、换机器、售后排查用）。"""
+
+    try:
+
+        license_path().unlink()
+
+    except OSError:
+
+        pass
+
+    return license_state(recheck=True)
 
 
 
@@ -18214,6 +18398,18 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/license'):
+
+                # 授权状态。**只读**：激活/清除都走 POST。
+
+                # 关于面板一打开就拉这个，所以必须走缓存（见 license_state）。
+
+                body = json.dumps({'ok': True, 'state': license_state()},
+
+                                  ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/firstrun'):
 
                 # 首次运行：库里一个文件都没有、也没被标记过 → 界面自动开始建库
@@ -19902,6 +20098,34 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                     body = json.dumps({'ok': True, 'started': True},
 
                                       ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/license_clear'):
+
+                # 换码 / 换机器 / 售后排查用。
+
+                # 必须排在 /api/license 前面 —— startswith 会让 '/api/license'
+
+                # 把 '/api/license_clear' 也吃掉。
+
+                license_clear()
+
+                body = json.dumps({'ok': True, 'state': license_state()},
+
+                                  ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/license'):
+
+                r = license_activate(req.get('code') or '')
+
+                if not r.get('ok'):
+
+                    print('[license] 激活失败：%s' % r.get('reason'))
+
+                body = json.dumps(r, ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 

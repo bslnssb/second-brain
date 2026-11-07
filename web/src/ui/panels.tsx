@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   getAutostart,
   getConfig,
+  getLicense,
   getPing,
   getSettings,
   getStats,
@@ -9,12 +10,15 @@ import {
   saveSettings,
   setAutostart,
   type ConfigInfo,
+  type LicenseState,
   type Ping,
   type Settings,
   type Stats,
   type TimelineGroup,
+  activateLicense,
   applyUpdate,
   checkUpdate,
+  clearLicense,
   copyText,
   openUrl,
   saveConfig,
@@ -675,6 +679,175 @@ function OfficialLinks({ ping }: { ping: Ping }) {
   )
 }
 
+/** 授权区：免费版给输入框，Pro 显示署名和到期。**纯本地校验，不联网**。
+ *
+ *  设计上有意做成「低调的一小块」：免费用户不该为它分心，Pro 用户找得到就行。
+ *  另外错误原因必须说清楚（格式错 / 签名错 / 过期），否则用户只会觉得「我买的东西坏了」。
+ */
+function LicenseBox({ open }: { open: boolean }) {
+  const [st, setSt] = useState<LicenseState | null>(null)
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    setMsg(null)
+    setEditing(false)
+    setCode('')
+    getLicense()
+      .then((r) => setSt(r.state))
+      .catch(() => {})
+  }, [open])
+
+  const reasonText = (r: string) => {
+    switch (r) {
+      case 'empty':
+        return t('lic_err_empty')
+      case 'format':
+        return t('lic_err_fmt')
+      case 'signature':
+        return t('lic_err_sig')
+      case 'expired':
+        return t('lic_err_exp')
+      case 'readonly':
+        return t('lic_err_io')
+      case 'version':
+        return t('lic_err_ver')
+      default:
+        return t('lic_err_other')
+    }
+  }
+
+  const doActivate = async () => {
+    if (!code.trim()) {
+      setMsg({ ok: false, text: t('lic_err_empty') })
+      return
+    }
+    setBusy(true)
+    try {
+      const r = await activateLicense(code)
+      setSt(r.state)
+      if (r.ok) {
+        setMsg({ ok: true, text: t('lic_ok') })
+        setCode('')
+        setEditing(false)
+      } else {
+        setMsg({ ok: false, text: reasonText(r.reason) })
+      }
+    } catch {
+      setMsg({ ok: false, text: t('lic_err_other') })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const doClear = async () => {
+    if (!window.confirm(t('lic_clear_ask'))) return
+    try {
+      const r = await clearLicense()
+      setSt(r.state)
+      setMsg(null)
+      setCode('')
+      setEditing(true)
+    } catch {
+      setMsg({ ok: false, text: t('lic_err_other') })
+    }
+  }
+
+  if (!st) return null
+  const active = st.valid && st.edition === 'pro'
+  const showInput = !active || editing
+
+  return (
+    <div className="mt-3 border-t border-line pt-3">
+      <div className="mb-1.5 flex flex-wrap items-center gap-2 text-[12px] text-sub">
+        <span>{t('lic_title')}</span>
+        <span
+          className={`rounded px-1.5 py-0.5 text-[10px] ${
+            active ? 'bg-accent text-white' : 'border border-line'
+          }`}
+        >
+          {active ? 'Pro' : t('lic_free')}
+        </span>
+        {active && st.name && <span className="truncate text-[11px] text-fg">{st.name}</span>}
+      </div>
+
+      {active && !editing && (
+        <div className="space-y-0.5 text-[11px] leading-5 text-sub">
+          <div>
+            {st.exp ? `${t('lic_exp')} ${st.exp}` : t('lic_forever')}
+            {st.days_left !== null && st.days_left >= 0
+              ? ` · ${t('lic_days').replace('{n}', String(st.days_left))}`
+              : ''}
+          </div>
+          <div className="truncate font-mono text-[10px] opacity-70" title={t('lic_masked_hint')}>
+            {st.code_masked}
+          </div>
+          {st.clock_warn && <div className="text-amber-600">{t('lic_clock')}</div>}
+        </div>
+      )}
+
+      {showInput && (
+        <div className="space-y-1.5">
+          <input
+            value={code}
+            onChange={(e) => {
+              setCode(e.target.value)
+              setMsg(null)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') doActivate()
+            }}
+            placeholder={t('lic_ph')}
+            spellCheck={false}
+            className="w-full rounded-md border border-line bg-card px-2 py-1 font-mono text-[11px] outline-none focus:border-accent"
+          />
+          <div className="flex items-center gap-2">
+            <button
+              onClick={doActivate}
+              disabled={busy}
+              className="rounded-md bg-accent px-2.5 py-1 text-[12px] text-white hover:opacity-90 disabled:opacity-60"
+            >
+              {busy ? t('lic_busy') : t('lic_act')}
+            </button>
+            {active && editing && (
+              <button
+                onClick={() => {
+                  setEditing(false)
+                  setCode('')
+                  setMsg(null)
+                }}
+                className="rounded-md border border-line px-2.5 py-1 text-[12px] hover:bg-card"
+              >
+                {t('lic_cancel')}
+              </button>
+            )}
+            <span className="ml-auto text-[10px] text-sub/70">{t('lic_offline')}</span>
+          </div>
+          <div className="text-[10px] leading-4 text-sub/80">{t('lic_hint')}</div>
+        </div>
+      )}
+
+      {msg && (
+        <div className={`pt-1 text-[11px] ${msg.ok ? 'text-accent' : 'text-red-500'}`}>{msg.text}</div>
+      )}
+
+      {active && !editing && (
+        <div className="flex gap-3 pt-1.5">
+          <button onClick={() => setEditing(true)} className="text-[10px] text-sub underline-offset-2 hover:underline">
+            {t('lic_change')}
+          </button>
+          <button onClick={doClear} className="text-[10px] text-sub underline-offset-2 hover:underline">
+            {t('lic_clear')}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function AboutModal({ open, onClose }: { open: boolean; onClose: () => void }) {  const [stats, setStats] = useState<Stats>({ files: 0, docs: 0 })
   const [ping, setPing] = useState<Ping>({ ver: '…' })
   // 检查更新：只有点按钮才发请求（要连 GitHub，不能跟着弹窗自动跑）
@@ -832,6 +1005,8 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
       {/* 官方地址：链接本身写在 brain.py 里（跟着 exe 编译），前端只显示。
           别人改一行 JS 就能换掉写死在前端的链接，但要换这里的得重新打包。 */}
       <OfficialLinks ping={ping} />
+
+      <LicenseBox open={open} />
 
       {/* 支持一下：二维码是可选的，assets/donate.png 存在才显示；指纹对不上就藏起来 */}
       <div className="mt-3 border-t border-line pt-3">
