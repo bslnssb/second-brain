@@ -193,6 +193,44 @@ def check_ip():
         '; '.join(bad + warn) or '无攀附措辞、仅系统字体、素材全自制')
 
 
+def check_terms():
+    """许可证表述一致（第 139 项）：换了协议，整套文案要跟着换。
+
+    MIT 不可撤销，但那只对**已发布的版本**有效。LICENSE 换成 PolyForm
+    Noncommercial 之后，「开源」这个词在 README 和界面里就变成虚假陈述 ——
+    开源有明确定义（OSI），不符合还写，被人指出一次就够难看了。
+
+    这条盯的是**将来手滑写回去**，尤其是界面里那句面向用户的话
+    （`about_free`，五语言）。第 138 项管「别用别人的东西」，这条管
+    「别把自己的协议说错」，两件事分开才查得准。
+    """
+    bad = []
+    lic = text(REPO / 'LICENSE')
+    if 'PolyForm Noncommercial License 1.0.0' not in lic:
+        bad.append('LICENSE 不是 PolyForm Noncommercial 1.0.0')
+    if 'Required Notice: Copyright' not in lic:
+        bad.append('LICENSE 缺 Required Notice 行（协议要求携带）')
+
+    for f, tag in (('README.md', '## 许可证'), ('README.en.md', '## License')):
+        body = text(REPO / f)
+        if tag not in body:
+            bad.append('%s 缺「%s」段' % (f, tag))
+            continue
+        head = body.split(tag, 1)[1][:120]
+        if 'PolyForm' not in head:
+            bad.append('%s 的许可证段没指向 PolyForm' % f)
+
+    s = text(ROOT / 'web/src/lib/i18n.ts')
+    for m in re.finditer(r"^\s*about_free:\s*'([^']*)'", s, re.M):
+        if re.search(r'开源|open source|código abierto|código aberto|ओपन सोर्स', m.group(1), re.I):
+            bad.append('about_free 仍自称开源：%s' % m.group(1)[:20])
+    if len(re.findall(r'^\s*about_free:', s, re.M)) != 5:
+        bad.append('about_free 不是五语言齐全')
+
+    rec('PASS' if not bad else 'FAIL', '许可证表述一致（PolyForm / 不自称开源）',
+        '; '.join(bad) or 'LICENSE、两份 README、五语言界面均已同步')
+
+
 def check_spec():
     need = ('win32file', 'pythoncom', 'win32com.client', 'pypinyin', 'hotkey', 'tray')
     bad = []
@@ -689,6 +727,7 @@ def main():
     check_donate()
     check_license()
     check_ip()
+    check_terms()
     check_spec()
     check_legacy()
     check_persistence()

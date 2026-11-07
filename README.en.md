@@ -265,4 +265,12 @@ scope.example.json      scope template
 
 ## License
 
-MIT
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+
+- **Free for personal use**: your own machine, study, research, hobby projects — use it, change it, pass it to a friend
+- **Schools, charities, public research and government bodies** also count as permitted noncommercial use
+- **Commercial use needs a license**: using it at work, or building a paid service on top of it, please get in touch
+
+To be explicit: this is **not** an open source license. The source stays public — read it,
+change it, build it yourself — but it may not be used commercially. Versions published
+under MIT earlier are not revoked; MIT is irrevocable. Only this and later versions change.
