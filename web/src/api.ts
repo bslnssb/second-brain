@@ -40,6 +40,9 @@ export type Settings = { hotkey?: boolean; theme?: string; lang?: string }
 type Bridge = {
   open_path?: (p: string) => Promise<boolean>
   reveal?: (p: string) => Promise<boolean>
+  /** 顶栏/标题栏「快搜」按钮：收起详情窗（快搜窗由 open_mini 唤起） */
+  hide_main?: () => Promise<boolean>
+  open_mini?: () => Promise<boolean>
 }
 
 function bridge(): Bridge | undefined {
@@ -87,10 +90,9 @@ export async function openUrl(u: string): Promise<boolean> {
     return false
   }
 }
-export const getTimeline = (days = 14, kind = 'all', pf = '') => {
+export const getTimeline = (days = 14, kind = 'all') => {
   const qs = new URLSearchParams({ days: String(days) })
   if (kind && kind !== 'all') qs.set('t', kind)
-  if (pf.trim()) qs.set('pf', pf.trim())
   return api<{ days: number; groups: TimelineGroup[] }>(`/api/timeline?${qs.toString()}`)
 }
 export const getSettings = () => api<Settings>('/api/settings')
@@ -154,16 +156,35 @@ export async function checkUpdate(): Promise<UpdateInfo> {
   }
 }
 
-/** 下载并安装：后端会起一个 bat、然后自己退出，界面会断开——这是正常的 */
-export async function applyUpdate(): Promise<{ ok: boolean; err?: string }> {
+/** 下载并安装：后端立即返回 started，下载在后台线程跑（171MB 要几十秒到几分钟），
+ *  进度用 updateStatus() 轮询；完成后后端起 bat、自己退出，界面会断开——这是正常的 */
+export async function applyUpdate(): Promise<{ ok: boolean; err?: string; started?: boolean }> {
   try {
     const r = await fetch('/api/update_apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin' },
       body: '{}',
     })
-    return (await r.json()) as { ok: boolean; err?: string }
+    return (await r.json()) as { ok: boolean; err?: string; started?: boolean }
   } catch (e) {
     return { ok: false, err: String(e) }
+  }
+}
+
+export type UpdateStatus = {
+  state?: 'idle' | 'download' | 'unpack' | 'done' | 'error'
+  pct?: number
+  err?: string
+  k?: string
+}
+
+/** 一键升级的下载进度（每 700ms 轮询一次） */
+export async function updateStatus(): Promise<UpdateStatus> {
+  try {
+    const r = await fetch('/api/update_status', { headers: { 'Sec-Fetch-Site': 'same-origin' } })
+    return (await r.json()) as UpdateStatus
+  } catch {
+    /* 后端正要退出重启时读不到，下一轮再试 */
+    return {}
   }
 }

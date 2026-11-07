@@ -134,4 +134,27 @@ describe('Onboarding', () => {
     await waitFor(() => expect(screen.queryByText(t('ob_welcome'))).toBeNull())
     expect(posts).toContainEqual({ welcome_seen: true })
   })
+
+  it('建库小卡显示真实 ETA（不再写死 18%/65% 假进度）', async () => {
+    installFetch({
+      firstrun: [{ need: true, state: 'busy', stage: 'names', files: 1200, eta: 9, total: 0 }],
+      settings: { hotkey: true, theme: 'auto' },
+    })
+    renderOb()
+    expect(await screen.findByText(t('ob_running_badge'))).toBeTruthy()
+    // ETA 文案按 i18n 渲染（eta_s：'预计还需约 {s} 秒'）
+    expect(screen.getByText(t('eta_s').replace('{s}', '9'))).toBeTruthy()
+  })
+
+  it('有 total 时进度条按 n/total 走真百分比', async () => {
+    installFetch({
+      firstrun: [{ need: true, state: 'busy', stage: 'content', n: 50, files: 0, eta: 0, total: 200 }],
+      settings: { hotkey: true, theme: 'auto' },
+    })
+    renderOb()
+    expect(await screen.findByText(t('ob_running_badge'))).toBeTruthy()
+    // 进度条容器内不该再有无定形动画条（状态点上的 animate-pulse 不算）
+    const bar = document.querySelector('.h-1.overflow-hidden .animate-pulse')
+    expect(bar).toBeNull()
+  })
 })

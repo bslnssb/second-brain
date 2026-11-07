@@ -48,7 +48,8 @@ mv dist/SecondBrain dist/SecondBrain-stale-$(date +%H%M)      # 见「坑」第 
 PY="C:/Users/…/Python312/python.exe"
 $PY gen_version.py && $PY -m PyInstaller --noconfirm --clean second-brain-app.spec && $PY -B stage_app.py
 $PY -B make_payload.py && $PY -m PyInstaller --noconfirm --clean SecondBrain-Setup.spec && $PY -B stage_setup.py
-# 4. 提交推送，然后建 Release 传安装包
+$PY -B tools/make_portable.py          # 可选：免安装便携版 zip（../dist/ 下，传 Release 附件）
+# 4. 提交推送，然后建 Release 传安装包（和便携版 zip）
 ```
 
 **check 报「仓库里有多余的跟踪文件」**

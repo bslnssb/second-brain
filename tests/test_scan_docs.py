@@ -27,6 +27,13 @@ class SkipSegmentTest(unittest.TestCase):
                   'E:\\node_modules\\x', 'F:\\.git\\config'):
             self.assertTrue(scan_docs._has_skip_segment(p), p)
 
+    def test_crossdevice_virtual_folder_flagged(self):
+        # 第 122 项：Windows「跨设备」虚拟文件夹（手机映射）不索引——枚举它会
+        # 弹「连接至 Windows」对话框，在用户机器上像木马行为
+        for p in ('C:\\Users\\me\\CrossDevice\\OnePlus Ace 2 Pro',
+                  'C:\\Users\\me\\CrossDevice\\OnePlus Ace 2 Pro\\storage\\Download'):
+            self.assertTrue(scan_docs._has_skip_segment(p), p)
+
     def test_normal_dirs_not_flagged(self):
         for p in ('D:\\MyDocs', 'C:\\Users\\me\\Photos', 'E:\\Work\\报告'):
             self.assertFalse(scan_docs._has_skip_segment(p), p)

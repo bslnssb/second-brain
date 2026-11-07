@@ -25,6 +25,8 @@ sync  tests/test_brain_pure2.py
 sync  tests/test_autostart_setup.py
 sync  tests/test_apprank.py
 sync  tests/test_scan_docs.py
+sync  tests/test_bigram.py
+sync  tests/test_body_reindex.py
 sync  app_window.py
 sync  hotkey.py
 sync  tray.py

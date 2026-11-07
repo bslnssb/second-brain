@@ -11,7 +11,12 @@ from pathlib import Path
 NOVEL_WORDS = ('小说', '书屋', '书城', '书架', 'novel', 'fiction', '轻小说', '网文')
 SKIP_DIRS = {'windows', 'program files', 'program files (x86)', 'appdata', '$recycle.bin',
              'node_modules', '.git', '__pycache__', 'site-packages', 'recovery',
-             'system volume information', 'pylibs', '.vs', 'packages'}
+             'system volume information', 'pylibs', '.vs', 'packages',
+             # Windows「跨设备」虚拟文件夹（手机经「连接至 Windows」映射进来的
+             # C:\Users\<user>\CrossDevice\<手机名>）：枚举它会尝试连接手机，手机不在
+             # 就弹「连接至 Windows」对话框（第 122 项），且内容随手机在线状态变化，
+             # 索引它没有意义。
+             'crossdevice'}
 # 第二大脑从「文档检索」扩为「全文件检索」（对标 Listary）：
 # 视频/图片/应用/音频/压缩包/源码/文档全部入索引，按 size 跳过超 50MB 的大文件。
 # 系统临时文件、缓存、备份类型主动排除，避免索引冗余。

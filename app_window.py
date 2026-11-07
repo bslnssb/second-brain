@@ -286,10 +286,14 @@ def system_dark():
 
 
 def effective_dark():
-    """界面主题（auto/dark/light）→ 现在到底是不是深色。"""
+    """界面主题（auto/dark/light）→ 现在到底是不是深色。
+
+    第 105 项把 settings.json 的读取收口成 _settings_read() 时这里漏改了，
+    AttributeError 被 except 吞成「读不到设置」→ theme=dark 时标题栏永远不变深
+    （2026-11-07 用户切深色才发现）。"""
     try:
         import brain as _b
-        th = (_b._settings_dict() or {}).get('theme', 'auto')
+        th = (_b._settings_read() or {}).get('theme', 'auto')
     except Exception:
         th = 'auto'
     if th == 'dark':
@@ -546,6 +550,55 @@ def revive_webview(hwnd):
         return 0
 
 
+# --------------------------------------------------------------- 标题栏「快搜」按钮
+# 主窗标题栏在最小化按钮左边放一枚放大镜小窗（WS_POPUP+TOOLWINDOW+NOACTIVATE，
+# owner = 主窗）：点击收起详情窗、唤出快搜窗。它是独立窗口，DWM 盖不到它的绘制。
+#
+# 位置用「二维 hit-test 扫描」校准：对主窗标题区做行列扫描，收集 HTMINBUTTON /
+# HTMAXBUTTON / HTCLOSE 的 bounding box——**不猜按钮条在哪一行**（实测条高随 DPI/
+# 主题在 6~52px 漂移，v1 的单行扫描扫不全按钮、rel 偏移盖住了原生最小化键）。
+# 扫描结果记成「相对右缘」偏移，挪窗/缩放不失效；DPI 变化 / 激活变化时重校准，
+# 每次同步位置前用单点探针自校正（rel 预期的缩小键中心必须是 HTMINBUTTON）。
+# 图标是 GDI 自绘放大镜（圆环+柄）——字体名经 CreateFontW 解析失败会画成
+# fallback emoji（圆脸），零字体依赖才稳。
+# 点击动作丢后台线程（WndProc 里同步调 pywebview 的 show/hide 实测卡死 100 秒），
+# hide 之后再用 Win32 SW_HIDE 兜底——后台线程调 pywebview 的 main.hide() 在
+# 「可见中的主窗」上实测无效（v1 的验证是在隐藏窗口上做的，假阳性）。
+_WM_NCHITTEST, _WM_NCLBUTTONDOWN = 0x0084, 0x00A1
+_WM_NCACTIVATE, _WM_MOVE, _WM_SIZE = 0x0086, 0x0003, 0x0005
+_WM_DPICHANGED = 0x02E0
+_HTMENU, _HTCAPTION, _HTMINBUTTON, _HTMAXBUTTON, _HTCLOSE = 5, 2, 8, 9, 20
+_SW_HIDE, _SW_SHOWNOACTIVATE = 0, 8
+_GWLP_WNDPROC = -4
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+
+_SUBCLASSPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_ssize_t, ctypes.c_uint,
+                                   ctypes.c_size_t, ctypes.c_ssize_t)
+_BTNPROC_REF = None          # 按钮窗口过程，同上
+_CAPBTN = {'installed': False, 'app': None, 'rel': None, 'hot': False,
+           'busy': False, 'btn': 0, 'shown': False}
+
+# 这些 user32/gdi32 函数的 argtypes 是进程级共享状态：lp 一律用 c_void_p（int 和
+# 实例都收），收紧成 c_ssize_t 会把 apply_window_icon 之类传 c_void_p 的调用方弄炸
+# （第 117 项的图标消失事故）。
+u32 = ctypes.windll.user32
+g32 = ctypes.windll.gdi32
+u32.DefWindowProcW.restype = ctypes.c_ssize_t
+u32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                               ctypes.c_size_t, ctypes.c_ssize_t]
+
+
+
+
+
+
+
+
 def foreground_desc():
     """谁占了前台——排查「窗口莫名其妙失焦」时唯一有用的线索"""
     try:
@@ -585,11 +638,14 @@ class Api:
     def __init__(self, win=None):
         self._win = win
         self._open_mini = None      # App 注入：唤出快搜窗（欢迎页按钮用）
+        self._hide_main = None      # App 注入：收起详情窗（顶栏/标题栏「快搜」按钮用）
 
     def set_dark(self, dark):
         """页面切主题时同步系统标题栏，免得「黑内容 + 白标题栏」。"""
         try:
-            return dark_caption(find_hwnd(MAIN_TITLE), bool(dark))
+            ok = dark_caption(find_hwnd(MAIN_TITLE), bool(dark))
+            _log('set_dark(%s) → %s' % (bool(dark), ok))
+            return ok
         except Exception:
             return False
 
@@ -598,6 +654,16 @@ class Api:
         try:
             if self._open_mini:
                 self._open_mini()
+            return True
+        except Exception:
+            return False
+
+    def hide_main(self):
+        """详情窗收起（顶栏「快搜」按钮的后半句）。以前桥上没有这个方法，
+        App.tsx 里 `setTimeout(api.hide_main(), 120)` 一直是静默空操作。"""
+        try:
+            if self._hide_main:
+                self._hide_main()
             return True
         except Exception:
             return False
@@ -643,6 +709,33 @@ class Api:
         except Exception:
             pass
         return True
+
+        try:
+            # os.startfile(p, 'properties') 内部缺 SEE_MASK_INVOKEIDLIST，
+            # 会报 WinError 1155（无关联）——必须用 ShellExecuteExW 直调。
+            import ctypes
+            from ctypes import wintypes
+
+            class _SEI(ctypes.Structure):
+                _fields_ = [('cbSize', wintypes.DWORD), ('fMask', wintypes.ULONG),
+                            ('hwnd', wintypes.HWND), ('lpVerb', wintypes.LPCWSTR),
+                            ('lpFile', wintypes.LPCWSTR), ('lpParameters', wintypes.LPCWSTR),
+                            ('lpDirectory', wintypes.LPCWSTR), ('nShow', ctypes.c_int),
+                            ('hInstApp', wintypes.HINSTANCE), ('lpIDList', ctypes.c_void_p),
+                            ('lpClass', wintypes.LPCWSTR), ('hkeyClass', wintypes.HKEY),
+                            ('dwHotKey', wintypes.DWORD), ('hIconOrMonitor', wintypes.HANDLE),
+                            ('hProcess', wintypes.HANDLE)]
+            np = os.path.normpath(p)
+            sei = _SEI()
+            sei.cbSize = ctypes.sizeof(_SEI)
+            sei.fMask = 0x0000000C              # SEE_MASK_INVOKEIDLIST
+            sei.lpVerb = 'properties'
+            sei.lpFile = np
+            sei.nShow = 1                       # SW_SHOWNORMAL
+            ret = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
+            return bool(ret)
+        except Exception:
+            return False
 
     def reveal(self, p):
         """在资源管理器里选中这个文件（主窗口 Ctrl+Enter）。
@@ -713,6 +806,13 @@ class MiniApi:
         except Exception:
             pass
 
+    def properties(self, p):
+        """弹出 Windows 文件属性对话框（快搜窗右键菜单）。
+        os.startfile 的 operation 参数（3.10+）走 ShellExecuteEx 的 properties
+        verb，立即返回不阻塞；白名单与 open_path/reveal 一致。"""
+        p = str(p or '')
+        if not p or not brain.ev_recent(p):
+            return False
     def reveal(self, p):
         """在资源管理器里定位这个文件（快搜窗里 Ctrl+Enter 的备用动作）"""
         p = str(p or '')
@@ -790,11 +890,12 @@ class App:
         )
         self.main_api = Api()
         self.main_api._open_mini = lambda: self.show_mini()
+        self.main_api._hide_main = self.hide_main
         sw, sh = screen_logical_size()
         saved = None
         try:
             import brain as _b
-            _st = _b._settings_dict()
+            _st = _b._settings_read()
             if _st.get('win_w') and _st.get('win_h'):
                 saved = (int(_st['win_w']), int(_st['win_h']))
         except Exception:
@@ -876,7 +977,7 @@ class App:
         """在 closing 事件之外 hide 主窗口，避开 WinForms FormClosing 的时序陷阱。"""
         try:
             self.main.hide()
-            _log('_safe_hide_main ok')
+            _log_always('_safe_hide_main ok')   # exe 模式 _log 不落盘——hide 是否执行是白屏排查的第一线索
         except Exception as e:
             _log(f'_safe_hide_main FAILED: {e}')
 
@@ -899,9 +1000,47 @@ class App:
         except Exception:
             pass
 
+    def _fallback_browser(self, reason):
+        """WebView2 初始化失败的降级：藏掉白窗、用默认浏览器打开界面，
+        服务与托盘照常运行（与 webview.start 失败的 FATAL 路径同款体验）。"""
+        try:
+            self._safe_hide_main()          # pywebview 层（后台线程调可能卡/无效）
+        except Exception:
+            pass
+        # Win32 兜底：从看门狗线程调 pywebview 的 hide 实测可能卡 20 秒或无效
+        # （第 124 项同款根因）——ShowWindow 跨线程必生效，白窗必须真消失。
+        try:
+            hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(ctypes.c_void_p(hwnd), 0)   # SW_HIDE
+        except Exception:
+            pass
+        try:
+            import webbrowser
+            webbrowser.open(self.url)
+            _log_always('webview 不可用（' + reason + '），已用浏览器打开界面')
+        except Exception:
+            _log_always('webview 不可用且浏览器降级失败：' + reason)
+
+    def _watch_loaded_or_fallback(self):
+        """WebView2 初始化失败（0x700AA profile 锁等）时 pywebview 只打印
+        「initialization failed」而不抛异常——窗口白屏挂着没人知道。这里等
+        loaded 事件，10 秒不来就降级浏览器（服务与托盘不受影响）。"""
+        try:
+            if self.main and self.main.events.loaded.wait(10):
+                return                                # 正常加载
+        except Exception:
+            return                                    # 事件机制异常，不动
+        try:
+            if u32.IsWindowVisible(ctypes.c_void_p(self.hwnd_main)) if (u32 := ctypes.windll.user32) else False:
+                self._fallback_browser('WebView2 初始化失败（0x700AA）')
+        except Exception:
+            pass
+
     def after_start(self):
         self.hwnd_mini = wait_hwnd(MINI_TITLE)
         self.hwnd_main = wait_hwnd(MAIN_TITLE)
+        threading.Thread(target=self._watch_loaded_or_fallback, daemon=True).start()
         # silent 模式主窗口按非 hidden 创建（见 create 里的说明），等 Form.Shown
         # 真正置位、events.shown 可用之后再收起来。用事件而不是固定 sleep：
         # 窗口只露出一瞬间，开机自启不会闪一大下。
@@ -1130,7 +1269,7 @@ class App:
                 hwnd = wait_hwnd(MAIN_TITLE, 2.0)
                 if hwnd:
                     self.hwnd_main = hwnd
-            _log(f'show_main begin q={q!r} hwnd={hwnd} '
+            _log_always(f'show_main begin q={q!r} hwnd={hwnd} '
                  f'visible={_is_visible(hwnd)} loaded={getattr(self, "_main_loaded", False)}')
 
             self.main.show()
@@ -1192,19 +1331,17 @@ class App:
 
         # ③ load_url / 整页导航可能重建渲染窗口，等它稳定后再补一次唤醒，
         #    避免刚显示的窗口又被新建的 WebView2 视图盖成空白。WebView2 的
-        #    合成是异步的，单点唤醒容易被它自己的布局循环盖掉，所以分两拍。
+        #    合成是异步的：渲染层初始化慢（后台 IO 忙）时固定两拍不够，
+        #    改成轮询式自愈（最多 10 秒，渲染子窗全可见才收工）。
         def _late_revive():
-            for delay in (0.3, 0.8):
-                time.sleep(delay)
-                revive_webview(hwnd)
-                self._force_webview_visible()
+            _late_revive_loop(self)
 
         threading.Thread(target=_late_revive, daemon=True).start()
 
         # ④ 抢前台，失败也不影响前面几步
         try:
             ok = topmost(hwnd)
-            _log(f'show_main topmost={ok} visible_now={_is_visible(hwnd)} '
+            _log_always(f'show_main topmost={ok} visible_now={_is_visible(hwnd)} '
                  f'fg={foreground_desc()}')
         except Exception:
             _log_always('show_main: 抢前台失败\n' + traceback.format_exc())
@@ -1419,7 +1556,9 @@ def _start_prune_after_boot():
     threading.Thread(target=_do, daemon=True).start()
 
 
-_MUTEX_NAME = 'Local\\SecondBrain.Desktop.SingleInstance'
+_MUTEX_NAME = 'Local\\SecondBrain.Desktop.SingleInstance.v2'
+# .v2 后缀：第 121/122 项排查期间，一个 GIL 死锁的测试进程持着旧名的互斥锁不放，
+# 导致零实例下 _single_instance 也误报「已在运行」。换名绕开；旧名随幽灵进程退出自然消失。
 _MUTEX_H = None
 
 
@@ -1477,10 +1616,11 @@ def _single_instance():
     try:
         import ctypes
         k = ctypes.windll.kernel32
-        h = k.CreateMutexW(None, False, _MUTEX_NAME)
+        k = ctypes.WinDLL('kernel32', use_last_error=True)   # 让 ctypes 保存该次调用的
+        h = k.CreateMutexW(None, False, _MUTEX_NAME)          # LastError，不被中间调用污染
         if not h:
             return True
-        if k.GetLastError() == 183:            # ERROR_ALREADY_EXISTS
+        if ctypes.get_last_error() == 183:    # ERROR_ALREADY_EXISTS
             _log('single instance: another copy is running')
             _activate_running()
             return False
@@ -1489,6 +1629,57 @@ def _single_instance():
     except Exception as e:
         _log(f'single instance FAILED: {e}')
         return True
+
+
+def _cleanup_orphan_webview():
+    """结束「父进程已死」的 msedgewebview2（第 125 项）。
+
+    强杀 SecondBrain.exe 后它的 WebView2 子进程孤儿化，锁着 webview-profile
+    数据目录——下一次启动的 WebView2 环境创建报 0x700AA（资源在使用中）→ 白屏。
+    Toolhelp32 快照枚举进程：msedgewebview2 且父进程 PID 不在快照中（父已死）
+    的就结束掉。系统组件（SearchHost 等）的 webview 父进程活着，不受影响。
+    快照里父 PID 存在但实际是不同名进程的场景极少（PID 复用窗口期），代价只是
+    少清一个孤儿，下一次启动还会再清。"""
+    if os.name != 'nt':
+        return
+    try:
+        TH32CS_SNAPPROCESS = 0x2
+        k32 = ctypes.windll.kernel32
+        class _PE(ctypes.Structure):
+            _fields_ = [('dwSize', ctypes.c_uint32), ('cntUsage', ctypes.c_uint32),
+                        ('th32ProcessID', ctypes.c_uint32),
+                        ('th32DefaultHeapID', ctypes.c_size_t),
+                        ('th32ModuleID', ctypes.c_uint32), ('cntThreads', ctypes.c_uint32),
+                        ('th32ParentProcessID', ctypes.c_uint32),
+                        ('pcPriClassBase', ctypes.c_long), ('dwFlags', ctypes.c_uint32),
+                        ('szExeFile', ctypes.c_wchar * 260)]
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == ctypes.c_void_p(-1).value or not snap:
+            return
+        pe = _PE()
+        pe.dwSize = ctypes.sizeof(_PE)
+        procs = {}
+        if k32.Process32FirstW(snap, ctypes.byref(pe)):
+            while True:
+                procs[pe.th32ProcessID] = (pe.szExeFile, pe.th32ParentProcessID)
+                if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                    break
+        k32.CloseHandle(ctypes.c_void_p(snap))
+        killed = 0
+        for pid, (name, ppid) in procs.items():
+            if name.lower() != 'msedgewebview2.exe':
+                continue
+            if ppid in procs:                      # 父进程活着 → 不是孤儿
+                continue
+            h = k32.OpenProcess(0x0001, False, pid)   # PROCESS_TERMINATE
+            if h:
+                k32.TerminateProcess(ctypes.c_void_p(h), 1)
+                k32.CloseHandle(ctypes.c_void_p(h))
+                killed += 1
+        if killed:
+            _log_always('orphan webview 清理：结束 %d 个父进程已死的 msedgewebview2' % killed)
+    except Exception as e:
+        _log_always('orphan webview 清理失败：%r' % (e,))
 
 
 def main(query=None, show_settings=False, lang=None, silent=False, start_mini=False):
@@ -1566,6 +1757,7 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
             _storage = str(_profile)
         except Exception:
             _storage = None
+        _cleanup_orphan_webview()          # 先清上一实例强杀留下的孤儿 webview
         webview.start(func=app.after_start, debug=False,
                       private_mode=False, storage_path=_storage)
     except Exception as e:

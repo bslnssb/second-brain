@@ -19,6 +19,8 @@ Python + SQLite FTS5. One `brain.db` holds every extracted document body; it kee
 
 Grab the latest `SecondBrain-Setup-vX.Y.Z.exe` (about 180 MB) from [Releases](https://github.com/bslnssb/second-brain/releases) and run it.
 
+On a machine where you cannot install software? The same Release carries a portable `SecondBrain-vX.Y.Z-portable.zip` — unzip it anywhere writable and run `SecondBrain.exe`. No installer, no services; data lives next to the program (or in `%LOCALAPPDATA%` when the folder is read-only).
+
 | | |
 |---|---|
 | OS | Windows 10 / 11 (64-bit) |
@@ -40,10 +42,10 @@ On first launch you pick the folders to index and the database builds itself. **
 - **File names and document text in one place**: name matches come from the index (sub-millisecond); after 300 ms of idle it also adds "this document mentions it" hits, tagged and with the matching sentence
 - **Pinyin search**: type `azb` to find 安装包 (setup package), `xzrs` for 行政人事. Initials and full pinyin both work
 - **Real system icons**: each row shows the same icon Explorer would (PDF red, Word blue, Excel green, an exe shows its own icon)
-- **Chinese full-text search**: 3+ characters use an FTS5 trigram index with highlighting; 1–2 characters fall back to `LIKE`
+- **Chinese full-text search**: 3+ characters use an FTS5 trigram index with highlighting; 2-character Chinese words go through a bigram inverted side table (milliseconds), single characters fall back to `LIKE`
 - **Automatic OCR**: image-only PDFs are recognised on the first 6 pages (20 s per document), offline Chinese OCR
 - **Index scope is visible — and editable**: the settings panel shows which drives are indexed, how many entries each holds, which folders feed the document index, and what is excluded. If the scope is wrong you add or remove folders and exclude words right there, then run an update
-- **New files show up on their own**: Desktop, Downloads, Documents and the folders in your index scope are watched; a file you create, rename or delete appears (or disappears) in about 2 seconds. Turn it off with `"watch": false` in `settings.json`
+- **New files show up on their own**: Desktop, Downloads, Documents and the folders in your index scope are watched; a file you create, rename or delete appears (or disappears) in about 2 seconds, and an edited document's **text** is re-read within about a minute. Turn it off with `"watch": false` in `settings.json` (`"watch_body": false` disables only the text re-read)
 - **Progress follows the interface language**: every maintenance step and every error is rendered in the current language — switching to English no longer leaves Chinese in the progress line
 - **Exclusions apply to both layers**: `exclude_dirs` filters the file-name index and the document index, and whole subtrees are pruned during the walk (on this machine, excluding game libraries took 600k entries down to 200k)
 - **Incremental by default**: changed files are re-indexed, deleted ones are pruned, unchanged ones are skipped; a long index run resumes where it stopped
@@ -74,7 +76,7 @@ When the quick search box is empty it lists recently opened files, so often you 
 | **Listary** | Strong, with pinyin and a launcher | No | Live |
 | **Second Brain** | Good enough: file and folder names (game libraries excludable — 200k entries here), around 0.2 ms per prefix query, pinyin included | **In the quick window** | Live in watched folders (~2s) + manual full rebuild |
 
-**What it does not do**: Listary can also jump folders inside Open/Save dialogs and select files in Explorer. Everything and Listary keep a **volume-wide** index live from the NTFS file table; Second Brain only watches the folders in your scope plus Desktop, Downloads and Documents — other drives still need a manual update, and document text is never re-read automatically. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
+**What it does not do**: Listary can also jump folders inside Open/Save dialogs and select files in Explorer. Everything and Listary keep a **volume-wide** index live from the NTFS file table; Second Brain only watches the folders in your scope plus Desktop, Downloads and Documents — other drives and anything that changed while the app was closed still need a manual update. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
 
 > Second Brain is an independent implementation: it uses no code, icons or UI assets from the products above, and has no affiliation with them. Product names appear only to explain the differences.
 

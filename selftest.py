@@ -392,7 +392,14 @@ def run_all(verbose=True, write_report=True):
         # 旧路径做抽检；对上才平移，对不上一条都不许改。
         jroot = None
         real_jidx = brain._dir_index
+        real_stdin = sys.stdin
         try:
+            # J3 断言的是「交给界面点选」这条路径。repair_scope 会看
+            # sys.stdin.isatty() 决定走控制台问号还是界面点选（brain.py repair_scope），
+            # 桌面 exe 里没有控制台（stdin 为 None），但从控制台跑 selftest 时 stdin
+            # 是 tty，会漂到控制台分支 —— J3 随环境假红，GUI 的质量自检子进程甚至
+            # 会卡在 input() 上。这里固定成非 tty，模拟桌面的真实形态。
+            sys.stdin = io.StringIO()
             jroot = Path(tempfile.mkdtemp(prefix='sb-repair-'))
             jold = jroot / 'oldplace' / '1' / 'library'
             (jold / 'a').mkdir(parents=True)
@@ -484,6 +491,7 @@ def run_all(verbose=True, write_report=True):
         except Exception as e:
             _rec('FAIL', 'J 范围搬家自动认亲', f'{type(e).__name__}: {e}')
         finally:
+            sys.stdin = real_stdin
             brain._dir_index = real_jidx
             if jroot is not None:
                 shutil.rmtree(str(jroot), ignore_errors=True)

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   getAutostart,
   getConfig,
@@ -18,6 +18,7 @@ import {
   copyText,
   openUrl,
   saveConfig,
+  updateStatus,
   type UpdateInfo,
 } from '../api'
 import { baseName, dayLabel, dirName, fmtSize, fmtTime, midName } from '../lib/hits'
@@ -475,7 +476,8 @@ const KB = (): [string, string][] => [
   ['Ctrl Ctrl', t('kb8')],
 ]
 
-const QS = (): [string, string][] => [
+/** 搜索框语法速览（帮助弹窗与侧栏「可用的语法」共用同一份，别写两份） */
+export const QS = (): [string, string][] => [
   ['ext:pdf', t('qs1')],
   ['size:>10m', t('qs2')],
   ['dm:7d', t('qs3')],
@@ -680,11 +682,18 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
     state: 'idle',
   })
   const [installing, setInstalling] = useState(false)
+  /** 一键升级的下载进度（-1 = 还没拿到第一拍）；后端异步下载，前端轮询 */
+  const [dlPct, setDlPct] = useState(-1)
+  const dlTimer = useRef<number | null>(null)
   useEffect(() => {
     if (!open) return
     getStats().then(setStats).catch(() => {})
     getPing().then(setPing).catch(() => {})
     setUp({ state: 'idle' })
+    return () => {
+      if (dlTimer.current) window.clearInterval(dlTimer.current)
+      dlTimer.current = null
+    }
   }, [open])
 
   const doCheck = async () => {
@@ -705,11 +714,41 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
 
   const doInstall = async () => {
     setInstalling(true)
-    const r = await applyUpdate()
+    setDlPct(-1)
+    let r: { ok: boolean; err?: string; started?: boolean }
+    try {
+      r = await applyUpdate()
+    } catch (e) {
+      r = { ok: false, err: String(e) }
+    }
     if (!r.ok) {
       setInstalling(false)
       setUp({ state: 'err', text: t('about_dl_fail').replace('{e}', String(r.err || t('about_unknown'))) })
+      return
     }
+    // 后端已改异步：立即返回 started，下载进度用 /api/update_status 轮询
+    const id = window.setInterval(async () => {
+      try {
+        const s = await updateStatus()
+        if (s.state === 'download' || s.state === 'unpack') {
+          setDlPct(s.pct ?? 0)
+        } else if (s.state === 'done') {
+          window.clearInterval(id)
+          setDlPct(100)                       // 到这步程序马上自己重启，保持「完成」显示
+        } else if (s.state === 'error') {
+          window.clearInterval(id)
+          setInstalling(false)
+          setDlPct(-1)
+          setUp({
+            state: 'err',
+            text: t('about_dl_fail').replace('{e}', String(s.err || t('about_unknown'))),
+          })
+        }
+      } catch {
+        /* 后端正在退出重启时读不到，下一轮再说 */
+      }
+    }, 700)
+    dlTimer.current = id
   }
 
   if (!open) return null
@@ -768,13 +807,24 @@ export function AboutModal({ open, onClose }: { open: boolean; onClose: () => vo
               disabled={installing}
               className="ml-auto rounded-md bg-accent px-2.5 py-1 text-[12px] text-white hover:opacity-90 disabled:opacity-60"
             >
-              {installing ? t('about_downloading') : t('about_download')}
+              {installing
+                ? dlPct >= 0
+                  ? `${t('about_downloading')} ${dlPct}%`
+                  : t('about_downloading')
+                : t('about_download')}
             </button>
           )}
         </div>
         {installing && (
-          <div className="pt-1 text-[11px] leading-4 text-sub">
-            {t('about_dl_hint')}
+          <div className="pt-2">
+            <div className="h-1.5 overflow-hidden rounded-full bg-line">
+              {dlPct >= 0 && (
+                <div className="h-full bg-accent transition-all" style={{ width: `${dlPct}%` }} />
+              )}
+            </div>
+            <div className="pt-1 text-[11px] leading-4 text-sub">
+              {dlPct >= 100 ? t('about_dl_hint') : t('about_downloading')}
+            </div>
           </div>
         )}
       </div>
@@ -865,7 +915,6 @@ function RowIcon({ row }: { row: { p: string; e?: string } }) {
 export function Timeline({
   onPick,
   kind = 'all',
-  pf = '',
   sort = 'new',
   view = 'list',
   onHover,
@@ -873,7 +922,6 @@ export function Timeline({
 }: {
   onPick: (p: string) => void
   kind?: string
-  pf?: string
   /** 排序：时间轴默认按时间倒序，用户换排序时这里也跟着变，否则按钮像坏的 */
   sort?: 'rel' | 'new' | 'old' | 'big' | 'name'
   view?: 'list' | 'grid'
@@ -888,14 +936,14 @@ export function Timeline({
   useEffect(() => {
     let alive = true
     setLoading(true)
-    getTimeline(days, kind, pf)
+    getTimeline(days, kind)
       .then((r) => alive && setGroups(r.groups || []))
       .catch(() => alive && setGroups([]))
       .finally(() => alive && setLoading(false))
     return () => {
       alive = false
     }
-  }, [days, kind, pf])
+  }, [days, kind])
 
   const total = useMemo(() => groups.reduce((a, g) => a + g.n, 0), [groups])
 
@@ -946,6 +994,17 @@ export function Timeline({
         <button className="hover:text-ink" onClick={() => setDays(7)}>{getLang() === 'zh' ? '7 天' : getLang() === 'es' ? '7 días' : getLang() === 'pt' ? '7 dias' : getLang() === 'hi' ? '7 दिन' : '7 days'}</button>
         <button className="hover:text-ink" onClick={() => setDays(30)}>{getLang() === 'zh' ? '30 天' : getLang() === 'es' ? '30 días' : getLang() === 'pt' ? '30 dias' : getLang() === 'hi' ? '30 दिन' : '30 days'}</button>
       </div>
+      {/* 列头：搜索结果的列表有「名称/路径/大小/时间」表头，时间轴以前没有——
+          用户不知道右边两列是什么。列宽与下面的行严格对齐；缩略图（grid）模式没有列，不渲染。 */}
+      {view === 'list' && (
+        <div className="flex items-center gap-2 border-b border-line px-2 pb-1 text-[11px] text-sub">
+          <span className="w-4 shrink-0" />
+          <span className="w-[46%] shrink-0">{t('col_name_only')}</span>
+          <span className="min-w-0 flex-1">{t('col_path')}</span>
+          <span className="w-20 shrink-0 text-right">{t('col_size')}</span>
+          <span className="w-28 shrink-0 text-right">{t('col_mtime')}</span>
+        </div>
+      )}
       {sorted.map((g) => (
         <section key={g.d}>
           <div className="flex items-baseline gap-2 px-2 pb-1 pt-3">

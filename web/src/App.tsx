@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { dirName, fmtSize, fmtTime, midName, sortItems, SORT_KEYS, type Hit, type SortKey } from './lib/hits'
 import { parseQSyn } from './lib/qsyn'
-import { AboutModal, HelpModal, Preview, SettingsDrawer, Timeline } from './ui/panels'
+import { AboutModal, HelpModal, Preview, QS, SettingsDrawer, Timeline } from './ui/panels'
 import { setLang, t } from './lib/i18n'
 import { ContextMenu, ReverseModal, ZipToast, type MenuItem } from './ui/context'
 import { Onboarding } from './ui/onboarding'
@@ -159,7 +159,6 @@ export default function App() {
   const [dark, setDark] = useState(false)
   const [kind, setKind] = useState<'all' | 'dir' | 'doc' | 'img' | 'video' | 'audio' | 'zip' | 'app'>('all')
   const [days, setDays] = useState(0)
-  const [pf, setPf] = useState('')
   const [panel, setPanel] = useState<null | 'settings' | 'help' | 'about'>(null)
   // 语言切换后整棵界面要跟着换字：监听 i18n 派发的事件，用 key 强制重挂子组件
   const [langTick, setLangTick] = useState(0)
@@ -279,6 +278,18 @@ export default function App() {
     setDark(isDark)
   }, [])
 
+  // 深色变化同步系统标题栏（第 45 项）。React 主界面从没接过这个桥——旧模板时代
+  // 标题栏能跟着变深，换 React 后一直靠后端启动时读 settings.json 兜底；
+  // 桥不可用（浏览器模式）时静默跳过。
+  useEffect(() => {
+    try {
+      const api = (window as unknown as { pywebview?: { api?: { set_dark?: (d: boolean) => void } } }).pywebview?.api
+      api?.set_dark?.(dark)
+    } catch {
+      /* 浏览器模式没有原生桥 */
+    }
+  }, [dark])
+
   // 首启建完库：页脚数字和时间轴要立刻跟上，否则用户搜到了、下面还写着 0
   const onFirstIndexed = useCallback(() => {
     api<Stats>('/api/stats').then(setStats).catch(() => {})
@@ -347,7 +358,6 @@ export default function App() {
       zip: ['zip', 'rar', '7z', 'tar', 'gz'],
       app: ['exe', 'lnk', 'msi', 'bat', 'cmd'],
     }
-    const key = pf.trim().toLowerCase()
     return rows.filter((r) => {
       const e = String(r.e || r.p.split('.').pop() || '').replace(/^\./, '').toLowerCase()
       if (kind === 'dir' && r.t !== 'dir') return false
@@ -356,10 +366,9 @@ export default function App() {
       if (kind === 'zip' && !kinds.zip.includes(e)) return false
       if (kind === 'app' && !kinds.app.includes(e)) return false
       if (days > 0 && (!r.m || r.m < now - days * 86400)) return false
-      if (key && !String(r.p).toLowerCase().includes(key)) return false
       return true
     })
-  }, [rows, kind, days, pf])
+  }, [rows, kind, days])
 
   // 侧栏筛选把行数砍短后，picked 要跟着收回来：
   // 否则高亮停在一条已经不存在的行上，回车就是打开错的文件（或什么都不打开）。
@@ -692,14 +701,24 @@ export default function App() {
             {label}
           </button>
         ))}
-        <div className="mx-1 mt-2 border-t border-line pt-2 text-[11px] text-sub">{t('path_contains')}</div>
-        <input
-          value={pf}
-          onChange={(e) => setPf(e.target.value)}
-          placeholder={t('optional')}
-          className="w-full rounded border border-line bg-card px-1.5 py-1 text-[11px] outline-none focus:border-accent"
-        />
-        <div className="mx-1 mt-2 border-t border-line pt-2 text-[11px] text-sub">{t('more')}</div>
+        {/* 侧栏语法速览：这些前缀直接写进搜索框生效（点击插入并聚焦）。
+            原来的「路径包含」输入框删掉了——那是另一套本地过滤，和搜索语法并存
+            让人以为语法不好使；要按路径过滤就写 `词尾/` 限定文件夹或 `-排除`。 */}
+        <div className="mx-1 mt-2 border-t border-line pt-2 text-[11px] text-sub">{t('help_qs')}</div>
+        <div className="mx-1 mt-1 flex flex-wrap gap-1 pb-1">
+          {QS().map(([syn, desc]) => (
+            <button
+              key={syn}
+              title={desc}
+              onClick={() =>
+                setQ((prev) => (prev.trim() ? prev.trimEnd() + ' ' + syn + ' ' : syn + ' '))
+              }
+              className="rounded bg-card px-1.5 py-0.5 font-mono text-[10.5px] text-sub hover:text-accent hover:outline hover:outline-line"
+            >
+              {syn}
+            </button>
+          ))}
+        </div>
         {([['help', t('help')], ['settings', t('settings')], ['about', t('about')]] as const).map(([k, label]) => (
           <button
             key={k}
@@ -737,7 +756,6 @@ export default function App() {
             key={reload}          /* 首启建库完成后 onIndexed 会 +1，这里强制重取时间轴 */
             onPick={(p) => openRow(p)}
             kind={kind}
-            pf={pf}
             sort={sort}
             view={view}
             selected={tlRow?.p}

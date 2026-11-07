@@ -22,6 +22,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { t } from '../lib/i18n'
+import { fill } from './maintenance'
 import { IconSearch, IconClock, IconDoc, IconFolder, IconImage, IconGrid } from './icons'
 
 type FirstRun = {
@@ -29,8 +30,12 @@ type FirstRun = {
   need?: boolean
   state?: string
   stage?: string
+  msg?: string
+  n?: number
   files?: number
   docs?: number
+  eta?: number
+  total?: number
   bg?: string
 }
 
@@ -304,9 +309,19 @@ export function Onboarding({ onOpenSettings, onIndexed }: Props) {
             <b className="text-ink">{files.toLocaleString()}</b> {t('ob_files')}
           </span>
         </div>
+        {/* 进度条不再写死 18%/65%：有 total（如正文阶段）就是真百分比；文件名阶段
+            总数未知的换成动画条，诚实一点——别让用户以为 65% 是算出来的 */}
         <div className="mt-2 h-1 overflow-hidden rounded-full bg-line">
-          <div className="h-full rounded-full bg-accent transition-all" style={{ width: files > 0 ? '65%' : '18%' }} />
+          {st.total && st.total > 0 && st.n ? (
+            <div className="h-full rounded-full bg-accent transition-all"
+                 style={{ width: `${Math.min(95, Math.round((st.n / st.total) * 100))}%` }} />
+          ) : (
+            <div className="h-full w-1/3 rounded-full bg-accent animate-pulse" />
+          )}
         </div>
+        {st.eta && st.eta > 0 && (
+          <div className="mt-1.5 text-[11px] text-sub opacity-80">{fill(t('eta_s'), { s: st.eta })}</div>
+        )}
         <div className="mt-2 text-[11px] leading-snug text-sub">{t('ob_can_search')}</div>
         {errBar}
         <div className="mt-2 flex justify-end gap-2">

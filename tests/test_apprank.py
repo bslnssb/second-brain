@@ -63,8 +63,10 @@ class BoostTest(unittest.TestCase):
         self.assertAlmostEqual(b, 1.00, places=4)
 
     def test_lnk_with_chinese_name_boosted(self):
+        # 路径用「公共桌面」：check_public 会把 C:\Users\<名字>\ 判成疑似本机用户目录
+        # （无法区分真假用户名），Public 是它明确豁免的示例路径。
         b = apprank.boost('微信', '微信.lnk',
-                          r'C:\Users\me\Desktop\微信.lnk')
+                          r'C:\Users\Public\Desktop\微信.lnk')
         # 主名 tier0 -> 1.00，lnk 快捷方式 -0.08
         self.assertAlmostEqual(b, 0.92, places=4)
 

@@ -326,14 +326,14 @@ def check_tests():
             if name == '后端 unittest':
                 m = re.search(r'Ran (\d+) tests', out)
                 ok = (r.returncode == 0 and any(x.startswith('OK') for x in lines)
-                      and m and int(m.group(1)) >= 22)
-                want = '>= 22 项'
+                      and m and int(m.group(1)) >= 92)
+                want = '>= 92 项'
             else:
                 mf = re.search(r'Test Files\s+(\d+) passed', out)
                 mt = re.search(r'Tests\s+(\d+) passed', out)
                 ok = (r.returncode == 0 and mf and mt and
-                      int(mf.group(1)) >= 6 and int(mt.group(1)) >= 52)
-                want = '>= 6 文件 / >= 52 用例'
+                      int(mf.group(1)) >= 6 and int(mt.group(1)) >= 56)
+                want = '>= 6 文件 / >= 56 用例'
             detail = '' if ok else '%s（要求 %s）' % (
                 (lines[-1] if lines else '?')[:100], want)
             rec('PASS' if ok else 'FAIL', '测试全绿：' + name, detail)

@@ -17,12 +17,20 @@ type Prog = {
   total?: number
   ok?: number
   fail?: number
+  /** 预计剩余秒数（index() 按实际速率算，0 = 未知/已结束） */
+  eta?: number
   msg?: string
   err?: string
   /** 后端给的文案键 + 参数：有 k 就按当前语言渲染，没有才退回 msg 原文 */
   k?: string
   a?: Record<string, string | number>
 }
+
+/** 剩余时间按语言渲染：<1 分钟只报秒，更长报「X 分 Y 秒」 */
+const etaText = (sec: number): string =>
+  sec >= 60
+    ? fill(t('eta_min'), { m: Math.floor(sec / 60), s: sec % 60 })
+    : fill(t('eta_s'), { s: sec })
 
 type Job = 'scan' | 'update' | 'names' | 'selftest'
 
@@ -174,6 +182,7 @@ export function Maintenance({ onDone }: { onDone?: () => void }) {
             <IconStop size={11} />
             {t(LABEL_KEY[job])} · {say(prog) || fill(t(BUSY_KEY[job]), prog.a)}
             {prog.done ? ` ${prog.done}${prog.total ? '/' + prog.total : ''}` : ''}
+            {prog.eta && prog.eta > 0 ? ` · ${etaText(prog.eta)}` : ''}
           </div>
           <div className="h-1.5 overflow-hidden rounded-full bg-line">
             <div className="h-full bg-accent transition-all" style={{ width: `${pct}%` }} />

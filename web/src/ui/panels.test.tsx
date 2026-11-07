@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { t } from '../lib/i18n'
-import { AboutModal } from './panels'
+import { AboutModal, Timeline } from './panels'
 
 function reply(body: unknown): Response {
   return { ok: true, status: 200, json: async () => body } as unknown as Response
@@ -60,5 +60,37 @@ describe('AboutModal / DonateQR', () => {
     // 占位文案被 <br> 拆成两个文本节点，getByText 精确匹配不到，改查整块文本
     await waitFor(() => expect(document.body.textContent).toContain(t('donate_put')))
     expect(screen.queryByAltText(t('donate_alt'))).toBeNull()
+  })
+})
+
+describe('Timeline 列头（第 115 项）', () => {
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  const oneGroup = {
+    days: 14,
+    groups: [{
+      d: '2026-11-07', label: '今天', n: 1,
+      items: [{ p: 'D:\\tmp\\a.txt', n: 'a.txt', s: 123, m: 1793991187 }],
+    }],
+  }
+
+  it('list 视图渲染「名称/路径/大小/时间」列头', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reply(oneGroup)))
+    render(<Timeline onPick={() => {}} />)
+    expect(await screen.findByText('a.txt')).toBeTruthy()
+    expect(screen.getByText(t('col_name_only'))).toBeTruthy()
+    expect(screen.getByText(t('col_path'))).toBeTruthy()
+    expect(screen.getByText(t('col_size'))).toBeTruthy()
+    expect(screen.getByText(t('col_mtime'))).toBeTruthy()
+  })
+
+  it('grid（缩略图）视图不渲染列头', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reply(oneGroup)))
+    render(<Timeline onPick={() => {}} view="grid" />)
+    expect(await screen.findByText('a.txt')).toBeTruthy()
+    expect(screen.queryByText(t('col_name_only'))).toBeNull()
   })
 })
