@@ -74,7 +74,7 @@ from pathlib import Path
 
 
 
-APP_VERSION = 'v0.9.52'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.53'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 
 BUILD_DATE = '2026-11-07'
 
@@ -6880,6 +6880,24 @@ def peek_body(con, path, q='', span=360):
 
 
 
+def _body_slots(n_name, first_app, limit=9):
+
+    """正文命中该占几格。抽成纯函数，好单测（真实库跑不出来这些边界）。
+
+    0 格只有一个理由：第一名是程序。搜「微信」想打开的是微信本体，
+    不是提到微信的 20 篇文档 —— 这时候正文占位纯属添乱。
+
+    其余情况至少 3 格。名字满屏时挤掉 3 条名字，因为「名字满屏」恰恰是
+    最常见的情况，正文要是只在名字不够时才出现，等于这个功能从没生效。
+    名字本来就少时多补几行，最多补满一屏（名字 0 条时就是 9 条正文）。"""
+
+    if first_app:
+
+        return 0
+
+    return min(limit, max(3, limit - n_name))
+
+
 def _body_hits(con, q, limit=3):
 
     """正文命中，排在名字命中之后垫底。片段里 char(1)/char(2) 是高亮标记，
@@ -7390,7 +7408,7 @@ def merge_same_target(items, limit=None):
 
 
 
-def mini_search(con, q, limit=9, deep=False, body=False):
+def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
     """返回 {'items': [...], 'deep': bool, 'ms': int}。
 
@@ -7400,7 +7418,9 @@ def mini_search(con, q, limit=9, deep=False, body=False):
 
     deep=True ：再加「名字任意位置包含」（全表扫）和拼音模糊 —— 用户停手后才发；
 
-    body=True ：最后补几条正文命中（带片段），排在名字命中后面。"""
+    body=True ：正文命中给固定配额，排在名字命中后面（见下方 body 分支的说明）；
+
+    content_only=True：只搜正文（用户敲了 c: / content: 前缀），名字一个都不要。"""
 
     q = (q or '').strip().lower()
 
@@ -7416,7 +7436,7 @@ def mini_search(con, q, limit=9, deep=False, body=False):
 
         return {'items': [], 'deep': deep, 'ms': 0, 'n': 0}
 
-    ck = (q, bool(body))
+    ck = (q, bool(body), bool(content_only))
 
     if deep:
 
@@ -7431,6 +7451,28 @@ def mini_search(con, q, limit=9, deep=False, body=False):
                     'n': len(got[1]), 'cache': True}
 
     t0 = time.perf_counter()
+
+    # 只搜正文：用户敲了 c:xxx / content:xxx。名字、目录、拼音全跳过 ——
+    # 主窗口早就支持这个语法，快搜窗一直没有，等于同一个软件两套行为。
+    if content_only:
+
+        hits = []
+
+        for it in _body_hits(con, q, limit):
+
+            hits.append(it)
+
+        ms = int((time.perf_counter() - t0) * 1000)
+
+        if hits:
+
+            with MINI_LOCK:
+
+                MINI_CACHE[ck] = (time.time(), [dict(x) for x in hits])
+
+        return {'items': hits, 'deep': deep, 'ms': ms,
+
+                'n': len(hits), 'content': True}
 
     items, seen, _rk = [], set(), {}
 
@@ -7968,13 +8010,41 @@ def mini_search(con, q, limit=9, deep=False, body=False):
 
     if body:
 
-        room = max(0, min(3, limit - len(out)))
+        # 正文配额不该由「名字够不够一屏」决定。
 
-        if room:
+        # 老逻辑是 room = limit - len(out)：名字命中满 9 条时 room=0，于是搜「报告」
 
-            for it in _body_hits(con, q, room):
+        # 这种常见词，正文命中**永远不会出现**——用户以为快搜窗根本不能搜正文
 
-                if os.path.normcase(it['p']) in seen:
+        # （2026-11-07 反馈）。而名字满一屏恰恰是最常见的情况，等于这个功能从没生效。
+
+        # 现在给正文固定配额：名字让出 3 格；名字本来就少时会补更多。
+
+        # 唯一例外是「用户在启动程序」：搜「微信」时第一名就是 微信.lnk（app + 前缀命中），
+        # 想打开的是微信本体，不是提到微信的 20 篇文档。
+        # 但只看 app 标记不够 —— 搜「会议」第一名是「腾讯会议.lnk」（app=1，中间命中 r=2），
+        # 这时候用户要的多半是会议纪要，正文必须出来。所以要 app 且 r<=1（前缀/词边界）。
+        _top = out[0] if out else None
+
+        _tr = _top.get('r') if _top else None
+
+        first_app = bool(_top and _top.get('app')
+
+                         and isinstance(_tr, (int, float)) and _tr <= 1)
+
+        slack = _body_slots(len(out), first_app, limit)
+
+        if slack:
+
+            bhits = []
+
+            for it in _body_hits(con, q, slack + 3):
+
+                _np = os.path.normcase(it['p'])
+
+                if _np in seen:
+
+                    # 同一个文件既名字命中又正文命中：名字那条排得更靠前，够了
 
                     continue
 
@@ -7984,9 +8054,21 @@ def mini_search(con, q, limit=9, deep=False, body=False):
 
                     continue
 
-                seen.add(os.path.normcase(it['p']))
+                seen.add(_np)
 
-                out.append(it)
+                bhits.append(it)
+
+                if len(bhits) >= slack:
+
+                    break
+
+            if bhits:
+
+                # 按实际拿到的条数挤名字，而不是按 slack 挤：正文只有 2 条时
+
+                # 名字该补回到 7 条，否则底部会空出两格，用户以为结果没加载完。
+
+                out = out[:max(0, limit - len(bhits))] + bhits
 
     # 只缓存「有结果」的查询：首启建库时表还很小，这时把空结果缓存下来，
 
@@ -8080,7 +8162,7 @@ def parse_qsyn(q):
 
             continue
 
-        if low == 'content:':
+        if low == 'content:' or low == '内容:':
 
             syn['content'] = True
 
@@ -8093,6 +8175,28 @@ def parse_qsyn(q):
             syn['content'] = True
 
             rest.append(tok[8:])
+
+            continue
+
+        # 快搜窗里少打几个字很值钱：c:微信 / 内容:微信 也当正文开关。
+
+        # 但必须放过「c:\users\...」这种盘符路径 —— 那是搜文件，不是搜正文。
+
+        if low.startswith('内容:') and len(tok) > 3:
+
+            syn['content'] = True
+
+            rest.append(tok[3:])
+
+            continue
+
+        if (low.startswith('c:') and len(tok) > 2
+
+                and tok[2] not in '\\/' and not tok.startswith('c:\\')):
+
+            syn['content'] = True
+
+            rest.append(tok[2:])
 
             continue
 
@@ -13025,6 +13129,10 @@ MINI_L = {
 
            'sep': '以下 {n} 条命中在文档正文里', 'empty': '输入文件名或正文关键词，边打边出结果',
 
+           'busy': '正在搜正文…', 'c_hint': 'c: 只搜正文',
+
+           'none': '没有找到 “{q}” 的文件名或正文',
+
            'empty_hint': '双击 Ctrl 唤出 · Esc 关闭', 'more': '展示更多 “{q}” 的搜索结果',
 
            'about_name': '第二大脑 · 本地搜索', 'about_ok': '知道了',
@@ -13036,6 +13144,10 @@ MINI_L = {
            'recent': 'Recently opened', 'recent_hint': 'Enter to open', 'fr': 'Ctrl+Enter detailed search',
 
            'sep': '{n} more matches inside document text', 'empty': 'Type a file name or a word from a document',
+
+           'busy': 'Searching inside documents…', 'c_hint': 'c: text only',
+
+           'none': 'Nothing found for “{q}” in names or text',
 
            'empty_hint': 'Double Ctrl to summon · Esc to close', 'more': 'Show more results for “{q}”',
 
@@ -13049,6 +13161,10 @@ MINI_L = {
 
            'sep': '{n} coincidencias más dentro del texto', 'empty': 'Escribe un nombre de archivo o una palabra del texto',
 
+           'busy': 'Buscando dentro de los documentos…', 'c_hint': 'c: solo texto',
+
+           'none': 'No se encontró “{q}” en nombres ni texto',
+
            'empty_hint': 'Doble Ctrl para abrir · Esc para cerrar', 'more': 'Ver más resultados de “{q}”',
 
            'about_name': 'Second Brain · búsqueda local', 'about_ok': 'Entendido',
@@ -13061,6 +13177,10 @@ MINI_L = {
 
            'sep': 'mais {n} resultados no texto do documento', 'empty': 'Digite um nome de arquivo ou uma palavra do texto',
 
+           'busy': 'Buscando dentro dos documentos…', 'c_hint': 'c: só texto',
+
+           'none': 'Nada encontrado para “{q}” em nomes ou texto',
+
            'empty_hint': 'Ctrl duas vezes para abrir · Esc para fechar', 'more': 'Ver mais resultados de “{q}”',
 
            'about_name': 'Second Brain · busca local', 'about_ok': 'Entendi',
@@ -13072,6 +13192,10 @@ MINI_L = {
            'recent': 'हाल में खोले गए', 'recent_hint': 'खोलने के लिए Enter', 'fr': 'Ctrl+Enter विस्तृत खोज',
 
            'sep': 'दस्तावेज़ टेक्स्ट में {n} और मिलान', 'empty': 'फ़ाइल नाम या दस्तावेज़ का शब्द लिखें',
+
+           'busy': 'दस्तावेज़ों में खोजा जा रहा है…', 'c_hint': 'c: केवल टेक्स्ट',
+
+           'none': '“{q}” नाम या टेक्स्ट में नहीं मिला',
 
            'empty_hint': 'Ctrl दो बार खोलें · Esc बंद करें', 'more': '“{q}” के और परिणाम देखें',
 
@@ -13184,6 +13308,10 @@ html,body{height:100%;background:#fff;overflow:hidden;
   gap:10px;flex:0 0 auto}
 
 .foot.hide{display:none}
+
+/* 「c: 只搜正文」的顺带提示：比正文更淡，不抢「展示更多」的主次 */
+
+.chint{font-size:11.5px;color:#bcc3d0;white-space:nowrap}
 
 .foot.clickable{cursor:pointer}
 
@@ -13610,13 +13738,17 @@ function render(items,q,keep){
 
   for(var i=0;i<rows.length;i++){
 
-    /* 正文命中排在最后（后端 r=6 / 前端 sort 也是这个意思）。
+    /* 正文命中排在最后（后端配额固定 3 格）。
 
        在交界处放一行小字，而不是一条粗线——用户要的是「知道下面这批为什么在」，
 
-       不是再画一道分割。 */
+       不是再画一道分割。
 
-    if(!sepDone && rows[i].b && i>0){
+       整屏都是正文时（用户敲了 c:xxx）不画：从头到尾都在正文里，这条线没有意义，
+
+       而且它的文案「以下 N 条」会漏掉第一条，看着像少了一条。 */
+
+    if(!sepDone && rows[i].b && i>0 && !rows[0].b){
 
       var rest=0; for(var j=i;j<rows.length;j++) if(rows[j].b) rest++;
 
@@ -13650,7 +13782,9 @@ function render(items,q,keep){
 
        必然抛 ReferenceError，又被外层 .catch 吞掉 —— 表现是「搜不到就一片白」。 */
 
-    LIST.innerHTML='<div class="empty">'+esc(MT('empty')+' — '+q)+'<i>'+esc(MT('fr'))+'</i></div>';
+    LIST.innerHTML='<div class="empty">'+esc(MT('none', {q: q}))
+
+      +'<i>'+esc(MT('fr'))+'</i></div>';
 
     bind(); resize(); return;
 
@@ -13666,7 +13800,20 @@ function render(items,q,keep){
 
   if(rows.length){
 
-    FT.innerHTML='<span class=mic></span><span>'+esc(MT('more', {q: q}))+'</span>';
+    /* 一条正文都没出、而第一名又是程序时，用户多半会怀疑「正文是不是没搜」。
+
+       这不是错觉：搜「微信」正文确实一条都不占位（他要的是打开微信本体）。
+
+       顺手把 c: 语法写在这儿——不占额外空间，也不用去翻文档。 */
+
+    var nb=0;
+
+    for(var j2=0;j2<rows.length;j2++) if(rows[j2].b) nb++;
+
+    var hint=(!nb && rows[0] && rows[0].app) ? '  ·  '+MT('c_hint') : '';
+
+    FT.innerHTML='<span class=mic></span><span>'+esc(MT('more', {q: q}))+'</span>'
+      +(hint?'<span class="chint">'+esc(hint)+'</span>':'');
 
     FR.textContent=MT('fr');
 
@@ -13847,9 +13994,21 @@ function doPrefix(v){
 
       if(my!==seq)return;
 
-      render(d.items||[],v);
+      render(d.items||[], d.q||v);
 
-      if((d.items||[]).length<9 && v.length>=2){
+      /* 停手 300ms 后再补一趟。名字不满一屏时连名字一起全表扫（deep=1），
+
+         满一屏时只补正文（deep=0）—— deep 会重排名字，结果在用户眼皮底下
+
+         换一批，比「少了 3 条正文」难受得多。
+
+         以前这里带 length<9 的前提，于是名字满一屏时连请求都不发：
+
+         搜「报告」这类常见词，正文命中**永远不会出现**。 */
+
+      var n=(d.items||[]).length;
+
+      if(v.length>=2){
 
         clearTimeout(deeptimer);
 
@@ -13857,7 +14016,7 @@ function doPrefix(v){
 
           if(my!==seq)return;
 
-          doDeep(v);
+          doDeep(v, n<9);
 
         },300);
 
@@ -13867,25 +14026,65 @@ function doPrefix(v){
 
 }
 
-function doDeep(v){
+/* 已经等了一会儿还没结果：告诉用户「在搜正文」，别让他以为搜不到。
+
+   正文检索要走 docs 的 FTS5 索引，短词还会降级成全表扫（0.3~1.5s），
+
+   这段时间界面什么都不变的话，用户按 Esc 就走了。 */
+
+function busy(q){
+
+  if(rows.length)return;              /* 已经有名字结果就别动它，否则会闪一下 */
+
+  LIST.className='';
+
+  LIST.innerHTML='<div class="empty">'+esc(MT('busy'))+'<i>'+esc(q)+'</i></div>';
+
+  EMPTY.classList.add('hide');
+
+  FOOT.classList.add('hide');
+
+  resize();
+
+}
+
+function doDeep(v,needDeep){
 
   var my=++seq;
 
-  /* body=1：连同正文一起查。名字命中已经排满一屏时这一步本来就不会发，
+  busy(v);
 
-     发出来的时候说明名字不够，正好拿正文命中补满最后几行。 */
+  var u='/api/mini?q='+encodeURIComponent(v)+'&body=1'+(needDeep?'&deep=1':'');
 
-  fetch('/api/mini?q='+encodeURIComponent(v)+'&deep=1&body=1').then(function(r){return r.json()})
+  fetch(u).then(function(r){return r.json()})
 
     .then(function(d){
 
       if(my!==seq)return;
 
-      if(!(d.items||[]).length)return;
+      if(!(d.items||[]).length){
 
-      render(d.items,v,true);
+        /* 深搜也没东西：把名字结果留下来（可能刚才 busy() 清掉了空态），
 
-    }).catch(function(){});
+           但这次请求为空说明确实没有，走 render 的空态分支。 */
+
+        if(!rows.length) render([], d.q||v);
+
+        return;
+
+      }
+
+      render(d.items, d.q||v, true);
+
+    }).catch(function(){
+
+      /* 正文检索超时/断连时别把「正在搜正文…」留在屏幕上：
+
+         那个状态没有超时机制，会一直挂着，比没结果更让人困惑。 */
+
+      if(!rows.length) render([], v);
+
+    });
 
 }
 
@@ -13952,6 +14151,16 @@ document.getElementById('btnSearch').onclick=function(){
 
 window.addEventListener('pywebviewready',function(){ API=window.pywebview.api; });
 
+/* ?q=xxx 预填：截图、调试、演示都要用，正常打开没有这个参数。
+
+   放在脚本顶层读一次，DOMContentLoaded 和 __onShow 都用它 —— __onShow 里
+
+   本来会把输入框清空（重新唤出该是干净的），带 q 的参数说明调用方想预填。 */
+
+var PRESET_Q='';
+
+try{ PRESET_Q=(new URLSearchParams(location.search)).get('q')||''; }catch(e){}
+
 document.addEventListener('DOMContentLoaded',function(){
 
   if(window.pywebview&&window.pywebview.api)API=window.pywebview.api;
@@ -13961,6 +14170,8 @@ document.addEventListener('DOMContentLoaded',function(){
   Q.focus();
 
   fetchRecent();
+
+  if(PRESET_Q){ Q.value=PRESET_Q; schedule(); }
 
 });
 
@@ -14014,9 +14225,11 @@ window.__onShow=function(){
 
   }catch(e){}
 
-  Q.value=''; cur=-1; seq++;
+  Q.value=PRESET_Q; cur=-1; seq++;
 
   renderRecent(RECENT);        /* 先用上次那一屏，秒出；下面再后台刷新 */
+
+  if(PRESET_Q){ setTimeout(function(){ schedule(); },0); }
 
   /* 窗口刚 Show 出来那一下，宿主还没把 mini_visible 置真，这时的 resize 会被拒。
 
@@ -18265,11 +18478,21 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 want_body = qs.get('body', ['0'])[0] in ('1', 'true')
 
+                # c:xxx / content:xxx / 内容:xxx —— 只要正文，名字一条都不占。
+
+                # 主窗口早就认这个语法，快搜窗以前把它当普通词剥掉就当没发生。
+
+                c_only = bool(syn_m['content'])
+
+                if c_only:
+
+                    want_body = True
+
                 try:
 
                     with con_lock:
 
-                        d = mini_search(conn(), q, 9, deep, want_body)
+                        d = mini_search(conn(), q, 9, deep, want_body, c_only)
 
                 except sqlite3.Error as e:
 
@@ -18288,6 +18511,11 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                                   if syn_ok(x.get('p'), _sz_of(x), x.get('m'), syn_m)]
 
                     allow_open([x['p'] for x in d['items']])
+
+                # 回传剥掉语法之后的词：前端页脚/空态显示「展示更多 “c:会议”」
+                # 像在提示用户再敲一遍 c:，而剥过的 q 才是他真正在找的东西。
+
+                d['q'] = q
 
                 body = json.dumps(d, ensure_ascii=False).encode()
 

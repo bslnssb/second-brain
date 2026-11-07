@@ -96,6 +96,27 @@ describe('parseQSyn', () => {
     expect(parseQSyn('content: 合同').content).toBe(true)
   })
 
+  it('c: / 内容: 也是正文开关（快搜窗里少打几个字）', () => {
+    const a = parseQSyn('c:会议')
+    expect(a.content).toBe(true)
+    expect(a.q).toBe('会议')
+
+    const b = parseQSyn('内容:预算')
+    expect(b.content).toBe(true)
+    expect(b.q).toBe('预算')
+
+    // 连写形式也要能拆
+    const c = parseQSyn('content:报告')
+    expect(c.content).toBe(true)
+    expect(c.q).toBe('报告')
+  })
+
+  it('c:\\ 盘符路径不能被当成正文开关', () => {
+    expect(parseQSyn('c:\\users').content).toBe(false)
+    expect(parseQSyn('c:/users').content).toBe(false)
+    expect(parseQSyn('c:').content).toBe(false)
+  })
+
   it('多个语法叠加后剩下的才是关键词', () => {
     const s = parseQSyn('ext:pdf size:>1m dm:30d -草稿 合同 2024/')
     expect(s.q).toBe('合同')

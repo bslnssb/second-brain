@@ -63,8 +63,25 @@ export function parseQSyn(raw: string): QSyn {
       syn.excl.push(low.slice(1))
       continue
     }
-    if (low === 'content:') {
+    if (low === 'content:' || low === '内容:') {
       syn.content = true
+      continue
+    }
+    // 连写形式也认（content:微信 / 内容:微信 / c:微信）。
+    // c: 必须放过 c:\users\... 这种盘符路径 —— 那是找文件，不是找正文。
+    if (low.startsWith('content:') && tok.length > 8) {
+      syn.content = true
+      rest.push(tok.slice(8))
+      continue
+    }
+    if (tok.startsWith('内容:') && tok.length > 3) {
+      syn.content = true
+      rest.push(tok.slice(3))
+      continue
+    }
+    if (low.startsWith('c:') && tok.length > 2 && !/[\\/]/.test(tok[2])) {
+      syn.content = true
+      rest.push(tok.slice(2))
       continue
     }
     if (low.startsWith('ext:') || low.startsWith('type:')) {

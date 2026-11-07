@@ -126,5 +126,71 @@ class TestEndToEndParsing(unittest.TestCase):
         self.assertEqual(s['folder'], 'folder')
 
 
+class TestContentOnlySyntax(unittest.TestCase):
+    """c: / 内容: / content: 三写法等价 —— 快搜窗里少打几个字很值钱。
+
+    但 c:\\ 和 c:/ 是盘符路径，绝不能被当成「只搜正文」。
+    """
+
+    def test_content_colon(self):
+        s = brain.parse_qsyn('content:报告')
+        self.assertTrue(s['content'])
+        self.assertEqual(s['q'], '报告')
+
+    def test_content_space(self):
+        s = brain.parse_qsyn('content: 报告')
+        self.assertTrue(s['content'])
+        self.assertEqual(s['q'], '报告')
+
+    def test_c_short(self):
+        s = brain.parse_qsyn('c:会议纪要')
+        self.assertTrue(s['content'])
+        self.assertEqual(s['q'], '会议纪要')
+
+    def test_chinese_prefix(self):
+        s = brain.parse_qsyn('内容:预算')
+        self.assertTrue(s['content'])
+        self.assertEqual(s['q'], '预算')
+
+    def test_drive_path_not_eaten(self):
+        # 盘符路径绝不能被当成正文开关。c:\ 单独输入时会被 folder/ 规则收走
+        # （用户想限定 C 盘），那也是对的，所以这里只断言 content 没被打开。
+        for raw in ('c:\\users', 'c:/users', 'c:\\'):
+            s = brain.parse_qsyn(raw)
+            self.assertFalse(s['content'], raw)
+        self.assertIn('c:', brain.parse_qsyn('c:\\users')['q'].lower())
+
+    def test_bare_c_not_eaten(self):
+        s = brain.parse_qsyn('c:')
+        self.assertFalse(s['content'])
+
+
+class TestBodySlots(unittest.TestCase):
+    """正文命中该占几格 —— 快搜窗只有 9 格，这个分配决定了正文能不能被看见。
+
+    背景：老实现是 room = limit - len(out)，名字满 9 条时 room=0，
+    于是搜「报告」这种常见词正文命中永远不会出现（2026-11-07 用户反馈）。
+    """
+
+    def test_full_name_list_still_offers_three(self):
+        # 名字满屏也必须让出 3 格 —— 这是这条修复的核心
+        self.assertEqual(brain._body_slots(9, False), 3)
+
+    def test_six_names(self):
+        self.assertEqual(brain._body_slots(6, False), 3)
+
+    def test_few_names_fill_the_screen(self):
+        self.assertEqual(brain._body_slots(1, False), 8)
+        self.assertEqual(brain._body_slots(0, False), 9)
+
+    def test_app_launch_takes_no_body_slot(self):
+        # 搜「微信」想打开的是微信本体，不是提过微信的 20 篇文档
+        self.assertEqual(brain._body_slots(9, True), 0)
+
+    def test_never_exceeds_limit(self):
+        for n in range(0, 10):
+            self.assertLessEqual(brain._body_slots(n, False), 9)
+
+
 if __name__ == '__main__':
     unittest.main()
