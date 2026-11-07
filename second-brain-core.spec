@@ -20,7 +20,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = []
+hiddenimports = ['env_check']       # /api/env 与 --diagnose 都是函数内 import
 
 for pkg in ('webview',               # 桌面窗口
             'pythonnet',             # pywebview 的 Windows 后端

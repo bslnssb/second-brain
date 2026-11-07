@@ -121,6 +121,10 @@ def run_scan(targets=None):
             errs[0] += 1
 
         for cur, dirs, files in os.walk(target, onerror=_onerr):
+            # 剪掉 junction / 符号链接：os.walk(followlinks=False) 用 os.path.islink 判断，
+            # 而 Windows 上 junction 的 islink 是 False，指向上层的 junction 会成环，
+            # 让正文扫描永远跑不完。判据见 brain._is_reparse_dir。
+            dirs[:] = [d for d in dirs if not brain._is_reparse_dir(os.path.join(cur, d))]
             dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS and not d.startswith('.')]
             if is_novel_dir(cur):
                 dirs[:] = []

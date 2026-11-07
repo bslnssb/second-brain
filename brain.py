@@ -74,7 +74,7 @@ from pathlib import Path
 
 
 
-APP_VERSION = 'v0.9.50'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.51'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 
 BUILD_DATE = '2026-11-07'
 
@@ -1286,6 +1286,8 @@ def discover_scan(targets=None, home=None):
 
             for cur, dirs, files in os.walk(root):
 
+                dirs[:] = [d for d in dirs if not _is_reparse_dir(os.path.join(cur, d))]
+
                 dirs[:] = [d for d in dirs if d.lower() not in scan_docs.SKIP_DIRS
 
                            and not d.startswith('.')]
@@ -1852,6 +1854,25 @@ NAMES_EXTS = scan_docs.ALL_FILES
 
 NAMES_SIZE_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
 
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_reparse_dir(path):
+    """这个目录是 junction / 符号链接 / 挂载点吗。
+
+    为什么必须单独判：`os.walk(followlinks=False)` 是拿 `os.path.islink` 来判断的，
+    而 Windows 上 **junction 的 islink 返回 False** —— 于是 os.walk 会跟着 junction 走。
+    指向上级目录的 junction 就形成环（`C:\\Users\\<user>\\AppData\\Local\\Application Data`
+    就是指向自己的那种），扫描会一直往下走到路径超长为止：用户看到的是
+    「索引进度卡住不动、风扇一直转」。
+    多一次 lstat 的代价很小（NTFS 元数据在缓存里），换来的是扫描一定能结束。
+    """
+    try:
+        st = os.lstat(path)
+        return bool(getattr(st, 'st_file_attributes', 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+    except Exception:
+        return False
+
 # 「能抽出正文」的类型，与 _extract_text_impl 的支持集一一对应；正文近实时（_body_worker）
 
 # 只收这些类型，别把视频/图片也丢去解析。ALL_FILES 是全类型（文件名层用），两者故意不同。
@@ -2103,6 +2124,12 @@ def build_files_index(targets=None):
             _prog(done=i, msg=f'扫描文件名 {root}', k='m_names_target', a={'p': root})
 
             for cur, dirs, files in os.walk(root):
+
+                # 剪掉 junction / 符号链接目录。os.walk(followlinks=False) 挡不住 junction：
+                # Windows 上 os.path.islink 对 junction 返回 False，而 os.walk 正是用它判断的。
+                # 指向上层的 junction（典型：C:\Users\x\AppData\Local\Application Data 指向自己）
+                # 会让扫描无限往下走，用户看到的是「索引永远做不完、风扇狂转」。
+                dirs[:] = [d for d in dirs if not _is_reparse_dir(os.path.join(cur, d))]
 
                 dirs[:] = [d for d in dirs if d.lower() not in NAMES_SKIP_DIRS
 
@@ -4923,6 +4950,9 @@ def _count_files(con):
 
 
 _REPORT = {'mt': None, 't': 0.0, 'body': None}
+
+# /api/env 的结果缓存（环境自检要查注册表、枚举显示器、quick_check 数据库，跑一次不便宜）
+_ENV_CACHE = {}
 
 
 
@@ -10506,6 +10536,8 @@ def _quick_names(dirs, budget=None, max_files=None):
 
                        if not d.startswith('.') and not d.startswith('$')
 
+                       and not _is_reparse_dir(os.path.join(cur, d))
+
                        and not _noise_dir(os.path.join(cur, d))]
 
             rows = []
@@ -11262,7 +11294,9 @@ def _dir_index(root):
 
         for cur, dirs, _files in os.walk(root):
 
-            dirs[:] = [d for d in dirs if d.lower() not in REPAIR_SKIP_DIRS]
+            dirs[:] = [d for d in dirs if d.lower() not in REPAIR_SKIP_DIRS
+
+                       and not _is_reparse_dir(os.path.join(cur, d))]
 
             for d in dirs:
 
@@ -12688,9 +12722,52 @@ def conn():
 
             if _con is None:
 
-                _con = init_db()
+                _con = _open_db_guarded()
 
     return _con
+
+
+def _open_db_guarded():
+    """打开数据库；文件损坏就备份坏库、起一个空库，让程序还能用。
+
+    断电、蓝屏、磁盘写错误都会留下 `database disk image is malformed`。
+    以前这条异常会从 conn() 一路冒到 HTTP 层：每个接口都 500，界面一直转圈，
+    用户唯一的出路是找到并删掉 brain.db —— 而普通用户根本不知道有这个文件。
+    现在变成「坏库改名留档 → 起空库 → 用户重新扫一遍」：索引是可再生的，
+    用户的文件一个都没动，程序也不至于打不开。
+
+    **必须先探测、再动文件**：如果直接 init_db() 抛异常，异常的 traceback 会
+    一直引用那条 sqlite 连接（局部变量 con 没被回收），Windows 上这时
+    `os.replace` 会报 WinError 32「另一个程序正在使用此文件」——
+    2026-11-07 实测踩到。所以用一条「只读 schema 头」的探针连接，
+    它在 finally 里立刻 close，之后才轮得到改名。
+    """
+    try:
+        probe = sqlite3.connect(DB, check_same_thread=False)
+        try:
+            # 只读文件头：损坏的库在这一步就会抛 DatabaseError，比 quick_check 便宜得多
+            probe.execute('PRAGMA schema_version').fetchone()
+        finally:
+            probe.close()
+    except sqlite3.DatabaseError as e:
+        msg = str(e).lower()
+        if not any(k in msg for k in ('malformed', 'not a database', 'corrupt')):
+            raise
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        bad = DB.with_name(DB.name + '.bad-' + stamp)
+        try:
+            if DB.exists():
+                DB.replace(bad)
+            for suf in ('-wal', '-shm'):
+                p = DB.with_name(DB.name + suf)
+                if p.exists():
+                    p.replace(bad.with_name(bad.name + suf))
+        except Exception as ex:
+            # 换不动（被占用/没权限）就别硬来，把原异常抛出去，至少日志里看得见
+            _log_file('数据库损坏且备份失败：%r / %r' % (e, ex))
+            raise
+        _log_file('数据库损坏（%s）→ 已留档 %s，重建空库，请重新建索引' % (e, bad))
+    return init_db()
 
 
 
@@ -17360,7 +17437,21 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         p = v.split(' ')[0]
 
-                    alive = bool(p) and os.path.isfile(p)
+                    # 文件还在但指向**别的目录**（用户挪过文件夹、或机器上同时装了两份）
+                    # 也算失效：开机起来的是旧那份，用户在新窗口里改的设置、建的索引全对不上。
+                    # 只有「路径就是当前这个 exe」才认作真的开着。
+
+                    try:
+
+                        same = bool(p) and (os.path.normcase(os.path.abspath(p))
+
+                                            == os.path.normcase(os.path.abspath(sys.executable)))
+
+                    except Exception:
+
+                        same = True
+
+                    alive = bool(p) and os.path.isfile(p) and same
 
                     return alive, cmd, val
 
@@ -17528,7 +17619,38 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
 
 
+    def _same_origin_ok(sfs, referer):
 
+        """浏览器自己发的同源请求才放行（抽成纯函数，方便单测）。
+
+        现代浏览器会给 `Sec-Fetch-Site: same-origin`，判等即可；
+        但那是 Chrome 76+ 才有的头 —— **固定版本部署的旧 WebView2、降级到
+        IE/旧 Edge 的用户根本不会发**，严格判等会让所有接口 403，
+        用户看到的是「界面能打开但一片空白、一直转圈」（2026-11-07 补）。
+
+        只对「没有这个头」放宽到看 Referer：攻击页面发起的跨站请求一定带
+        `cross-site`（照样拦），<img>/<a ping> 带的是攻击者域名的 Referer（也拦），
+        而且它们读不到响应内容，所以放宽不降低安全性。"""
+
+        sfs = (sfs or '').strip().lower()
+
+        if sfs:
+
+            return sfs == 'same-origin'
+
+        ref = (referer or '').strip()
+
+        if not ref:
+
+            return False
+
+        try:
+
+            return (urlsplit(ref).hostname or '').lower() in _LOOPBACK
+
+        except ValueError:
+
+            return False
 
 
 
@@ -17572,15 +17694,8 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
         def _same_origin(self):
 
-            """浏览器自己发的同源请求才放行。
-
-
-
-            反过来（黑名单）不行：curl / <img> / <a ping> 这类请求根本不带
-
-            Sec-Fetch-Site，按「不在黑名单里就放行」等于对它们敞开。"""
-
-            return (self.headers.get('Sec-Fetch-Site') or '').lower() == 'same-origin'
+            return _same_origin_ok(self.headers.get('Sec-Fetch-Site'),
+                                   self.headers.get('Referer'))
 
         def do_GET(self):
 
@@ -17705,6 +17820,56 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                                    'issues': OFFICIAL_ISSUES},
 
                                   ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/env'):
+
+                # 环境自检：用户报「打不开 / 窗口不对」时，让他点一下这里，把结论发过来，
+                # 等于把现场搬到开发机上。只读探测，不做任何修复动作。
+                # 结果缓存 90 秒：quick_check 一个 1GB 的库要一两秒，面板刷新不该重复付这笔钱。
+
+                global _ENV_CACHE
+
+                _now = time.time()
+
+                _force = 'force=1' in self.path
+
+                if (not _force and _ENV_CACHE.get('t')
+
+                        and _now - _ENV_CACHE['t'] < 90):
+
+                    body = _ENV_CACHE['body']
+
+                else:
+
+                    try:
+
+                        import env_check
+
+                        _inf = env_check.probe_all(data_dir=str(app_dir()), db_path=str(DB))
+
+                        _iss = env_check.judge(_inf)
+
+                        body = json.dumps({'ok': True, 'info': _inf, 'issues': _iss,
+
+                                           'plan': env_check.plan(_inf),
+
+                                           'text': env_check.render(_inf, _iss)},
+
+                                          ensure_ascii=False).encode()
+
+                    except Exception as _e:
+
+                        import traceback
+
+                        body = json.dumps({'ok': False, 'msg': repr(_e),
+
+                                           'tb': traceback.format_exc()},
+
+                                          ensure_ascii=False).encode()
+
+                    _ENV_CACHE = {'t': _now, 'body': body}
 
                 ctype = 'application/json; charset=utf-8'
 

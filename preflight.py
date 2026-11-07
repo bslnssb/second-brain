@@ -373,8 +373,162 @@ def check_white_screen():
             or 'OpenEventW' not in s[k:k + 700] \
             or 'SetEvent' not in s[k:k + 700]:
         bad.append('二次启动没用命名事件通知第一个实例')
+    # 轮询式自愈（第 119 项）：只补一两拍不够——渲染层慢时固定拍数会刚好错开。
+    # 这两个函数曾被文档写成"已做"、代码里却根本没有（show_main 里那行
+    # `_late_revive_loop(self)` 直接 NameError，线程静默死掉），所以必须钉死。
+    if 'def _late_revive_loop(' not in s:
+        bad.append('_late_revive_loop 丢失（轮询自愈从未生效）')
+    if 'def _render_children_visible(' not in s:
+        bad.append('_render_children_visible 丢失（白屏判定失效）')
+    i2 = s.find('def show_main(')
+    j2 = s.find('def hide_main(', i2 + 1)
+    if '_late_revive_loop(self)' not in s[i2:j2 if j2 > i2 else None]:
+        bad.append('show_main 没起轮询自愈线程')
+    # 2026-11-07 真根因：silent 启动时对"马上要 hide"的窗口调 resize()，
+    # WinForms 的 Bounds 赋值会把刚 hide 的窗口顶回来，而渲染层不跟 → 白屏。
+    # 同日第二轮改造（用户要求「别只修 150%，100% 的机器也得能跑」）：
+    # 尺寸校正统一走 set_client_size（SetWindowPos，不改可见性），不再按 dpr 分叉，
+    # 所以断言从「silent 别调」改成「谁都不许用 pywebview 的 resize 改尺寸」。
+    a = s.find('def after_start(')
+    b = s.find('def _start_activate_listener(', a + 1)
+    body = s[a:b] if a >= 0 and b > a else ''
+    if '_fit_main_size()' not in body:
+        bad.append('after_start 没做尺寸校验（各档 DPI 会走偏）')
+    if 'if not self.silent:' in body:
+        bad.append('after_start 仍按 silent 分叉尺寸逻辑（100% 机器测不到另一条路）')
+    fa = s.find('def _fit_main_size(')
+    fb = s.find('def place_mini(', fa + 1)
+    fbody = s[fa:fb] if fa >= 0 and fb > fa else ''
+    if fa < 0 or 'set_client_size' not in fbody:
+        bad.append('尺寸校正没用 set_client_size（应走 SetWindowPos，不动可见性）')
+    if 'self.main.resize(' in fbody:
+        bad.append('尺寸校正退回了 pywebview resize（会把隐藏窗口顶出来变白屏）')
+    if 'needs_fit(' not in fbody:
+        bad.append('尺寸校正缺少容差判定（100% 缩放下会被边框误差误触发）')
+    nf = s.find('def needs_fit(')
+    if nf < 0 or '24' not in s[nf:nf + 900] or '48' not in s[nf:nf + 900]:
+        bad.append('needs_fit 的边框量级容差被改掉了（100% 机器会开始动窗口）')
+    for fn in ('def set_client_size(', 'def calc_window_size(', 'def window_dpr('):
+        if fn not in s:
+            bad.append('%s 丢失（DPI 换算无法单测）' % fn.strip('def ('))
+    if 'def _silent_hide_guard(' not in s:
+        bad.append('静默启动缺少 hide 守卫')
     rec('PASS' if not bad else 'FAIL', '白屏自愈（第一个实例自己 show+revive）',
         '; '.join(bad))
+
+
+def check_env_robustness():
+    """跨环境健壮性（2026-11-07 第 131 项）：用户在别的机器上才会踩到的那几类坑。
+
+    开发机只有一块 4K@150% 的屏、目录结构干净、库也没坏过，所以这几条只能靠
+    静态断言 + 单测（tests/test_env_matrix.py / test_fs_safety.py / test_db_recovery.py）
+    守住，一旦有人「简化」掉就又回到「用户那边打不开」。
+    """
+    s = text(ROOT / 'app_window.py')
+    b = text(ROOT / 'brain.py')
+    sc = text(ROOT / 'scan_docs.py')
+    bad = []
+
+    # ① 小屏 + 高缩放：窗口最小尺寸不能超过屏幕可用空间，否则标题栏出屏、关不掉。
+    if 'def main_min_size(' not in s:
+        bad.append('main_min_size 丢失（小屏上窗口会拖不动）')
+    if 'min_size=main_min_size(' not in s:
+        bad.append('create_window 没用自己的 min_size（又写死 520 了）')
+    mf = s.find('def main_window_size(')
+    mw = s[mf:mf + 2000] if mf >= 0 else ''
+    if 'max(420' not in mw:
+        bad.append('main_window_size 的高度下限回到 520（1366×768@150% 会超屏）')
+
+    # ② 多显示器：快搜窗要跟着鼠标走，副屏在左/上时坐标是负数。
+    for fn in ('def cursor_monitor_rect(', 'def mini_origin_in(', 'def _place_mini_on('):
+        if fn not in s:
+            bad.append('%s 丢失（副屏上快搜窗会弹在主屏）' % fn.strip('def ('))
+    if 'if cur and prim and cur != prim:' not in s:
+        bad.append('place_mini 没判断「鼠标在不在主屏」')
+
+    # ③ 联接点：os.walk(followlinks=False) 挡不住 junction，会成环扫不完。
+    if 'def _is_reparse_dir(' not in b:
+        bad.append('_is_reparse_dir 丢失（junction 成环时索引永远跑不完）')
+    if b.count('_is_reparse_dir(') < 3:
+        bad.append('有 os.walk 没剪 junction（正文/首启/修复三条扫描路径要全覆盖）')
+    if '_is_reparse_dir(' not in sc:
+        bad.append('scan_docs 的正文扫描没剪 junction')
+
+    # ④ 数据库损坏（断电/蓝屏）：要留档重建，而不是让所有接口 500。
+    if 'def _open_db_guarded(' not in b or '_open_db_guarded()' not in b:
+        bad.append('conn() 没走损坏保护（断电后程序会彻底打不开）')
+    if "PRAGMA schema_version" not in b:
+        bad.append('损坏探测没用「先探测再动文件」（Windows 上会 WinError 32）')
+
+    # ⑤ 日志必须落在数据目录：从快捷方式/开机自启启动时 CWD 是 System32。
+    lg = s.find('def _log(msg)')
+    lb = s[lg:lg + 1200] if lg >= 0 else ''
+    if 'open(\'debug.log\'' in lb or 'open("debug.log"' in lb:
+        bad.append("_log 还在用相对路径 debug.log（开机自启时日志会丢）")
+
+    # ⑥ 环境快照：用户报「窗口不对」时，日志里要有分辨率和缩放。
+    if 'def env_snapshot(' not in s or '[env]' not in s:
+        bad.append('启动没有环境快照（现场数据缺失，只能靠猜）')
+
+    # ⑦ 同源校验的旧浏览器兜底：Sec-Fetch-Site 是 Chrome 76+ 才有的头，
+    #    固定版本 WebView2 / IE 不发，严格判等会让所有接口 403（界面全空）。
+    if 'def _same_origin_ok(' not in b:
+        bad.append('同源校验没有 Referer 兜底（旧 WebView2 上接口会全 403）')
+    if "Sec-Fetch-Site" not in b or 'Referer' not in b:
+        bad.append('同源校验缺少头处理')
+
+    rec('PASS' if not bad else 'FAIL', '跨环境健壮性（小屏/多屏/junction/坏库/日志）',
+        '; '.join(bad))
+
+
+def check_env_adapt():
+    """环境自适应（第 132 项）：探测能力、自动降级，以及「DPI 感知真的设上了」。
+
+    这一条专门给 2026-11-07 那个坑立的：SetProcessDpiAwarenessContext 的参数
+    传 c_int(-4) 会**静默失败**（返回 False，不抛异常），进程退化成 DPI-unaware，
+    整个窗口被窗口管理器当 96dpi 位图再拉伸一次 —— 界面发虚，而且 GetSystemMetrics
+    返回虚拟化后的逻辑值，所有尺寸计算跟着错。老的 try/except 一点用都没有，
+    因为没有异常。这种错只能靠静态断言参数写法来挡。
+    """
+    s = text(ROOT / 'app_window.py')
+    su = text(ROOT / 'setup_app.py')
+    bad = []
+
+    # ① 环境探测模块在，且关键函数都在
+    p = ROOT / 'env_check.py'
+    if not p.is_file():
+        bad.append('env_check.py 丢了（换环境只能靠猜）')
+    else:
+        e = text(p)
+        for fn in ('def probe_all(', 'def judge(', 'def plan(', 'def webview2_version('):
+            if fn not in e:
+                bad.append('env_check 缺 %s' % fn.strip('def ('))
+        if 'WEBVIEW2' not in e and 'EdgeWebView' not in e:
+            bad.append('env_check 没查 WebView2（最致命的缺件）')
+
+    # ② DPI 感知：参数必须用 64 位指针写法
+    if 'SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))' not in s:
+        bad.append('DPI 感知没用 c_void_p(-4)')
+    if 'SetProcessDpiAwarenessContext(ctypes.c_int(' in s:
+        bad.append('DPI 感知用了 c_int(-4)（返回 False，进程变 DPI-unaware）')
+
+    # ③ 快搜窗按屏幕宽收窄
+    if 'def calibrate_mini_width(' not in s:
+        bad.append('没有 calibrate_mini_width（1920@250% 快搜窗会被切）')
+
+    # ④ 渲染降级（远程桌面 / 无显卡驱动 → 黑块）
+    if 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS' not in s:
+        bad.append('远程桌面/基础显示适配器时不会自动关 GPU（黑块）')
+
+    # ⑤ 安装程序要查 WebView2
+    if 'def wv2_version(' not in su:
+        bad.append('安装程序没查 WebView2（LTSC/精简版装完就是白屏）')
+
+    # ⑥ 启动要留环境快照
+    if '[env-boot]' not in s:
+        bad.append('启动没写环境快照（用户报问题时无从下手）')
+
+    rec('PASS' if not bad else 'FAIL', '环境自适应（探测·降级·DPI 写法）', '; '.join(bad))
 
 
 def check_autostart_default():
@@ -413,6 +567,8 @@ def main():
     check_persistence()
     check_settings_concurrent()
     check_white_screen()
+    check_env_robustness()
+    check_env_adapt()
     check_autostart_default()
     check_tests()
     check_build_fresh()

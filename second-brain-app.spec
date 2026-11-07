@@ -47,7 +47,7 @@ if _webdist.is_dir():
 # 显式列出来省得 PyInstaller 漏掉；win32* 由 pywin32 自带的 hook 收集。
 # win32file 是 v0.9.47 实时索引用的（brain._watch_worker 里函数内 import），
 # 不列出来 PyInstaller 不会收 —— 源码跑得好好的，exe 一启动监听就静默失败。
-hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest',
+hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest', 'env_check',
                   'hotkey', 'tray', 'pypinyin', 'pythoncom', 'win32com.client',
                   'win32gui', 'win32api', 'win32con', 'win32process', 'win32file']
 

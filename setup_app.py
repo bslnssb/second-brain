@@ -17,11 +17,52 @@ from pathlib import Path
 APP_ZH = '第二大脑'
 APP_EN = 'Second Brain'
 DIR_NAME = 'SecondBrain'   # 安装目录固定英文名，不跟界面语言变
-VERSION = '0.9.50'
+VERSION = '0.9.51'
 
 SILENT = os.environ.get('SB_SILENT') == '1'
 NO_LAUNCH = os.environ.get('SB_NO_LAUNCH') == '1'
 FORCE_DIR = os.environ.get('SB_INSTALL_DIR')
+
+# WebView2 运行时：Win11 和打了补丁的 Win10 自带，但 LTSC 2019 / Server /
+# 各种精简版系统**没有**。缺它的话装完双击是白屏或闪退，用户根本不知道
+# 世界上有这么一个组件。所以安装程序自己查一次、缺了就直接把下载页给他。
+WV2_GUID = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+WV2_URL = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
+
+
+def wv2_version():
+    """返回 WebView2 Runtime 版本；没装返回 ''。注册表和目录都查一遍。"""
+    try:
+        import winreg
+        for hive, path in ((winreg.HKEY_LOCAL_MACHINE,
+                            r'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\\' + WV2_GUID),
+                           (winreg.HKEY_LOCAL_MACHINE,
+                            r'SOFTWARE\Microsoft\EdgeUpdate\Clients\\' + WV2_GUID),
+                           (winreg.HKEY_CURRENT_USER,
+                            r'Software\Microsoft\EdgeUpdate\Clients\\' + WV2_GUID)):
+            try:
+                with winreg.OpenKey(hive, path) as k:
+                    v = str(winreg.QueryValueEx(k, 'pv')[0] or '')
+                    if v and not v.startswith('0.0.0'):
+                        return v
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        import glob
+        for pat in ('%s\\Microsoft\\EdgeWebView\\Application\\*\\msedgewebview2.exe' % os.environ.get('ProgramFiles(x86)', ''),
+                    '%s\\Microsoft\\EdgeWebView\\Application\\*\\msedgewebview2.exe' % os.environ.get('ProgramFiles', ''),
+                    '%s\\Microsoft\\EdgeWebView\\Application\\*\\msedgewebview2.exe' % os.environ.get('LOCALAPPDATA', '')):
+            if pat.startswith('\\'):
+                continue
+            hits = glob.glob(pat)
+            if hits:
+                return os.path.basename(os.path.dirname(hits[0]))
+    except Exception:
+        pass
+    return ''
+
 
 INK = '#1a2233'
 SUB = '#6b7280'
@@ -586,6 +627,39 @@ def install_gui(payload, lang):
         st['sc'] = sc
         last['pct'] = 1.0
         rebar()
+        # 装完先看 WebView2。装得再成功，缺这个组件双击就是白屏 —— 用户只会认为
+        # 「装坏了 / 这软件是骗人的」，而完全不知道世界上有这么一个组件。
+        # 所以这里宁可打断一下，把下载页递到手上，也不自动启动去看那张白屏。
+        wv = wv2_version()
+        if not wv:
+            zh = st.get('lang') == 'zh'
+            status.configure(text='已安装，但还缺 WebView2 运行时' if zh
+                                 else 'Installed, but WebView2 Runtime is missing',
+                             fg='#b26a00')
+            hint.configure(text=(tr('sc_ok') if sc else tr('sc_no')) + '\n'
+                                + (tr('as_ok') if auto else tr('as_no')))
+            try:
+                go_btn.configure(
+                    text=('下载 WebView2' if zh else 'Get WebView2'), bg=ACC,
+                    command=lambda: os.startfile(WV2_URL))
+            except Exception:
+                pass
+            set_busy(False)
+            try:
+                from tkinter import messagebox
+                ask = messagebox.askyesno(
+                    '还需要 WebView2' if zh else 'WebView2 Runtime needed',
+                    ('第二大脑的界面靠 Windows 的 WebView2 组件渲染，这台电脑上没有。\n'
+                     '不装的话打开会是白屏。安装包约 2 MB，装一次以后都不用再装。\n\n'
+                     '现在打开官方下载页吗？') if zh else
+                    ('The interface is rendered by the WebView2 runtime, which is '
+                     'missing on this PC.\nWithout it the app opens to a blank window.\n\n'
+                     'Open the official download page now?'))
+                if ask:
+                    os.startfile(WV2_URL)
+            except Exception:
+                pass
+            return                      # 不自动启动：必然白屏，不如先让用户装组件
         status.configure(text=tr('done') % target, fg='#1a7f37')
         hint.configure(text=(tr('sc_ok') if sc else tr('sc_no')) + '\n'
                             + (tr('as_ok') if auto else tr('as_no')))

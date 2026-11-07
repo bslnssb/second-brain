@@ -17,16 +17,34 @@ import ctypes
 # 旧逻辑用 SetProcessDPIAware（System DPI Aware）——在多显示器 / 150% 缩放下，
 # WebView2 会用错误比例渲染，界面元素被整体放大、发虚（表现就是「窗口里一切都很大」）。
 # 改为 Per-Monitor v2：WebView2 在窗口所在显示器上按真实 DPI 渲染，内容清晰、大小正常。
+#
+# 【2026-11-07 实测的坑】**参数必须用 c_void_p(-4)，不能用 c_int(-4)**。
+# 这个 API 收的是 DPI_AWARENESS_CONTEXT —— 一个 64 位指针，-4 要写成 0xFFFF...FC。
+# 传 c_int 时只给了低 32 位、高 32 位没符号扩展，等于传了 0x00000000FFFFFFFC，
+# 调用**返回 False 静默失败**（不抛异常，所以原来那层 try/except 一点用都没有）。
+# 实测：c_int(-4) → False，GetSystemMetrics(0)=2560（虚拟化后的逻辑值）；
+#       c_void_p(-4) → True，GetSystemMetrics(0)=3840（真实物理值）。
+# 失败之后进程就是 DPI-unaware：整个窗口被系统当 96dpi 位图再拉伸一次，
+# 界面发虚；而且所有尺寸计算拿到的都是虚拟化数值，算出来的位置全偏。
+_DPI_MODE = 'none'
 try:
-    try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_int(-4))  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-    except Exception:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)                       # PROCESS_PER_MONITOR_DPI_AWARE
+    if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+        _DPI_MODE = 'per-monitor-v2'
 except Exception:
+    pass
+if _DPI_MODE == 'none':
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:            # PROCESS_PER_MONITOR_DPI_AWARE
+            _DPI_MODE = 'per-monitor-v1'
     except Exception:
         pass
+if _DPI_MODE == 'none':
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():                       # System DPI Aware（最后兜底）
+            _DPI_MODE = 'system'
+    except Exception:
+        pass
+
 
 import json
 import os
@@ -105,14 +123,31 @@ DEBUG = bool(os.environ.get('SB_DEBUG'))
 
 
 def _log(msg):
-    """窗口显隐的时序问题只能靠时间戳看。正常启动不开，排查时设 SB_DEBUG=1。"""
-    if DEBUG:
-        line = f'[{time.strftime("%H:%M:%S")}.{int(time.time() * 1000) % 1000:03d}] {msg}'
+    """窗口显隐的时序问题只能靠时间戳看。正常启动不开，排查时设 SB_DEBUG=1。
+
+    **必须写到 _log_path()，不能用相对路径 `debug.log`**：从快捷方式、开机自启、
+    计划任务启动时当前目录是 System32 或用户目录，相对路径要么写不进去（异常被吞），
+    要么写到用户根本找不到的地方 —— 排查时「开了 SB_DEBUG 却没有日志」就是它。
+    """
+    if not DEBUG:
+        return
+    now = time.time()
+    stamp = '%s.%03d' % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now)),
+                         int(now * 1000) % 1000)
+    try:
+        p = _log_path()
         try:
-            with open('debug.log', 'a', encoding='utf-8') as f:
-                f.write(line + '\n')
+            if p.exists() and p.stat().st_size > _LOG_MAX:
+                p.replace(p.with_suffix('.log.1'))
         except Exception:
-            print(line, flush=True)
+            pass
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write('[%s] %s%s' % (stamp, msg, chr(10)))
+    except Exception:
+        try:
+            print('[%s] %s' % (stamp, msg), flush=True)
+        except Exception:
+            pass
 
 
 _LOG_MAX = 512 * 1024
@@ -185,29 +220,60 @@ def _port_busy(port):
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 
-def _is_ours(port):
-    """端口上跑的是不是本应用（而不是恰好占了同一端口的别的程序）"""
+def _is_ours(port, data_dir=None):
+    """端口上跑的是不是**这个用户**的这一份应用。
+
+    以前只认 app 名就够了，因为一台机器只有一个用户在跑。多用户会话（快速用户
+    切换、远程桌面服务器上的多个会话）打破了这个前提：另一个用户的实例同样监听
+    8765、同样自称 second-brain，第二个用户一启动就把它当成「自己已经在跑」——
+    复用别人的服务，看到的是别人的索引和文件列表。所以有 data_dir 时再比一次。
+    """
     try:
         with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/ping', timeout=0.8) as r:
-            return json.loads(r.read().decode('utf-8')).get('app') == 'second-brain'
+            v = json.loads(r.read().decode('utf-8'))
+            if v.get('app') != 'second-brain':
+                return False
+            if data_dir:
+                try:
+                    a = os.path.normcase(os.path.abspath(str(v.get('dir') or '')))
+                    b = os.path.normcase(os.path.abspath(str(data_dir)))
+                except Exception:
+                    return True          # 比不了就当是自己的，别把正常单用户搞坏
+                if a != b:
+                    _log('port %d 属于另一个数据目录（%s），不复用' % (port, a))
+                    return False
+            return True
     except Exception:
         return False
+
+
+def _data_dir():
+    try:
+        return str(brain.app_dir())
+    except Exception:
+        return ''
 
 
 def _pick_port():
     """找一个能用的端口：空闲的优先，其次复用已在运行的本应用实例。
     全部被占返回 0。原实现直接用 8765，被别的程序占用时会直接抛异常退出。"""
+    d = _data_dir()
     for port in range(BASE_PORT, BASE_PORT + PORT_TRIES):
         if not _port_busy(port):
             return port
-        if _is_ours(port):
+        if _is_ours(port, d):
             return port
     return 0
 
 
 def _start_server(port):
     if _port_busy(port):
-        return None          # 已有实例在跑，直接复用
+        if _is_ours(port, _data_dir()):
+            return None          # 本用户的实例已经在跑，直接复用
+        # 端口在这几毫秒里被别的程序（或别的用户）抢走了：不能再假装复用，
+        # 否则窗口会去连别人的服务，显示的是别人的索引。
+        _START_ERR[0] = '端口 %d 在启动瞬间被其他程序占用' % port
+        return None
     try:
         srv = brain.make_server(port)
     except Exception:
@@ -266,11 +332,152 @@ def wait_hwnd(title, timeout=6.0):
     return None
 
 
+def _monitor_scale(hmon):
+    """这块显示器的缩放比例（1.5 = 150%），拿不到返回 0。
+
+    用 GetScaleFactorForMonitor 而不是 GetDpiForMonitor：后者对 Per-Monitor v2
+    进程返回的是「系统 DPI」，实测在 150% 的屏上也给 96 —— 用它换算等于没量。
+    """
+    try:
+        sh = ctypes.WinDLL('shcore', use_last_error=True)
+        sf = ctypes.c_int(0)
+        if sh.GetScaleFactorForMonitor(ctypes.c_void_p(hmon), ctypes.byref(sf)) == 0 \
+                and sf.value:
+            return sf.value / 100.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def screen_metrics():
+    """主屏 (物理宽, 物理高, dpr)。
+
+    **别用 GetSystemMetrics ÷ GetDpiForSystem**：后者给的是「登录会话建立那一刻」的
+    系统 DPI，用户登录后把缩放从 100% 调到 150%，它仍然是 96（本机实测 96 vs 真实 144）。
+    于是逻辑屏宽被算大 1.5 倍，居中的窗口就偏到右边（150% 屏上实测偏 640 逻辑像素）。
+    """
+    u, wt = _win()
+    if not u:
+        return 1920, 1080, 1.0
+    try:
+        hmon = u.MonitorFromPoint(wt.POINT(0, 0), 2)      # MONITOR_DEFAULTTONEAREST
+        dpr = _monitor_scale(hmon) or window_dpr(None) or 1.0
+        return int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1)), float(dpr)
+    except Exception:
+        return 1920, 1080, 1.0
+
+
 def mini_origin(hwnd=None):
     """快搜窗出现的位置：屏幕水平居中，垂直约 17% —— 视线自然落点，
     底部还留得下九行结果。返回的是逻辑像素，和 create_window 的单位一致。"""
-    sw, sh = screen_logical_size(hwnd)
-    return max(0, (sw - MINI_W) // 2), max(0, int(sh * 0.17))
+    pw, ph, dpr = screen_metrics()
+    if hwnd:
+        # 窗口已存在时以它自己的 DPI 为准：跨屏拖动后只有 GetDpiForWindow 是最新的
+        try:
+            dpr = window_dpr(hwnd) or dpr
+        except Exception:
+            pass
+    sw, sh = pw / dpr, ph / dpr
+    return max(0, int((sw - MINI_W) // 2)), max(0, int(sh * 0.17))
+
+
+
+# --- 多显示器：快搜窗要出现在鼠标所在的那块屏上 -----------------------
+# 单屏用户永远走上面 mini_origin 的老路（零改动）；只有鼠标离开主显示器时，
+# 才改用下面这套「按物理像素定位」的逻辑。否则双屏用户在主屏旁边的副屏上干活，
+# 双击 Ctrl 之后窗口弹在另一块屏的中央 —— 他的感受就是「快捷键没反应」。
+MONITOR_DEFAULTTONEAREST = 0x00000002
+
+
+def _monitor_info(hmon):
+    """取显示器信息：返回 (left, top, right, bottom) 物理像素，失败返回 None。"""
+    u, wt = _win()
+    if not u or not hmon:
+        return None
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [('cbSize', wt.DWORD), ('rcMonitor', wt.RECT),
+                    ('rcWork', wt.RECT), ('dwFlags', wt.DWORD)]
+
+    try:
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(mi)
+        if not u.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(mi)):
+            return None
+        r = mi.rcMonitor
+        return (int(r.left), int(r.top), int(r.right), int(r.bottom))
+    except Exception:
+        return None
+
+
+def cursor_monitor_rect():
+    """鼠标所在显示器的物理矩形；拿不到返回 None。"""
+    u, wt = _win()
+    if not u:
+        return None
+    try:
+        pt = wt.POINT()
+        if not u.GetCursorPos(ctypes.byref(pt)):
+            return None
+        hmon = u.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+        return _monitor_info(hmon)
+    except Exception:
+        return None
+
+
+def primary_monitor_rect():
+    """主显示器的物理矩形；拿不到返回 None。"""
+    u, wt = _win()
+    if not u:
+        return None
+    try:
+        hmon = u.MonitorFromPoint(wt.POINT(0, 0), MONITOR_DEFAULTTONEAREST)
+        return _monitor_info(hmon)
+    except Exception:
+        return None
+
+
+def mini_origin_in(rect, dpr):
+    """在指定显示器（物理矩形 rect + 该屏缩放 dpr）里算快搜窗的逻辑坐标。
+
+    抽成纯函数是为了能测：单屏时 rect=(0,0,W,H)，结果和 mini_origin 完全一致；
+    副屏在左/上方时 rect 的 left/top 是负数，坐标也要跟着为负，不能 max 到 0。
+    """
+    left, top, right, bottom = rect
+    sw = (right - left) / dpr
+    sh = (bottom - top) / dpr
+    x = int(round((sw - MINI_W) / 2)) + int(round(left / dpr))
+    y = int(round(sh * 0.17)) + int(round(top / dpr))
+    return x, y
+
+
+def calibrate_mini_width():
+    """按真实屏幕宽收窄快搜窗。
+
+    设计宽 760 逻辑像素。可是「1920×1080 + 250% 缩放」只剩 768 逻辑宽、
+    「1920×1080 + 300%」只剩 640 —— 窗口比屏幕还宽，右边被切掉，用户看到的是
+    「搜出来的标题只剩半句」。这类组合在触屏本和远程桌面上比 4K 常见得多。
+
+    正常屏幕（逻辑宽 ≥ 800）**不动 MINI_W**，截图基准和 DOM 尺寸都保持原样。
+    """
+    global MINI_W
+    try:
+        import env_check
+        scr = env_check.logical_screens()
+        prim = next((s for s in scr if s.get('primary')), scr[0] if scr else None)
+        if not prim:
+            return MINI_W
+        avail = int(prim.get('logical_full_w') or 0)
+        if avail <= 0:
+            return MINI_W
+        want = MINI_W if avail >= MINI_W + 40 else max(420, avail - 32)
+        if want != MINI_W:
+            _log('calibrate_mini_width: 屏逻辑宽 %d → 快搜窗 %d（原 %d）'
+                 % (avail, want, MINI_W))
+            MINI_W = want
+    except Exception as e:
+        _log('calibrate_mini_width FAILED: %r' % (e,))
+    return MINI_W
 
 
 def system_dark():
@@ -387,14 +594,98 @@ def main_window_size(sw, sh, saved=None):
     # 上一版给到 72%/1840，2560 屏上直接 1840 —— 用户的原话是「我只让你宽一半，这宽了两三倍」。
     mw = int(min(max(1180, sw * 0.50), 1400))
     mh = int(min(max(720, sh * 0.62), 900))
-    mw = max(760, min(mw, int(sw * 0.92)))
-    mh = max(520, min(mh, int(sh * 0.90)))
+    # 可用空间优先于「合适尺寸」：留 8% 宽 / 10% 高给任务栏和边距。
+    # 2026-11-07 修：原来下限写死 `max(520, ...)`，1366×768 笔记本设 150% 时
+    # 逻辑屏只有 910×512、扣掉任务栏可用 472 —— 520 的硬下限直接把窗口顶出屏幕，
+    # 标题栏跑到屏幕外，用户既拖不动也点不到「关闭」，只能任务管理器杀掉。
+    # 这类「小屏 + 高缩放」在触屏本和老花眼用户里很常见，比 4K 更容易踩到。
+    max_w = max(640, int(sw * 0.92))
+    max_h = max(420, int(sh * 0.90))
+    mw = min(max(760, mw), max_w)
+    mh = min(max(420, mh), max_h)
     return mw, mh
 
 
+def main_min_size(mw, mh):
+    """用户能把主窗拖到的最小尺寸。
+
+    同样不能超过屏幕可用空间：下限比屏幕还高时，窗口最小也超出可视区，
+    等于「窗口关不掉」。正常尺寸下结果和旧常量一致（760×520）。
+    """
+    w = max(560, min(760, int(mw * 0.62)))
+    h = max(360, min(520, int(mh * 0.62)))
+    return min(w, int(mw)), min(h, int(mh))
+
+
+def env_snapshot(hwnd=None):
+    """一行环境描述（系统版本 / 物理分辨率 / 显示器数量 / 缩放）。
+
+    写进 debug.log 的启动行。用户报「窗口不对、看不到、太大太小」时，第一件事
+    永远是问分辨率多少、缩放多少、几块屏 —— 这一行把答案直接留在现场，
+    省掉一轮来回。用 _log_always 写，不依赖 SB_DEBUG。
+    """
+    bits = []
+    try:
+        import platform
+        bits.append('win=%s/%s' % (platform.release(), platform.version()))
+    except Exception:
+        pass
+    u, wt = _win()
+    if u:
+        try:
+            bits.append('screen=%dx%d' % (int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1))))
+        except Exception:
+            pass
+        try:
+            n = [0]
+            PROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                      ctypes.POINTER(wt.RECT), ctypes.c_double)
+
+            def _cb(hmon, hdc, lprc, data):
+                n[0] += 1
+                return 1
+            u.EnumDisplayMonitors(None, None, PROC(_cb), None)
+            bits.append('monitors=%d' % n[0])
+        except Exception:
+            pass
+        try:
+            bits.append('dpr=%.2f' % window_dpr(hwnd))
+            sw, sh = screen_logical_size(hwnd)
+            bits.append('logical=%dx%d' % (sw, sh))
+        except Exception:
+            pass
+    return ' '.join(bits)
+
+
+def window_dpr(hwnd=None):
+    """窗口所在显示器的缩放比：96→1.0、120→1.25、144→1.5、192→2.0。
+
+    只信 `GetDpiForWindow`。**别用 `GetDpiForSystem`**：它返回的是「登录会话建立时」
+    的系统 DPI，用户登录后再改缩放不会更新（本机实测返回 96，而窗口真实是 144）。
+    `GetDpiForMonitor` 同理不可靠——MSDN 明确它不适用于 Per-Monitor v2 应用，
+    本机对 150% 的屏也返回 96。所以拿不到窗口句柄时只能退回系统值，但那只是估值。
+    """
+    u, _ = _win()
+    if not u:
+        return 1.0
+    try:
+        dpi = 0
+        if hwnd:
+            dpi = int(u.GetDpiForWindow(ctypes.c_void_p(hwnd)) or 0)
+        if not dpi:
+            dpi = int(u.GetDpiForSystem() or 96)
+        return (dpi or 96) / 96.0
+    except Exception:
+        return 1.0
+
+
 def screen_logical_size(hwnd=None):
-    """逻辑像素的屏幕尺寸。pywebview 的 move/resize 用逻辑像素（会乘 DPI 缩放），
-    而 GetSystemMetrics 给的是物理像素——150% 缩放下这两个差 1.5 倍，直接用会偏到屏幕外。"""
+    """逻辑像素的屏幕尺寸（100% 缩放时等于分辨率本身）。
+
+    GetSystemMetrics 在 Per-Monitor v2 进程里给的是物理像素，所以必须除以窗口
+    真实 DPR；传 hwnd 才算得准，不传只能用系统 DPI 估（见 window_dpr 的说明）。
+    pywebview 的 move/resize 收的都是逻辑像素，两者单位必须一致，否则窗口会偏到屏幕外。
+    """
     u, wt = _win()
     if not u:
         try:
@@ -403,13 +694,116 @@ def screen_logical_size(hwnd=None):
         except Exception:
             return 1920, 1080
     try:
-        dpi = u.GetDpiForWindow(hwnd) if hwnd else u.GetDpiForSystem()
-        if not dpi:
-            dpi = 96
-        sc = dpi / 96.0
+        sc = window_dpr(hwnd)
         return int(u.GetSystemMetrics(0) / sc), int(u.GetSystemMetrics(1) / sc)
     except Exception:
         return 1920, 1080
+
+
+def get_client_size(hwnd):
+    """客户区（不含标题栏/边框）的物理像素尺寸。CSS 视口 = 这个值 / dpr。"""
+    u, wt = _win()
+    if not u or not hwnd:
+        return 0, 0
+    try:
+        rc = wt.RECT()
+        u.GetClientRect(ctypes.c_void_p(hwnd), ctypes.byref(rc))
+        return int(rc.right - rc.left), int(rc.bottom - rc.top)
+    except Exception:
+        return 0, 0
+
+
+def calc_window_size(css_w, css_h, dpr, style, exstyle):
+    """由客户区尺寸（CSS/逻辑像素）算出整窗物理尺寸（含标题栏与边框）。
+
+    单独抽出来是为了能单测：它的结果只取决于传给它的 dpr，所以 96/120/144/168/192/240
+    六档缩放、1K/2K/4K 各种分辨率都能在没有对应硬件的机器上验证（tests/test_dpi_fit.py）。
+    """
+    u, wt = _win()
+    css_w, css_h = max(1, int(css_w)), max(1, int(css_h))
+    tw = int(round(css_w * dpr))
+    th = int(round(css_h * dpr))
+    if not u:
+        return tw, th
+    rc = wt.RECT(0, 0, tw, th)
+    try:
+        try:
+            u.AdjustWindowRectExForDpi(ctypes.byref(rc), style, False, exstyle,
+                                       int(round(dpr * 96)))
+        except Exception:
+            # Win10 1607 之前没有 *ForDpi 版本（那时也不会有 >100% 的混合缩放）
+            u.AdjustWindowRectEx(ctypes.byref(rc), style, False, exstyle)
+    except Exception:
+        return tw, th
+    return int(rc.right - rc.left), int(rc.bottom - rc.top)
+
+
+def set_client_size(hwnd, css_w, css_h):
+    """把客户区精确调成 css_w × css_h（CSS/逻辑像素），返回是否真的动了。
+
+    两个关键点，都是踩过坑换来的：
+    1. **用 SetWindowPos，不用 pywebview 的 resize()**。后者走 WinForms 的 Bounds
+       赋值，会把刚 hide 掉的窗口重新显示出来；SetWindowPos 带 SWP_NOACTIVATE
+       只改几何，隐藏的窗口不会冒头，可见的窗口也不会抢焦点。
+    2. **按客户区算，不按整窗算**。WinForms 的 Width/Height 含标题栏和边框，
+       直接照抄会让 CSS 视口少十几个像素；AdjustWindowRectExForDpi 能把
+       「客户区尺寸 + 样式 → 整窗尺寸」在不同 DPI 下算准（96/120/144/168/192/240 通用）。
+    """
+    u, wt = _win()
+    if not u or not hwnd:
+        return False
+    try:
+        dpr = window_dpr(hwnd)
+        style = u.GetWindowLongW(ctypes.c_void_p(hwnd), -16) & 0xFFFFFFFF      # GWL_STYLE
+        exstyle = u.GetWindowLongW(ctypes.c_void_p(hwnd), -20) & 0xFFFFFFFF    # GWL_EXSTYLE
+        w, h = calc_window_size(css_w, css_h, dpr, style, exstyle)
+        SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_NOOWNERZORDER = 0x2, 0x4, 0x10, 0x200
+        u.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, w, h,
+                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+        return True
+    except Exception as e:
+        _log('set_client_size FAILED: %r' % (e,))
+        return False
+
+
+def needs_fit(cur_w, cur_h, tw, th):
+    """CSS 视口（cur）和设计尺寸（target）差得够不够多，值得动窗口。
+
+    容差分两级，故意放得很宽：
+      · 像素差在「标题栏 + 边框」量级以内（实测宽 ~15、高 ~37，各主题略有差别）→ 不算问题；
+      · 或者相对偏差 ≤5%。
+    这样 100% 缩放（视口只比设计少一圈边框）和 150% 缩放（pywebview 已经正确放大，
+    同样只差一圈边框）都会落进「不用动」，绝大多数用户启动时这里等于空操作。
+    只有真算错——比如某天 pywebview 的换算失效，150% 下视口掉成 843×569——才会返回 True。
+    """
+    dx, dy = abs(cur_w - tw), abs(cur_h - th)
+    dev = max(dx / max(1, tw), dy / max(1, th))
+    return not ((dx <= 24 and dy <= 48) or dev <= 0.05)
+
+
+def notify_resize(hwnd):
+    """给窗口补发一条 WM_SIZE，让 WebView2 按当前客户区重建渲染表面。
+
+    只发消息、不改几何：同尺寸的 resize() 在 WinForms 上等于再赋一次 Bounds，
+    会把可见性 / 焦点一起牵动，代价比收益大。
+    """
+    u, _ = _win()
+    if not u or not hwnd:
+        return False
+    try:
+        cw, ch = get_client_size(hwnd)
+        if cw <= 0 or ch <= 0:
+            return False
+        u.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                   ctypes.c_void_p, ctypes.c_void_p]
+        u.SendMessageW.restype = ctypes.c_ssize_t
+        WM_SIZE, SIZE_RESTORED = 0x0005, 0
+        u.SendMessageW(ctypes.c_void_p(hwnd), WM_SIZE, ctypes.c_void_p(SIZE_RESTORED),
+                       ctypes.c_void_p(((ch & 0xFFFF) << 16) | (cw & 0xFFFF)))
+        return True
+    except Exception as e:
+        _log('notify_resize FAILED: %r' % (e,))
+        return False
 
 
 def topmost(hwnd, tries=12):
@@ -500,7 +894,7 @@ def _is_visible(hwnd):
         return False
 
 
-def revive_webview(hwnd):
+def revive_webview(hwnd, quiet=False):
     """把 hide 之后没跟着 show 的 WebView2 渲染子窗口重新显示（治「整块白窗口」）。
 
     `--silent` 启动会先 hide 整个主窗口，连 WebView2 的 Chrome_WidgetWin_* 一起
@@ -510,7 +904,7 @@ def revive_webview(hwnd):
     2026-11-06 实测：silent 启动后从托盘打开，主窗口 4 个子窗口里 3 个是 hidden。
 
     只在真的发现隐藏子窗口时才动作并留一行日志，正常显示不产生任何副作用。
-    """
+    quiet=True 供轮询自愈用：每轮都写日志会把 debug.log 灌满。"""
     if not hwnd:
         return 0
     try:
@@ -543,11 +937,63 @@ def revive_webview(hwnd):
                       0x1 | 0x2 | 0x20 | 0x40)
         # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
         u.RedrawWindow(ctypes.c_void_p(hwnd), None, None, 0x1 | 0x4 | 0x80 | 0x100)
-        _log_always('白屏自愈：唤醒 %d 个隐藏的 WebView2 子窗口' % len(hidden))
+        if not quiet:
+            _log_always('白屏自愈：唤醒 %d 个隐藏的 WebView2 子窗口' % len(hidden))
         return len(hidden)
     except Exception:
         _log_always('白屏自愈失败\n' + traceback.format_exc())
         return 0
+
+
+def _render_children_visible(hwnd):
+    """主窗里 WebView2 的渲染子窗口是不是**全部**可见（False = 白屏现场）。
+
+    白屏的判定标准只能是渲染层：外壳（WindowsForms10.Window…）可见而
+    Chrome_WidgetWin_* / D3D 全隐藏时，用户看到的是一块白板。"""
+    if not hwnd:
+        return False
+    try:
+        u = ctypes.windll.user32
+        if not u.IsWindowVisible(ctypes.c_void_p(hwnd)):
+            return False
+        PROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        cls = ctypes.create_unicode_buffer(256)
+        seen = []
+
+        def _cb(h, _l):
+            u.GetClassNameW(ctypes.c_void_p(h), cls, 256)
+            n = cls.value
+            if n.startswith('Chrome_') or 'D3D' in n:
+                seen.append(bool(u.IsWindowVisible(ctypes.c_void_p(h))))
+            return 1
+
+        u.EnumChildWindows(ctypes.c_void_p(hwnd), PROC(_cb), None)
+        return bool(seen) and all(seen)
+    except Exception:
+        return False
+
+
+def _late_revive_loop(app, timeout=10.0, interval=0.3):
+    """show 之后的轮询式自愈：最多 10 秒，每 0.3 秒唤醒一次渲染层，全可见才收工。
+
+    只补一两次不够：开机的头几秒 IO 忙（bigram 回填 / 首启扫描）时 WebView2 渲染层
+    初始化慢，固定拍数的唤醒会刚好错开，用户对着白窗等到自己放弃。正常场景第一轮
+    就全可见、立即退出，没有副作用。用户中途收起窗口就停止（别把窗口硬拉回来）。"""
+    rounds = 0
+    end = time.time() + timeout
+    while time.time() < end:
+        hwnd = app.hwnd_main or find_hwnd(MAIN_TITLE)
+        if hwnd and not _is_visible(hwnd):
+            return
+        if _render_children_visible(hwnd):
+            if rounds > 1:
+                _log('白屏自愈：轮询 %d 轮后渲染层恢复' % rounds)
+            return
+        revive_webview(hwnd, quiet=True)
+        app._force_webview_visible()
+        rounds += 1
+        time.sleep(interval)
+    _log_always('白屏自愈：轮询 %.0f 秒后渲染子窗仍不可见（窗口可能仍是白板）' % timeout)
 
 
 # --------------------------------------------------------------- 标题栏「快搜」按钮
@@ -813,6 +1259,15 @@ class MiniApi:
         p = str(p or '')
         if not p or not brain.ev_recent(p):
             return False
+        # 第 123 项这个函数体被误删过一次（只剩白名单校验，右键「属性」点了没反应）。
+        # ShellExecuteEx 的 properties verb 立即返回，不会阻塞快搜窗。
+        try:
+            os.startfile(os.path.normpath(p), 'properties')
+            return True
+        except Exception as e:
+            _log('properties FAILED: %r' % (e,))
+            return False
+
     def reveal(self, p):
         """在资源管理器里定位这个文件（快搜窗里 Ctrl+Enter 的备用动作）"""
         p = str(p or '')
@@ -873,6 +1328,7 @@ class App:
         self.mini_visible = False
         self.hotkey = None
         self._hide_hint_given = False
+        self._want_main = False      # 用户主动要求显示主窗（silent 守卫据此让路）
         self._lock = threading.Lock()
 
     # -- 窗口 ---------------------------------------------------------
@@ -880,6 +1336,8 @@ class App:
         # 位置必须在创建时给定：pywebview 的 move()/resize() 会让隐藏窗口变可见
         # （底层是 winforms 的 Location/Size 赋值，会顺手把窗体 Show 出来）。
         # 实测过：对 hidden 窗口调一次 move，IsWindowVisible 就从 0 变 1。
+        # 屏幕逻辑宽不够时先把快搜窗收窄（这一步只改尺寸常量，不碰窗口）。
+        calibrate_mini_width()
         x, y = mini_origin()
         self.mini = webview.create_window(
             MINI_TITLE, f'{self.url}/mini',
@@ -900,12 +1358,27 @@ class App:
                 saved = (int(_st['win_w']), int(_st['win_h']))
         except Exception:
             saved = None
+        # 逻辑屏尺寸取「物理 ÷ 真实缩放」：screen_metrics 的 dpr 来自
+        # GetScaleFactorForMonitor，比 GetDpiForSystem 可靠（后者可能是登录时的旧值）
+        _pw, _ph, _dpr = screen_metrics()
+        if _pw > 0 and _ph > 0:
+            sw, sh = _pw / _dpr, _ph / _dpr
         MW, MH = main_window_size(sw, sh, saved)
         self._main_w, self._main_h = MW, MH
-        # WinForms 外壳把 create_window 的 width 当作物理像素，不随 DPI 放大；
-        # 但 WebView2 在 125%/150% 屏上按窗口真实 DPI 渲染 CSS（DPR>1），CSS 视口被
-        # 缩成「物理/DPI」，比设计窄，字号/图标就显得过大。这里先用逻辑尺寸建窗，
-        # after_start 里再按实际 DPI 把物理尺寸补成「逻辑 × DPR」（见 _fit_main_dpi）。
+        # 主窗初始位置：自己算居中，**别交给 WinForms 的 CenterScreen**。
+        # 实测（3840×2160 @150%）CenterScreen 在 Per-Monitor v2 进程里不生效 ——
+        # 普通启动落在 (38,38)（左上角起，右边空出半个屏幕）；silent 启动再唤出时
+        # 还会恢复到 (-317,298)，左边缘 317px 跑到屏幕外。两处都是「用户以为窗口
+        # 没开 / 拖不回来」的来源。这里给逻辑像素，pywebview（winforms.py 第 214-220 行）
+        # 走 StartPosition=Manual + Location=x*scale，各档缩放同一套换算。
+        _mx = max(0, int((sw - MW) // 2))
+        _my = max(0, int((sh - MH) // 2))
+        if _my + MH > sh:                       # 任务栏很高时别把窗口底推出屏
+            _my = max(0, int(sh - MH))
+        # create_window 收的是逻辑像素，打包里的 pywebview 自己会 ×DPR 换成物理
+        # （winforms.py: self.Size = initial_width * self._scale），所以这里给逻辑值就对了；
+        # 100% / 125% / 150% / 200% 走的是同一条换算，不需要为某档缩放单独写分支。
+        # 万一某个版本的换算不对，_fit_main_size 会用客户区实测值兜底校正。
         # 主窗口【不能】hidden 创建：pywebview 的 show()/load_url() 都带
         # @_shown_call，要先等 WinForms 的 Form.Shown 事件置位；hidden 窗口永远不触发
         # 这个事件，于是「从快搜窗点展示更多 → show_main」会卡满 20 秒再抛
@@ -913,7 +1386,8 @@ class App:
         # silent（开机自启）时不显示窗口，改为在 after_start 等窗口真正 shown 之后再 hide。
         self.main = webview.create_window(
             MAIN_TITLE, self.main_url,
-            width=MW, height=MH, min_size=(max(760, int(MW * 0.62)), max(520, int(MH * 0.62))),
+            width=MW, height=MH, x=_mx, y=_my,
+            min_size=main_min_size(MW, MH),
             text_select=True, js_api=self.main_api, hidden=False,
         )
         self.main_api._win = self.main
@@ -968,10 +1442,47 @@ class App:
         try:
             if self.main.events.shown.wait(10):
                 self._safe_hide_main()
+                # 只记「该隐藏时到底隐藏了没有」：白屏排查时这一行比任何猜测都直接。
+                _log('hide_after_shown: visible=%s' % _is_visible(self.hwnd_main))
+                # 隐藏动作是排队进 GUI 线程的，后面排队的 resize / 属性赋值会把它顶回来
+                # （见 after_start 的注释）。这里等一拍复查一次，再挂一个 10 秒守卫。
+                time.sleep(0.35)
+                if _is_visible(self.hwnd_main):
+                    _log_always('静默启动：hide 之后窗口又被顶出来，重新收起')
+                    self._safe_hide_main()
+                    self._win32_hide_main()
+                threading.Thread(target=self._silent_hide_guard, daemon=True).start()
             else:
                 _log_always('主窗口 shown 事件超时，silent 模式未隐藏窗口')
         except Exception:
             _log_always('_hide_after_shown 失败\n' + traceback.format_exc())
+
+    def _win32_hide_main(self):
+        """Win32 直接 SW_HIDE：跨线程必生效，渲染层会级联藏起来（第 109/121 项验证过）。"""
+        try:
+            hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(ctypes.c_void_p(hwnd), 0)
+        except Exception:
+            pass
+
+    def _silent_hide_guard(self, seconds=10.0, interval=0.5):
+        """静默启动后盯 10 秒：窗口要是又自己冒出来，立刻收回去。
+
+        开机的头几秒 DPI 通知 / 渲染层初始化 / 排队中的 resize 都可能把刚隐藏的主窗
+        顶出来；用户此时看到的是一块白板（渲染层还没跟上）。这条守卫不看原因只看
+        结果——只要 silent 且用户没主动要求显示，主窗可见就收起。
+        用户从托盘 / 双击图标打开后 `_want_main` 为 True，守卫自动让路。"""
+        end = time.time() + seconds
+        while time.time() < end:
+            time.sleep(interval)
+            if self._want_main:
+                return
+            hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
+            if hwnd and _is_visible(hwnd):
+                _log_always('静默启动守卫：主窗又冒出来了，重新收起')
+                self._safe_hide_main()
+                self._win32_hide_main()
 
     def _safe_hide_main(self):
         """在 closing 事件之外 hide 主窗口，避开 WinForms FormClosing 的时序陷阱。"""
@@ -1025,28 +1536,60 @@ class App:
     def _watch_loaded_or_fallback(self):
         """WebView2 初始化失败（0x700AA profile 锁等）时 pywebview 只打印
         「initialization failed」而不抛异常——窗口白屏挂着没人知道。这里等
-        loaded 事件，10 秒不来就降级浏览器（服务与托盘不受影响）。"""
+        loaded 事件，等不到就降级浏览器（服务与托盘不受影响）。
+
+        **超时不等于坏了**：机械硬盘 + 杀毒软件全盘扫描 + 首次启动的回填线程
+        叠加时，二三十秒加载不完很正常。旧版固定等 10 秒、时间一到就藏窗口开浏览器，
+        这类机器上用户看到的是「程序一闪，浏览器里打开一个网页」——比白屏更让人懵。
+        现在的判据是渲染层：渲染子窗口活着就继续等（最多再等 60 秒），
+        真白（渲染子窗全隐藏）才降级。"""
         try:
-            if self.main and self.main.events.loaded.wait(10):
+            if self.main and self.main.events.loaded.wait(30):
                 return                                # 正常加载
         except Exception:
             return                                    # 事件机制异常，不动
+        hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
         try:
-            if u32.IsWindowVisible(ctypes.c_void_p(self.hwnd_main)) if (u32 := ctypes.windll.user32) else False:
-                self._fallback_browser('WebView2 初始化失败（0x700AA）')
+            if hwnd and _render_children_visible(hwnd):
+                _log_always('页面加载超过 30 秒，但渲染层正常 —— 继续等（慢机器/杀软扫描）')
+                try:
+                    if self.main.events.loaded.wait(60):
+                        return
+                except Exception:
+                    return
+            if hwnd and _is_visible(hwnd):
+                self._fallback_browser('WebView2 初始化失败（90 秒内没有渲染）')
         except Exception:
             pass
 
     def after_start(self):
         self.hwnd_mini = wait_hwnd(MINI_TITLE)
         self.hwnd_main = wait_hwnd(MAIN_TITLE)
+        # 环境快照：用户报「窗口不对/看不到」时，这一行就是现场数据。
+        try:
+            _log_always('[env] %s silent=%s target=%dx%d'
+                        % (env_snapshot(self.hwnd_main), self.silent,
+                           int(self._main_w), int(self._main_h)))
+        except Exception:
+            pass
         threading.Thread(target=self._watch_loaded_or_fallback, daemon=True).start()
         # silent 模式主窗口按非 hidden 创建（见 create 里的说明），等 Form.Shown
         # 真正置位、events.shown 可用之后再收起来。用事件而不是固定 sleep：
         # 窗口只露出一瞬间，开机自启不会闪一大下。
         if self.silent:
             threading.Thread(target=self._hide_after_shown, daemon=True).start()
-        self._fit_main_dpi()
+        # 【别在"马上要隐藏"的窗口上调 pywebview 的 resize()】它走 WinForms 的
+        # Bounds 赋值，会把刚 hide 掉的窗口重新显示出来；而 WebView2 渲染层不跟
+        # （没有真正的尺寸变化 → 收不到 WM_SIZE → 控制器仍认为窗口不可见）→
+        # 外壳显示、内容全白。2026-11-07 实测：150% 缩放（dpr=1.5）下开机自启
+        # 100% 必现，日志形如
+        #   fit_main_dpi: dpr=1.50 target=1280x892 visible_before=True
+        #   _safe_hide_main ok
+        #   hide_after_shown: visible=True    ← 隐藏后 2ms 又被顶回来
+        # 现在尺寸校验收口在 _fit_main_size：它用 SetWindowPos（不改可见性）且
+        # 只在 CSS 视口真的偏了才动手，所以静默启动也能安全调用 —— 不再需要
+        # 「非 silent 才修正」这种按缩放/启动方式分叉的逻辑。
+        self._fit_main_size()
         self._dbg_autohelp()
         round_corners(self.hwnd_mini)
         soft_shadow(self.hwnd_mini)
@@ -1123,34 +1666,87 @@ class App:
         except Exception as e:
             _log('force webview visible FAILED: %r' % (e,))
 
-    def _fit_main_dpi(self):
-        """高 DPI 修正：pywebview 基于 .NET WinForms，create_window 的 width 被当作
-        物理像素，不会按显示器 DPI 自动放大；而 WebView2 在 125%/150% 屏上以窗口真实
-        DPI（DPR>1）渲染 CSS，于是 CSS 视口被缩成「物理/DPI」、比设计窄，字号/图标相对
-        就显得过大（即用户看到的「一切都被放大了」）。
+    def _fit_main_size(self):
+        """保证主窗口的 CSS 视口 ≈ 设计尺寸（_main_w × _main_h），**所有缩放档同一套逻辑**。
 
-        这里把窗口物理尺寸补成「逻辑尺寸 × DPR」，让 CSS 视口回到设计宽度，内容比例
-        恢复正常。dpr==1 时无需调整，直接跳过。"""
-        if not self.hwnd_main:
+        为什么不再按 DPR 分支：旧实现是「dpr==1 直接 return，dpr>1 就 resize」，于是
+        只有非 100% 的机器才会走进 resize 那条路——也正是这条路会把刚隐藏的窗口顶回来
+        （WinForms 的 Bounds 赋值 → 白屏）。100% 的机器永远测不到那个 bug，反过来
+        一旦哪天 pywebview 的换算变了，100% 的机器反而可能踩到没人测过的新路径。
+
+        现在的做法跟缩放在几档无关：
+          · 读客户区的物理像素，除以窗口真实 DPR → 得到「现在真实的 CSS 视口」；
+          · 和设计尺寸比，偏差在 5% 以内就什么都不做（100% 缩放正常时就是这一步，
+            连标题栏那十几个像素的差都不足以触发）；
+          · 真偏了才用 set_client_size（SetWindowPos）校正 —— 不改变窗口可见性，
+            所以隐藏状态下调用也安全，不会再白屏。
+        """
+        hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
+        if not hwnd:
             return
         try:
-            dpi = ctypes.windll.user32.GetDpiForWindow(self.hwnd_main) or 96
-            dpr = dpi / 96.0
-            if dpr == 1.0:
+            dpr = window_dpr(hwnd)
+            cw, ch = get_client_size(hwnd)
+            if cw <= 0 or ch <= 0:
                 return
-            # 实测（150% 屏）：create_window 的尺寸被 WinForms 当物理像素，而 resize()
-            # 自己还会再乘一次 DPR —— 所以这里传「逻辑目标」，CSS 视口才会等于 _main_w。
-            # 旧代码传 _main_w*dpr，等于乘了两次，视口反而被撑到 1.5 倍宽。
-            self.main.resize(int(self._main_w), int(self._main_h))
-        except Exception:
-            pass
+            cur_w, cur_h = cw / dpr, ch / dpr
+            tw, th = int(self._main_w), int(self._main_h)
+            dev = max(abs(cur_w - tw) / max(1, tw), abs(cur_h - th) / max(1, th))
+            # 用 _log_always：每次启动只打 1~2 行，但用户报「字太大/窗口不对」时，
+            # 这行里就有 dpr、真实 CSS 视口和目标尺寸，比问一轮话快得多。
+            _log_always('fit_main_size: dpr=%.2f css=%.0fx%.0f target=%dx%d dev=%.1f%% visible=%s'
+                        % (dpr, cur_w, cur_h, tw, th, dev * 100, _is_visible(hwnd)))
+            # 容差见 needs_fit：100% / 150% 的正常机器都返回 False，什么都不做。
+            if not needs_fit(cur_w, cur_h, tw, th):
+                return
+            ok = set_client_size(hwnd, tw, th)
+            _log_always('fit_main_size: %s → client=%s visible_after=%s'
+                        % ('resized' if ok else 'FAILED', get_client_size(hwnd), _is_visible(hwnd)))
+        except Exception as e:
+            _log('fit_main_size FAILED: %r' % (e,))
 
     def place_mini(self):
+        """把快搜窗摆到鼠标所在的那块屏上（单屏时就是原来的居中 + 17%）。"""
         try:
-            x, y = mini_origin(self.hwnd_mini)
-            self.mini.move(x, y)
-        except Exception:
-            pass
+            cur = cursor_monitor_rect()
+            prim = primary_monitor_rect()
+            if cur and prim and cur != prim:
+                self._place_mini_on(cur)
+            else:
+                x, y = mini_origin(self.hwnd_mini)
+                self.mini.move(x, y)
+        except Exception as e:
+            _log('place_mini FAILED: %r' % (e,))
+
+    def _place_mini_on(self, rect):
+        """把快搜窗摆到 rect 这块显示器上（物理像素定位）。
+
+        为什么不用 `self.mini.move()`：pywebview 的坐标是「逻辑像素 × 窗口当前
+        scale」，而混合 DPI 的多屏里每块屏的 scale 不一样，拿主屏的 scale 算副屏
+        的坐标必然偏（偏得多了窗口就落到屏幕外，看起来像「快捷键失灵」）。
+        这里先按物理像素把窗口挪进目标屏（不改尺寸），让 `GetDpiForWindow` 拿到
+        那块屏真实的 DPI，再按 DPI 精确摆位。
+        """
+        hwnd = self.hwnd_mini
+        u, wt = _win()
+        if not hwnd or not u:
+            return
+        SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+        left, top, right, bottom = rect
+        # ① 先落进目标屏（尺寸不动），窗口 DPI 会跟着变成那块屏的
+        u.SetWindowPos(ctypes.c_void_p(hwnd), None, left + 40, top + 40, 0, 0,
+                       SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        dpr = window_dpr(hwnd)
+        wr = wt.RECT()
+        u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(wr))
+        h = int(wr.bottom - wr.top) or int(MINI_H * dpr)
+        w = int(round(MINI_W * dpr))
+        x = left + max(0, (right - left - w) // 2)
+        y = top + int(round((bottom - top) * 0.17))
+        u.SetWindowPos(ctypes.c_void_p(hwnd), None, x, y, w, h,
+                       SWP_NOZORDER | SWP_NOACTIVATE)
+        _log('place_mini: 副屏 dpr=%.2f rect=%s → (%d,%d) %dx%d'
+             % (dpr, rect, x, y, w, h))
 
     # -- 快搜窗 -------------------------------------------------------
     def toggle_mini(self):
@@ -1263,6 +1859,7 @@ class App:
 
         # ① 显示窗口。换深色标题栏、抢前台这类非关键动作各自单独吞异常，
         #    别让它们把整个流程带进一个「统一 except」再触发跳浏览器。
+        self._want_main = True
         try:
             hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
             if not hwnd:
@@ -1289,12 +1886,13 @@ class App:
                     dark_caption(hwnd, effective_dark())
                 except Exception as e:
                     _log('dark caption on show failed: %r' % (e,))
-                # Win32 强制重排一次：让 WebView2 收到 WM_SIZE 重建渲染表面，
-                # 否则它会在下次合成时把刚 show 出来的渲染子窗口又藏回（白屏）。
-                try:
-                    self.main.resize(self.main.width, self.main.height)
-                except Exception:
-                    pass
+                # 让 WebView2 重建渲染表面：给它补发一条 WM_SIZE。
+                # 旧代码用 `self.main.resize(self.width, self.height)` 干这件事，但尺寸
+                # 根本没变 —— 等于让 WinForms 再赋一次 Bounds，副作用（可见性/焦点）比
+                # 收益大。SendMessage 只通知、不动几何，确定性更高。
+                notify_resize(hwnd)
+                # 尺寸兜底校正：正常机器这里 dev<=5% 直接返回，不产生任何窗口操作。
+                self._fit_main_size()
                 # 外壳 show 起来了，WebView2 的渲染子窗口却可能还藏着（silent 启动
                 # 必现）：不唤醒的话用户看到的就是一整块白窗口。
                 revive_webview(hwnd)
@@ -1702,6 +2300,9 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
         print(f'端口 {BASE_PORT}~{BASE_PORT + PORT_TRIES - 1} 都被占用，无法启动。')
         print('请关掉占用端口的程序后重试。')
         return
+    # 环境快照先落日志：万一后面窗口起不来，这条就是唯一能看的东西
+    _env_info = _env_boot_probe()
+    _apply_render_fallback(_env_info)
     url = f'http://127.0.0.1:{port}'
     srv = _start_server(port)
     if srv is None and _START_ERR[0]:
@@ -1838,6 +2439,66 @@ def _attach_console():
         pass
 
 
+def _apply_render_fallback(info):
+    """按环境自动关掉 WebView2 的硬件加速（而不是让用户自己去查参数）。
+
+    两种环境没有可靠的 GPU 合成：远程桌面会话、只装了「Microsoft Basic Display
+    Adapter」的机器（虚拟机、没装显卡驱动）。WebView2 在这两种环境里的典型表现是
+    黑块、白块、整片不刷新 —— 用户描述通常就是「窗口是黑的」。
+
+    关掉硬件加速只是慢一点（软渲染），但至少能用。设置必须在 webview.start()
+    之前生效，所以放在启动流程里、窗口创建之前。
+    """
+    try:
+        import env_check
+        p = env_check.plan(info or {})
+        if not p.get('disable_gpu'):
+            return False
+        cur = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS') or ''
+        if '--disable-gpu' in cur:
+            return False
+        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (cur + ' --disable-gpu').strip()
+        _log_always('渲染降级：远程桌面/无硬件加速环境，已关闭 WebView2 GPU')
+        return True
+    except Exception as e:
+        _log('render fallback FAILED: %r' % (e,))
+        return False
+
+
+def _env_boot_probe():
+    """启动时做一次轻量环境探测，结论写进日志。
+
+    它**不修任何东西**（该修的各模块自己已经做了），只负责在日志里留下证据：
+    用户报「打不开」时，第一行就能看出到底是「没装 WebView2」还是「磁盘满了」，
+    不用来回猜着问。light=True 跳过 quick_check，耗时可忽略。
+    """
+    try:
+        import env_check
+        info = env_check.probe_all(light=True)
+        prim = info.get('primary') or {}
+        _log_always('[env-boot] webview2=%s win=%s screen=%dx%d@%d%% monitors=%d '
+                    'data=%s(%s) free=%dMB db=%s(%.1fMB)%s'
+                    % (info.get('webview2') or 'MISSING', info.get('windows'),
+                       prim.get('phys_w', 0), prim.get('phys_h', 0),
+                       prim.get('scale', 0), len(info.get('screens') or []),
+                       info.get('data_dir'),
+                       'rw' if info.get('data_writable') else 'RO',
+                       info.get('free_mb', -1), info.get('db_state'),
+                       info.get('db_mb', 0),
+                       ' remote' if info.get('remote_session') else ''))
+        for it in env_check.judge(info):
+            if it['level'] == 'FAIL':
+                _log_always('[env-boot:FAIL] %s | %s | %s'
+                            % (it['title'], it.get('detail', ''), it.get('fix', '')))
+            elif it['level'] == 'WARN':
+                _log_always('[env-boot:WARN] %s | %s'
+                            % (it['title'], it.get('detail', '')))
+        return info
+    except Exception:
+        _log_always('[env-boot] 自检失败：%s' % traceback.format_exc()[-400:])
+        return {}
+
+
 def _run_window(query, show_settings, lang, silent=False, start_mini=False):
     try:
         main(query=query, show_settings=show_settings, lang=lang,
@@ -1845,14 +2506,100 @@ def _run_window(query, show_settings, lang, silent=False, start_mini=False):
     except Exception as e:
         import traceback
         traceback.print_exc()
+        # 窗口没起来时先判断「是不是根本没有 WebView2」：这是外行用户最可能遇到的
+        # 一种完全空白，原来那句「通常是缺少 WebView2」只是让用户自己去找，
+        # 现在直接把下载页递到他手上（点确定就打开浏览器）。
+        wv = ''
+        try:
+            import env_check
+            wv = env_check.webview2_version()
+        except Exception:
+            pass
+        if not wv:
+            try:
+                r = ctypes.windll.user32.MessageBoxW(
+                    None,
+                    ('第二大脑需要「WebView2 运行时」，这台电脑上没找到。'
+                     + chr(10) * 2
+                     + '点「确定」会打开微软官方下载页，装好后重新打开第二大脑即可。'
+                     + chr(10)
+                     + '（安装包很小，约 2 MB；装一次，以后都不用再装。）'),
+                    '第二大脑 · 缺少 WebView2 运行时', 0x01)
+                if r == 1:
+                    os.startfile('https://go.microsoft.com/fwlink/p/?LinkId=2124703')
+                    return
+            except Exception:
+                pass
+            return
         _die(f'窗口启动失败：{type(e).__name__}: {e}\n\n'
              f'Window failed to start.\n'
-             f'通常是缺少 WebView2 运行时，可从以下地址安装：\n'
-             f'https://developer.microsoft.com/microsoft-edge/webview2/')
+             f'WebView2 已安装（{wv}），问题可能出在显卡驱动或安全软件。\n'
+             f'可以试试：1) 更新显卡驱动  2) 用 --diagnose 生成环境报告\n'
+             f'{chr(10)}日志：{_log_path()}')
+
+
+def _diagnose():
+    """`--diagnose`：跑一遍环境自检，把报告写下来并打开给人看。
+
+    exe 是窗口程序（console=False），控制台输出用户根本看不见 —— 所以报告必须落成
+    文件、再把文件打开。用户要做的只有一件事：把这份报告发过来。
+    这份报告里有分辨率、缩放、显示器数、WebView2 版本、数据目录、索引库状态，
+    等于把「现场」搬到开发机上，省掉来回问「你是什么系统、多少分辨率」。
+    """
+    _attach_console()
+    try:
+        import env_check
+    except Exception as e:
+        _die('环境自检模块缺失：%r' % (e,))
+        return
+    try:
+        info = env_check.probe_all()
+        issues = env_check.judge(info)
+        text = env_check.render(info, issues)
+    except Exception:
+        import traceback
+        _fatal('环境自检失败', traceback.format_exc()[-1200:])
+        return
+    print(text)
+    out = None
+    try:
+        import brain as _b
+        d = Path(_b.app_dir())
+        d.mkdir(parents=True, exist_ok=True)
+        out = d / 'env_report.txt'
+        out.write_text(text, encoding='utf-8')
+        (d / 'env_report.json').write_text(
+            json.dumps({'info': info, 'issues': issues, 'plan': env_check.plan(info)},
+                       ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        out = None
+    if getattr(sys, 'frozen', False):
+        fails = [i for i in issues if i['level'] == 'FAIL']
+        warns = [i for i in issues if i['level'] == 'WARN']
+        lines = ['%s %s' % ('×' if i['level'] == 'FAIL' else '!', i['title'])
+                 for i in (fails + warns)[:6]]
+        head = ('发现 %d 项不可用、%d 项要注意' % (len(fails), len(warns))
+                if (fails or warns) else '本机环境正常，没发现问题')
+        body = head + ((chr(10) * 2 + chr(10).join(lines)) if lines else '')
+        if out:
+            body += chr(10) * 2 + '完整报告：' + str(out)
+        try:
+            ctypes.windll.user32.MessageBoxW(None, body, '第二大脑 · 环境自检', 0x40)
+        except Exception:
+            pass
+        if out:
+            try:
+                os.startfile(str(out))
+            except Exception:
+                pass
+    return out
 
 
 def _boot():
     argv = sys.argv[1:]
+    if any(a in ('--diagnose', '/diagnose', '-diagnose') for a in argv):
+        _diagnose()
+        return
     rest, show_settings, lang, silent, start_mini = _parse_window_args(argv)
     # 第一个剩余 token 是已知子命令（update / search / selftest…）→ 走命令行
     if rest and not show_settings and not lang and not silent and rest[0] in _CLI_CMDS:

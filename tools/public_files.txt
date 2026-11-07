@@ -27,6 +27,12 @@ sync  tests/test_apprank.py
 sync  tests/test_scan_docs.py
 sync  tests/test_bigram.py
 sync  tests/test_body_reindex.py
+sync  tests/test_dpi_fit.py
+sync  tests/test_env_matrix.py
+sync  tests/test_fs_safety.py
+sync  tests/test_db_recovery.py
+sync  tests/test_env_check.py
+sync  env_check.py
 sync  app_window.py
 sync  hotkey.py
 sync  tray.py
