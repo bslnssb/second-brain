@@ -64,6 +64,14 @@ BAD_CONTENT = [
 # 内容确实一样但属于「故意两份」的，报出来只会让人每次去核对一遍
 KNOWN_DUP = {
     ('app.ico', 'assets/icon.ico'),        # 安装器窗口图标 = 程序图标，同一张图
+
+    # 落地页 docs/ 必须自包含：GitHub Pages 只发布 /docs 目录，
+    # 页面里写 ../assets/x.png 在线上会变成站点根的 /assets/x.png → 404。
+    # 所以这些图是「有意复制的副本」，不是忘了删。
+    ('assets/demo-contract.gif', 'docs/img/demo-contract.gif'),
+    ('assets/demo-invoice.gif', 'docs/img/demo-invoice.gif'),
+    ('assets/screenshot-quick.png', 'docs/img/screenshot-quick.png'),
+    ('logo64.png', 'docs/img/logo64.png'),
 }
 
 MAX_FILE = 3 * 1024 * 1024          # 单文件 3 MB

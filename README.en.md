@@ -1,6 +1,6 @@
 # Second Brain · Local Document Search
 
-[简体中文](README.md) | **English**
+[简体中文](README.md) | **English** · [Homepage](https://bslnssb.github.io/second-brain/)
 
 **Scanned documents are searchable too.**
 

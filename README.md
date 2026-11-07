@@ -1,6 +1,6 @@
 # 第二大脑 · Local Second Brain
 
-**简体中文** | [English](README.en.md)
+**简体中文** | [English](README.en.md) · [在线主页](https://bslnssb.github.io/second-brain/)
 
 **扫描件也能搜。**
 
