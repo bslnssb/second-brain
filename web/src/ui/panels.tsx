@@ -771,7 +771,7 @@ function LicenseBox({ open }: { open: boolean }) {
         >
           {active ? 'Pro' : t('lic_free')}
         </span>
-        {active && st.name && <span className="truncate text-[11px] text-fg">{st.name}</span>}
+        {active && st.name && <span className="truncate text-[11px] text-ink">{st.name}</span>}
       </div>
 
       {active && !editing && (

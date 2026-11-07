@@ -159,7 +159,12 @@ export default function App() {
   const [dark, setDark] = useState(false)
   const [kind, setKind] = useState<'all' | 'dir' | 'doc' | 'img' | 'video' | 'audio' | 'zip' | 'app'>('all')
   const [days, setDays] = useState(0)
-  const [panel, setPanel] = useState<null | 'settings' | 'help' | 'about'>(null)
+  // `?panel=about` 直接打开某个面板：截图、演示录屏、排查「关于面板打不开」时用，
+  // 正常使用没有任何人会带这个参数（和 /mini 的 ?q= 预填同一类调试入口）。
+  const [panel, setPanel] = useState<null | 'settings' | 'help' | 'about'>(() => {
+    const want = new URLSearchParams(location.search).get('panel')
+    return want === 'about' || want === 'settings' || want === 'help' ? want : null
+  })
   // 语言切换后整棵界面要跟着换字：监听 i18n 派发的事件，用 key 强制重挂子组件
   const [langTick, setLangTick] = useState(0)
   // 安装时选过语言（安装器写了 lang.txt，/api/ping 会带回来）：
