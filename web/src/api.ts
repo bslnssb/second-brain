@@ -62,6 +62,24 @@ export const getStats = () => api<Stats>('/api/stats')
 export const getConfig = () => api<ConfigInfo>('/api/config')
 export const getPing = () => api<Ping>('/api/ping')
 
+/**
+ * Pro：把当前结果导出成 Excel（第 140 项）。
+ * 后端自己写文件到「文档/第二大脑导出」并定位，前端只负责提示 ——
+ * 和「右键打包」同一套做法，免得在 WebView2 里跟 blob 下载打交道。
+ * 未授权时返回 `{ ok:false, pro:true }`，不是异常。
+ */
+export type ExportResult = {
+  ok?: boolean
+  pro?: boolean
+  path?: string
+  n?: number
+  err?: string
+  k?: string
+}
+
+export const exportResults = (rows: unknown[], q: string) =>
+  api<ExportResult>('/api/export', { method: 'POST', body: JSON.stringify({ rows, q }) })
+
 /** 授权状态。字段与后端 license_core.parse_code 的返回一致，未激活时 edition='free'。 */
 export type LicenseState = {
   valid: boolean

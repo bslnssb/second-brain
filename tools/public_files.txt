@@ -19,10 +19,12 @@ sync  brain.py
 # 离线授权（第 137 项）：纯标准库 Ed25519，只有公钥进 exe；
 # 签发工具在开发根 tools/make_license.py，**不进本仓库**（私钥更不进）
 sync  license_core.py
+sync  xlsx_writer.py
 sync  setup_app.py
 sync  selftest.py
 sync  preflight.py
 sync  tests/test_settings.py
+sync  tests/test_xlsx.py
 sync  tests/test_brain_pure.py
 sync  tests/test_brain_pure2.py
 sync  tests/test_autostart_setup.py

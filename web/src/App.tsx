@@ -5,6 +5,7 @@ import { AboutModal, HelpModal, Preview, QS, SettingsDrawer, Timeline } from './
 import { setLang, t } from './lib/i18n'
 import { ContextMenu, ReverseModal, ZipToast, type MenuItem } from './ui/context'
 import { Onboarding } from './ui/onboarding'
+import { exportResults } from './api'
 import {
   IconApp,
   IconClock,
@@ -204,10 +205,27 @@ export default function App() {
   const [menu, setMenu] = useState<{ x: number; y: number; row: Row } | null>(null)
   const [reverse, setReverse] = useState<string | null>(null)
   const [toast, setToast] = useState('')
+  const [exporting, setExporting] = useState(false)
   const seq = useRef(0)
   const qEl = useRef<HTMLInputElement>(null)
 
   const syn = useMemo(() => parseQSyn(q), [q])
+
+  /** 导出当前结果（Pro，第 140 项）。后端自己写文件并定位，这里只提示。 */
+  const doExport = async () => {
+    if (!rows.length || exporting) return
+    setExporting(true)
+    try {
+      const d = await exportResults(rows, q)
+      if (d.ok) setToast(t('exp_ok').replace('{n}', String(d.n ?? rows.length)))
+      else if (d.pro) setToast(t('exp_pro'))
+      else setToast(t('exp_fail'))
+    } catch {
+      setToast(t('exp_fail'))
+    } finally {
+      setExporting(false)
+    }
+  }
 
   // 主题：跟系统（auto）或跟用户设置
   useEffect(() => {
@@ -576,6 +594,18 @@ export default function App() {
           ))}
         </div>
         <div className="ml-auto" />
+        {rows.length > 0 && (
+          <button
+            className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-sub hover:text-ink disabled:opacity-40"
+            onClick={doExport}
+            disabled={exporting}
+            title={t('exp_title')}
+            data-act="export"
+          >
+            <IconDoc size={14} />
+            {exporting ? t('exp_doing') : t('exp_btn')}
+          </button>
+        )}
         <button
           className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-sub hover:text-ink"
           onClick={cycleSort}

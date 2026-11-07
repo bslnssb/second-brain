@@ -942,6 +942,27 @@ def boot_lang():
 
 
 
+def export_dir():
+    """导出文件的落地目录：`我的文档/第二大脑导出`。
+
+    不写 app_dir()：程序可能装在 Program Files 或某个深层目录，用户点完
+    「导出」根本找不到文件在哪；也不直接扔桌面，那会把桌面弄乱。
+    Documents 在 OneDrive 重定向时可能不是默认名，所以加一层 `文档` 兜底。
+    """
+    base = Path.home() / 'Documents'
+    if not base.is_dir():
+        base = Path.home() / '文档'
+    d = base / '第二大脑导出'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _export_slug(s):
+    """把搜索词变成能当文件名的片段。Windows 文件名不许 \\ / : * ? " < > |。"""
+    s = re.sub(r'[\\/:*?"<>|\s]+', '_', str(s or '')).strip('._')
+    return (s or '结果')[:40]
+
+
 def app_dir():
 
     """放数据的地方（数据库/settings/scope）——默认是程序所在目录。
@@ -20019,6 +20040,35 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                                           ensure_ascii=False).encode()
 
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/export'):
+                # Pro（第 140 项）：把当前搜索结果导出成 Excel。
+                # 只挂**新增**功能 —— 现有 28 个 API 一个都没上锁，反锁等于口碑自杀。
+                if not license_feature('export'):
+                    body = json.dumps({'ok': False, 'pro': True},
+                                      ensure_ascii=False).encode()
+                else:
+                    rows = req.get('rows') or []
+                    if not isinstance(rows, list) or not rows:
+                        body = json.dumps({'ok': False, 'k': 'e_nothing'},
+                                          ensure_ascii=False).encode()
+                    else:
+                        try:
+                            import xlsx_writer
+                            rows = rows[:5000]
+                            q = str(req.get('q') or '').strip()[:40] or '搜索结果'
+                            p = export_dir() / ('导出_%s_%s.xlsx' % (
+                                _export_slug(q), time.strftime('%Y%m%d-%H%M%S')))
+                            p.write_bytes(xlsx_writer.build_xlsx(
+                                xlsx_writer.result_rows(rows), head=xlsx_writer.HEAD,
+                                widths=xlsx_writer.WIDTHS, sheet=q))
+                            subprocess.Popen(['explorer', '/select,', str(p)])
+                            body = json.dumps({'ok': True, 'path': str(p), 'n': len(rows)},
+                                              ensure_ascii=False).encode()
+                        except Exception as e:
+                            body = json.dumps({'ok': False, 'err': str(e)},
+                                              ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/update_apply'):
