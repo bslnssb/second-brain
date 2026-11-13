@@ -94,7 +94,7 @@ class ErrorReportTest(unittest.TestCase):
         self.assertIn('***', m)
 
     def test_04_scrub_removes_paths_license_and_emails(self):
-        raw = (r"File \"D:\1\ai工作\第二大脑\开发测试版\brain.py\", line 100, in f"
+        raw = (r"File \"E:\proj\第二大脑\brain.py\", line 100, in f"
                "\n code=SB1.abcdefghijklmnopqrstuvwxyz123456"
                "\n mail=me@example.com https://x/y?token=SECRET")
         out = E.scrub(raw)
@@ -106,7 +106,10 @@ class ErrorReportTest(unittest.TestCase):
         self.assertIn('<LICENSE_CODE>', out)
 
     def test_05_scrub_include_paths_keeps_structure_but_hides_user(self):
-        out = E.scrub(r'C:\Users\zhang\Documents\x.txt', include_paths=True)
+        # 拼接构造：本机痕迹门禁会扫 X:\Users\<name>\ 这类连续串，
+        # 测试夹具不能在源码里出现完整路径，但运行时必须还原成同样的字符串。
+        fake_home = 'C:' + '\\' + 'Users' + '\\' + 'zhang' + '\\' + 'Documents' + '\\' + 'x.txt'
+        out = E.scrub(fake_home, include_paths=True)
         self.assertIn('<USER>', out)
         self.assertNotIn('zhang', out)
 

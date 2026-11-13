@@ -148,7 +148,7 @@
   .demo p{margin:0 2px;font-size:13.5px;color:var(--sub);line-height:1.7}
   @media (max-width:760px){ .demos{grid-template-columns:1fr} }
 
-  /* ---------- 定价 ---------- */
+  /* ---------- 功能与隐私 ---------- */
   .plans{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:stretch}
   .plan{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:30px 28px;box-shadow:var(--shadow-sm);display:flex;flex-direction:column}
   .plan.pro{border-color:#c7d7fb;box-shadow:var(--shadow-md),0 0 0 4px rgba(37,99,235,.06)}
@@ -227,7 +227,7 @@
     <nav class="nav-links">
       <a href="#how">它能做什么</a>
       <a href="#demo">看效果</a>
-      <a href="#plans">免费与专业版</a>
+      <a href="#plans">全部功能免费</a>
       <a href="#faq">常见问题</a>
     </nav>
     <a class="nav-cta" href="#download">下载</a>
@@ -355,21 +355,22 @@
   </div>
 </section>
 
-<!-- 定价 -->
+<!-- 全部功能免费 -->
 <section id="plans" class="pain">
   <div class="wrap">
     <div class="section-head">
-      <p class="eyebrow">免费与专业版</p>
-      <h2>日常用，免费版就够了</h2>
+      <p class="eyebrow">全部功能免费</p>
+      <h2>装完就能用，没有需要解锁的东西</h2>
       <p class="section-lede">
-        搜索、OCR、快搜窗、右键打包——这些全部免费，没有次数限制，不会过期。
-        专业版只放「批量处理」这类工作流功能，用来养这个项目继续做下去。
+        搜索、正文全文检索、扫描件 OCR、双击 Ctrl 快搜窗、右键打包、时间线、
+        五语言界面、主题配色与全局壁纸——全部免费，没有次数限制、不会过期，
+        也不需要账号，不需要联网验证。
       </p>
     </div>
     <div class="plans">
       <div class="plan">
         <div class="plan-head">
-          <h3>免费版</h3>
+          <h3>所有功能</h3>
           <span class="price muted">一直免费</span>
         </div>
         <p class="desc">装完就能用，功能不打折。</p>
@@ -380,25 +381,26 @@
           <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg><b>扫描件 OCR</b>（自动建索引）</li>
           <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>右键打包、查重、时间线</li>
           <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>五种界面语言</li>
+          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>主题配色与全局壁纸</li>
         </ul>
-        <p class="note">没有任何功能需要「升级才能用」，也不会在某个版本突然改成收费。<br>建索引时扫描件自动识别前几页；要把整本逐页认完，用专业版的批量 OCR。</p>
+        <p class="note">所有功能装完即可使用，也不会在某个版本突然改成收费。<br>建索引时扫描件自动识别前几页，认出来的字和普通文档一样能搜。</p>
       </div>
 
       <div class="plan pro">
         <div class="plan-head">
-          <h3>专业版</h3>
-          <span class="price">定价未定</span>
+          <h3>完全在本机</h3>
+          <span class="price">不联网</span>
         </div>
-        <p class="desc">给每天要处理一整个文件夹的人。</p>
+        <p class="desc">文件、正文和索引都不出这台电脑。</p>
         <ul>
-          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#2563eb" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>搜索结果导出 Excel（已完成）</li>
-          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#2563eb" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>整本扫描件逐页识别（已完成）</li>
-          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2.6" stroke="#9aa4b8" stroke-width="1.7"/></svg>案卷 / 教案 / 合同归档模板</li>
-          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2.6" stroke="#9aa4b8" stroke-width="1.7"/></svg>多库切换（工作 / 个人分开）</li>
+          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>解析、OCR、索引全在本机完成</li>
+          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>不需要账号，也不需要联网验证</li>
+          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>索引就是一个 brain.db，删掉即彻底清除</li>
+          <li><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.4l2.6 2.6L11 4.2" stroke="#16a34a" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>本地服务只绑 127.0.0.1</li>
         </ul>
         <p class="note">
-          一次买断，不做订阅。授权码离线校验，不绑手机号、不联网验证。
-          <a href="https://github.com/bslnssb/second-brain/issues" style="color:var(--accent);font-weight:600">你需要哪个功能？告诉我</a>，我按需求排优先级。
+          没有代码签名证书，首次运行 Windows 会拦一下，点「更多信息 → 仍要运行」即可。
+          <a href="https://github.com/bslnssb/second-brain/issues" style="color:var(--accent);font-weight:600">发现问题？告诉我</a>。
         </p>
       </div>
     </div>

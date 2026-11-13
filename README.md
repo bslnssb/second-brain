@@ -48,7 +48,6 @@
 - **拼音也能搜**：`azb` 出「安装包」，`xzrs` 出「行政人事」——首字母、全拼都认，`wx` 也能找到「微信」
 - **真实系统图标**：每行是资源管理器里同一张图标（PDF 红、Word 蓝、Excel 绿、exe 是它自己的图标），不是自绘简笔
 - **中文全文检索**：≥3 字走 FTS5 trigram 倒排（带高亮），2 字中文走 bigram 倒排旁表（毫秒级），1 字降级 LIKE 兜底
-- **扫描件自动 OCR**：纯图片 PDF 自动识别前 6 页（单篇 20 秒预算），中文离线识别
 - **索引范围看得见，也改得动**：设置里能看到扫了哪几个盘、各多少条、正文收了哪些文件夹、排除了什么；范围不对直接在里面增删文件夹和排除词，保存后点一次更新即可
 - **新文件自己进库**：桌面 / 下载 / 文档与索引范围内的目录在后台被监听，新建 / 改名 / 删除约 2 秒后就能搜到（或消失）；文档被编辑后约 1 分钟内**正文**也会跟着重读；不想开着可在 `settings.json` 写 `"watch": false`（加 `"watch_body": false` 只关正文重读）
 - **维护进度跟随界面语言**：扫描 / 更新 / 重建索引 / 自检的每一句进度、每一条报错都按当前语言显示，切英文后不会突然冒中文
@@ -186,13 +185,13 @@ python scan_docs.py           # 只扫描磁盘，生成待索引清单
 cd web
 npm install
 npm run build      # 产物在 web/dist，后端直接读它
-npm test           # 35 条单元测试
+npm test           # 97 条单元测试
 ```
 
 打 exe（Windows，需 PyInstaller）：
 
 ```bash
-cd release/github
+# 打包脚本就在仓库根目录（完整流程见 tools/README.md）
 python -m PyInstaller --noconfirm --clean second-brain-app.spec && python -B stage_app.py
 python -B make_payload.py && python -m PyInstaller --noconfirm --clean SecondBrain-Setup.spec && python -B stage_setup.py
 ```
@@ -270,7 +269,7 @@ selftest.py             质量自检（合成数据）
 qa_test.py              QA 套件：边界 / 延迟 / 并发 / 泄漏
 ocr_backfill.py         把历史「提不出文本」的文件重走一遍
 web/                    前端源码（React + TypeScript + Tailwind）
-release/github/         打包脚本与安装器（PyInstaller specs）
+*.spec                 打包与安装器配置（仓库根目录）
 assets/                 README 截图与应用图标
 scope.example.json      范围配置模板
 ```

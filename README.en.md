@@ -176,13 +176,13 @@ The frontend lives in `web/` (React + TypeScript + Tailwind). Rebuild it after c
 cd web
 npm install
 npm run build      # output in web/dist, the backend serves it directly
-npm test           # 35 unit tests
+npm test           # 97 unit tests
 ```
 
 Building the exe (Windows, requires PyInstaller):
 
 ```bash
-cd release/github
+# Packaging scripts live in the repo root (see tools/README.md)
 python -m PyInstaller --noconfirm --clean second-brain-app.spec && python -B stage_app.py
 python -B make_payload.py && python -m PyInstaller --noconfirm --clean SecondBrain-Setup.spec && python -B stage_setup.py
 ```
@@ -258,7 +258,7 @@ selftest.py             quality self-test (synthetic data)
 qa_test.py              pre-release QA: edge cases / latency / concurrency / leaks
 ocr_backfill.py         re-runs OCR over previously unreadable files
 web/                    frontend source (React + TypeScript + Tailwind)
-release/github/         packaging scripts and installer (PyInstaller specs)
+*.spec                 packaging and installer specs (repo root)
 assets/                 screenshots and application icons
 scope.example.json      scope template
 ```
