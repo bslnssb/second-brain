@@ -123,6 +123,16 @@ export const IconHelp = (p: IconProps) => (
   </Svg>
 )
 
+/* 「关于」用：圆圈里一个小写 i —— 和 IconHelp（圆圈问号）同尺寸同描边，
+   左栏三个入口摆在一起时不会一个大一个小。 */
+export const IconInfo = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="10" cy="10" r="7.2" />
+    <circle cx="10" cy="6.4" r=".85" fill="currentColor" stroke="none" />
+    <path d="M10 9.2v4.4" />
+  </Svg>
+)
+
 export const IconCheck = (p: IconProps) => (
   <Svg {...p}>
     <path d="M4.4 10.4l3.6 3.6 7.6-8" />
@@ -155,6 +165,56 @@ export const IconAudio = (p: IconProps) => (
     <path d="M9 14.5V6l6-1.2v8.2" />
     <circle cx="7" cy="15" r="2" />
     <circle cx="15" cy="13.8" r="2" />
+  </Svg>
+)
+
+/* 顶栏「环境体检」：心电折线（体检＝看这台机器还活着没毛病） */
+export const IconPulse = (p: IconProps) => (
+  <Svg {...p}>
+    <rect x="2.5" y="3.5" width="15" height="13" rx="2.6" />
+    <path d="M4.8 10.4h2.4l1.3-2.6 1.7 5 1.4-3.1h3.6" />
+  </Svg>
+)
+
+/* 顶栏「错误日志 / 上报」：三角感叹号（和「关于」「帮助」区分开，别用问号） */
+export const IconAlert = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M10 3.6 17.4 16.4H2.6L10 3.6Z" />
+    <path d="M10 8.2v3.6" />
+    <circle cx="10" cy="14" r="0.65" fill="currentColor" stroke="none" />
+  </Svg>
+)
+
+/* 「赞助」用：实心心形。填充走 currentColor，颜色由调用处给（默认红心） */
+export function IconHeart({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 20 20" aria-hidden="true">
+      <path
+        d="M10 16.9C10 16.9 3 12.6 3 7.85 3 5.4 4.9 3.6 7.1 3.6c1.2 0 2.3.6 2.9 1.5.6-.9 1.7-1.5 2.9-1.5C15.1 3.6 17 5.4 17 7.85c0 4.75-7 9.05-7 9.05Z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
+/* 「体检与报错」用：圆环 + 心跳折线（健康监测的意思）。
+   为什么是圆不是方：左边「简要搜索」已经是个方框，两个方框并排在小尺寸下分不清；
+   第 188 项就是把这三个键和 − □ ✕ 摆在一排，形状得先拉开差距。 */
+export const IconHealth = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="10" cy="10" r="7.3" />
+    <path d="M2.9 10.1h3.2l1.4-3 2.4 6 1.5-2.9h5.7" />
+  </Svg>
+)
+
+/* 「赞助」用：咖啡杯（请我喝杯咖啡那种打赏），只描边不填色，
+   颜色交给 currentColor —— 用户明确说红心跟蓝白黑主题不搭。 */
+export const IconCoffee = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M3.6 5.4h9v4.4a4.5 4.5 0 0 1-9 0z" />
+    <path d="M12.6 6.6h1.4a2 2 0 0 1 0 4h-1.4" />
+    <path d="M3 16.2h11.4" />
+    <path d="M6.4 2.6v1.3M9.2 2.6v1.3" />
   </Svg>
 )
 

@@ -43,7 +43,7 @@ VSVersionInfo(
         StringStruct('FileDescription', '第二大脑 · 本地文件搜索（文件名 + 文档正文）'),
         StringStruct('FileVersion', %r),
         StringStruct('InternalName', 'SecondBrain'),
-        StringStruct('LegalCopyright', 'MIT License'),
+        StringStruct('LegalCopyright', 'PolyForm Noncommercial 1.0.0'),
         StringStruct('OriginalFilename', 'SecondBrain.exe'),
         StringStruct('ProductName', '第二大脑 (Second Brain)'),
         StringStruct('ProductVersion', %r),

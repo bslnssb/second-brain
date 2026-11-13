@@ -6,17 +6,19 @@
 scope.json / tmp / thumbs / backups / webview-profile），解压到哪个目录都是全新开始；
 程序目录只读时会自动退到 %LOCALAPPDATA%\\SecondBrain\\data，便携盘也能跑。
 
-用法（在 release/github 目录下）：
+用法（在对外仓库根目录下，即 上传的干净版/）：
     python tools/make_portable.py
-产物：..\\dist\\SecondBrain-v<版本>-portable.zip（不进 git，check_public 黑名单挡着）。
+产物：../构建产物/dist/SecondBrain-v<版本>-portable.zip（不进 git）。
 """
 import json
 import sys
 import zipfile
 from pathlib import Path
 
-root = Path('dist/SecondBrain')
-out_dir = Path('../dist')
+HERE = Path(__file__).resolve().parent          # 上传的干净版/tools
+REPO = HERE.parent                              # 上传的干净版
+root = REPO / 'dist' / 'SecondBrain'
+out_dir = REPO.parent / '构建产物' / 'dist'    # 和工作区里安装包放一起
 sep = chr(92)  # 反斜杠，避免转义麻烦
 
 # 这些是「这一台机器的状态」，绝不能打进便携版

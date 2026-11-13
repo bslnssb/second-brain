@@ -196,5 +196,49 @@ class TestVersionParse(unittest.TestCase):
         self.assertEqual(ec._ver_tuple('garbage'), (0,))
 
 
+class TestEnvMsgs(unittest.TestCase):
+    """体检文案的西/葡/印地语表（第 176 项）：键与占位符必须与英文表一一对应。
+
+    这些串走 % 格式化：少一个 %d 就是 TypeError，体检面板整块空白，
+    而「键齐了」什么都说明不了。
+    """
+
+    def test_tables_cover_three_langs(self):
+        import env_msgs
+        self.assertEqual({'es', 'pt', 'hi'}, set(env_msgs.TABLES))
+
+    def test_keys_match_english(self):
+        import env_msgs
+        for name, tb in env_msgs.TABLES.items():
+            self.assertEqual(set(ec._EN), set(tb), name)
+
+    def test_placeholders_match_english(self):
+        import re
+        import env_msgs
+        def sig(v):
+            return re.findall(r'%[sd]|%\.\d+f', v)
+        for name, tb in env_msgs.TABLES.items():
+            for k, v in tb.items():
+                self.assertEqual(sig(ec._EN[k]), sig(v), '%s.%s' % (name, k))
+
+    def test_table_picks_language(self):
+        self.assertEqual({}, ec._table('zh'))          # 中文用调用处默认值
+        self.assertEqual(ec._EN, ec._table('en'))
+        self.assertEqual(ec._EN, ec._table('fr'))      # 没翻的语言退回英文
+        self.assertEqual('Runtime de WebView2 %s', ec._table('es')['wv_ok_t'])
+        self.assertEqual('Runtime do WebView2 %s', ec._table('pt')['wv_ok_t'])
+
+    def test_judge_is_localized(self):
+        import re
+        info = mk(webview2='')
+        hi = ec.judge(info, 'hi')
+        self.assertTrue(re.search(r'[\u0900-\u097F]', hi[0]['title']), hi[0]['title'])
+        es = ec.judge(info, 'es')
+        self.assertIn('Falta', es[0]['title'])
+        # 中文仍然是默认，不能因为加了表就把中文顶掉
+        self.assertIn('WebView2', ec.judge(info)[0]['title'])
+        self.assertIn('缺少', ec.judge(info)[0]['title'])
+
+
 if __name__ == '__main__':
     unittest.main()

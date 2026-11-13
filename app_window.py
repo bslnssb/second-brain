@@ -97,7 +97,12 @@ def apply_window_icon(hwnd, ico=None):
     """把窗口图标换成我们自己的：标题栏 / Alt-Tab / 任务栏三处都读它。
 
     pywebview 的 create_window 没有 icon 参数（WinForms 外壳不转发），所以只能建完窗
-    再 WM_SETICON。小图标给 16，大图标给 0（让系统按 DPI 自己挑 256 那档）。"""
+    再 WM_SETICON。
+
+    ⚠️ 别再写 LoadImageW(..., 0, 0)：对多尺寸 .ico 它拿的是**第一张 16x16**，
+    不是注释里想当然的「系统按 DPI 挑 256」（2026-11-12 用 GetIconInfo 实测）。
+    也别把小图标写死 16：150% DPI 的任务栏要 24/32，拿 16 放大必糊。
+    这里按 GetDpiForWindow 选 ico 里最接近目标物理像素的那一档。"""
     ico = ico or icon_file()
     if not hwnd or not ico:
         return False
@@ -106,8 +111,15 @@ def apply_window_icon(hwnd, ico=None):
         u = ctypes.windll.user32
         LR_LOADFROMFILE, IMAGE_ICON, WM_SETICON = 0x10, 1, 0x0080
         u.LoadImageW.restype = ctypes.c_void_p
-        big = u.LoadImageW(0, ico, IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
-        small = u.LoadImageW(0, ico, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        try:
+            u.GetDpiForWindow.restype = ctypes.c_uint
+            dpr = (u.GetDpiForWindow(ctypes.c_void_p(hwnd)) or 96) / 96.0
+        except Exception:
+            dpr = 1.0
+        small_sz = min((16, 20, 24, 32, 40, 48), key=lambda x: abs(x - 16 * dpr))
+        big_sz = min((32, 40, 48, 64, 96, 128, 256), key=lambda x: abs(x - 32 * dpr))
+        big = u.LoadImageW(0, ico, IMAGE_ICON, big_sz, big_sz, LR_LOADFROMFILE)
+        small = u.LoadImageW(0, ico, IMAGE_ICON, small_sz, small_sz, LR_LOADFROMFILE)
         ok = False
         if big:
             u.SendMessageW(hwnd, WM_SETICON, 1, ctypes.c_void_p(big))
@@ -176,9 +188,31 @@ def _log_always(msg):
         pass
 
 
+def _startup_report(text):
+    """启动/初始化失败时先落一份本机报告（第 162 项）。
+
+    界面都起不来时，设置页里的「报告我看到的问题」根本不可达；这里直接写
+    UserFeedback 报告，下次正常启动会随其他待发报告一起补发。
+    """
+    try:
+        import error_report
+        if not (getattr(error_report, '_CTX', {}) or {}).get('dir'):
+            error_report.configure(brain.app_dir(), getattr(brain, 'VERSION', ''))
+        rid = error_report.save_feedback('启动/初始化失败：' + str(text)[:1200], True)
+        if rid:
+            _log_always('startup report saved: %s' % rid)
+        return rid or ''
+    except Exception as e:
+        _log_always('startup report failed: %r' % (e,))
+        return ''
+
+
 def _fatal(title, text):
     """窗口起不来时别让用户对着空气——弹一个能读的框，并把详情写进日志。"""
     _log_always('FATAL %s: %s' % (title, text))
+    rid = _startup_report('%s\n%s' % (title, text))
+    if rid:
+        text = '%s\n\n已保存本机报告 %s，下次正常启动会自动补发。' % (text[:1100], rid)
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(None, ('%s%s%s') % (text[:1200], chr(10), chr(10) + '日志：' + str(_log_path())),
@@ -195,6 +229,7 @@ def _die(msg):
         ctypes.windll.user32.MessageBoxW(None, msg, 'Second Brain · 第二大脑', 0x10)
     except Exception:
         print(msg)
+    _startup_report(msg)
     sys.exit(1)
 
 
@@ -302,17 +337,39 @@ def _win():
         return None, None
 
 
-def find_hwnd(title):
-    """按标题找本进程的窗口句柄（pywebview 没暴露 HWND，绕一圈拿到原生句柄）"""
+def find_hwnd(title, pid=None):
+    """按标题找窗口句柄（pywebview 没暴露 HWND，绕一圈拿到原生句柄）。
+
+    ⚠️ **必须校验进程归属**（第 181 项，踩过真坑）：以前只比标题，机器上同时
+    跑着两个实例时（用户那份 + 调试那份）会抓到**别人**的窗口 —— 实测把用户窗口
+    的 WS_CAPTION 摘掉了，自己那份却还留着系统标题栏，前端照着 ping 又画一条，
+    于是屏幕上出现两条标题栏，而且「日志说摘成功、肉眼却是坏的」。
+    默认只认本进程；要跨进程拿句柄时显式传 pid。
+    """
     try:
         import win32gui
     except Exception:
         return None
+    me = os.getpid() if pid is None else int(pid)
+    u = ctypes.windll.user32
+    u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
     hits = []
 
+    def owner(h):
+        try:
+            p = ctypes.c_ulong(0)
+            u.GetWindowThreadProcessId(ctypes.c_void_p(h), ctypes.byref(p))
+            return p.value
+        except Exception:
+            return 0
+
     def cb(h, _):
-        if win32gui.GetWindowText(h) == title and win32gui.IsWindow(h):
-            hits.append(h)
+        if win32gui.GetWindowText(h) != title or not win32gui.IsWindow(h):
+            return True
+        o = owner(h)
+        if o and o != me:
+            return True
+        hits.append(h)
         return True
 
     try:
@@ -405,6 +462,31 @@ def _monitor_info(hmon):
         if not u.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(mi)):
             return None
         r = mi.rcMonitor
+        return (int(r.left), int(r.top), int(r.right), int(r.bottom))
+    except Exception:
+        return None
+
+
+def _monitor_work(hmon):
+    """显示器**工作区**（排除任务栏）：(left, top, right, bottom)，失败 None。
+
+    和 `_monitor_info` 的区别只在取 `rcWork` 而不是 `rcMonitor` ——
+    贴边半屏必须按工作区算，否则下半截会被任务栏盖住。
+    """
+    u, wt = _win()
+    if not u or not hmon:
+        return None
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [('cbSize', wt.DWORD), ('rcMonitor', wt.RECT),
+                    ('rcWork', wt.RECT), ('dwFlags', wt.DWORD)]
+
+    try:
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(mi)
+        if not u.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(mi)):
+            return None
+        r = mi.rcWork
         return (int(r.left), int(r.top), int(r.right), int(r.bottom))
     except Exception:
         return None
@@ -510,6 +592,82 @@ def effective_dark():
     return system_dark()
 
 
+# 界面底色的两个真值，必须和 web/src/index.css 里的 --sb-bg 保持一致。
+# 为什么要从 Python 这边也知道：摘掉系统标题栏后，窗口还留着 WS_THICKFRAME 的
+# 7px 缩放边框，那圈**由 Form 的 BackColor 填**（pywebview 默认 #FFFFFF）。
+# 于是标题栏是浅灰、外面一圈纯白 —— 用户看到的就是「两层颜色」（第 184 项）。
+UI_BG_LIGHT = (244, 246, 250)      # --sb-bg: 244 246 250
+UI_BG_DARK = (24, 27, 33)          # [data-theme='dark'] --sb-bg: 24 27 33
+
+
+def ui_bg_rgb(dark=None):
+    """界面底色（RGB 三元组）。dark 传入时以它为准，否则读配置/系统。
+
+    为什么要能传：页面实际用哪套色，前端才知道（它认 localStorage.sb_theme，
+    还会跟系统 auto）。后端读 settings.json 只是**启动时**的猜测，两者平时一致、
+    用户在页面里改主题那一刻不一致 —— 所以运行期一律用前端报过来的值。
+    """
+    try:
+        d = effective_dark() if dark is None else bool(dark)
+    except Exception:
+        d = False
+    return UI_BG_DARK if d else UI_BG_LIGHT
+
+
+def ui_bg_hex(dark=None):
+    r, g, b = ui_bg_rgb(dark)
+    return '#%02X%02X%02X' % (r, g, b)
+
+
+def _hex_rgb(x):
+    """'#RRGGBB' → (r, g, b)。前端报上来的自定义配色底色用这个解析，坏值一律 None。"""
+    try:
+        t = str(x).strip().lstrip('#')
+        if len(t) != 6:
+            return None
+        return int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)
+    except Exception:
+        return None
+
+
+def paint_frame(hwnd, dark=None, bg=None):
+    """把窗口外框刷成界面底色（第 184 项）。
+
+    这里要治的是**三个不同来源**的白，缺一个都还会剩一条白边：
+    1. `DWMWA_BORDER_COLOR`（34）—— 最外那 1px 描边；
+    2. `DWMWA_CAPTION_COLOR`（35）—— 顶部那条「标题带」。样式位摘了 WS_CAPTION
+       之后，WinForms/DWM 仍会按 FormBorderStyle 在顶部留一条 caption 带，
+       **它的颜色不受 Form.BackColor 影响**，实测只能用它压（设成界面底色后白带消失）；
+    3. 左右/下三边的填充 —— 由 Form.BackColor 决定，在 create_window 里给
+       `background_color` 就定下来了。
+    Win10 不认 34/35，返回非 0，忽略即可。
+    """
+    if not hwnd:
+        return False
+    # bg 优先：主题配色（暖纸 / 夜航蓝…）不是标准深浅色，只有前端知道确切底色
+    r, g, b = bg if bg else ui_bg_rgb(dark)
+    try:
+        import ctypes
+        # COLORREF 是 0x00BBGGRR
+        v = ctypes.c_int((b << 16) | (g << 8) | r)
+        hr = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 34, ctypes.byref(v), 4)
+        # 顶部白带（caption 带）：不设这条，标题栏上方永远压着一条 8-9px 的白
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 35, ctypes.byref(v), 4)
+        try:
+            # 改完描边要立刻重画这一帧，否则滚动/拖动时旧的白边才会被覆盖掉
+            u = ctypes.windll.user32
+            u.RedrawWindow(ctypes.c_void_p(hwnd), None, None,
+                           _RDW_FRAME | _RDW_INVALIDATE | _RDW_UPDATENOW)
+        except Exception:
+            pass
+        return hr == 0
+    except Exception as e:
+        _log('paint_frame failed: %r' % (e,))
+        return False
+
+
 def dark_caption(hwnd, dark=True):
     """把系统标题栏刷成深色（Win10 1809+ 用属性 19，Win11 用 20）。
 
@@ -531,6 +689,150 @@ def dark_caption(hwnd, dark=True):
         pass
     return False
 
+
+
+# ── 自绘标题栏（第 180 项）──────────────────────────────────────────────
+# WorkBuddy / VS Code 那类 Electron 应用有 `titleBarStyle: hidden` 一行开关就能把
+# 按钮摆进标题栏；pywebview + WinForms 没有这个开关，等效做法只有一个：
+# **把系统画的标题栏摘掉**（WS_CAPTION），客户区自然顶到窗口最上面，标题栏由 HTML 画。
+# 不要再去非客户区里画（第 115 / 121 项三版全撤：DWM 会盖掉、打包后行为不一致）。
+#
+# 关键取舍 —— 只摘 WS_CAPTION，**保留** WS_THICKFRAME / WS_MAXIMIZEBOX /
+# WS_MINIMIZEBOX / WS_SYSMENU：
+#   · 拖动走 WM_NCLBUTTONDOWN(HTCAPTION)，由系统接管，Aero Snap / 双击最大化都在；
+#   · 边框缩放、DWM 阴影、任务栏缩略图都还是系统的；
+#   · 窗口仍是 WS_OVERLAPPED，最大化不会盖住任务栏（换成 WS_POPUP 才会）。
+_WS_CAPTION = 0x00C00000
+_GWL_STYLE = -16
+# SetWindowPos 标志位（用到的每个都单独命名：只写一个合成值 _SWP_FLAGS
+# 会让别的调用处误用未定义名字 —— 第 183 项就踩了，NameError 被 except 吞掉，
+# 现象是「拖动完全没反应」而日志一片正常）
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+_SWP_FRAMECHANGED = 0x0020
+_SWP_SHOWWINDOW = 0x0040
+# RedrawWindow：改完非客户区（描边 / 缩放边框底色）必须让它立刻重画
+_RDW_INVALIDATE = 0x0001
+_RDW_UPDATENOW = 0x0100
+_RDW_FRAME = 0x0400
+_SWP_FLAGS = _SWP_FRAMECHANGED | _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOZORDER
+_WM_NCLBUTTONDOWN, _HTCAPTION = 0x00A1, 2
+_SW_MINIMIZE, _SW_MAXIMIZE, _SW_RESTORE = 6, 3, 9
+
+
+def _win_ptr_funcs():
+    """64 位必须用 GetWindowLongPtrW：不设 restype 会被截成 32 位，样式位就乱了。"""
+    import ctypes
+    import ctypes.wintypes          # titlebar_* 要用 RECT，别指望别的函数先导入
+    u = ctypes.windll.user32
+    get = getattr(u, 'GetWindowLongPtrW', None) or u.GetWindowLongW
+    put = getattr(u, 'SetWindowLongPtrW', None) or u.SetWindowLongW
+    get.restype = ctypes.c_ssize_t
+    get.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    put.restype = ctypes.c_ssize_t
+    put.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+    u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    u.IsZoomed.argtypes = [ctypes.c_void_p]
+    u.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    return ctypes, u, get, put
+
+
+def caption_off(hwnd, off=True):
+    """摘掉 / 恢复系统标题栏。返回 True 表示样式位确实处于目标状态。"""
+    if not hwnd:
+        return False
+    try:
+        ctypes, u, get, put = _win_ptr_funcs()
+        h = ctypes.c_void_p(hwnd)
+        style = get(h, _GWL_STYLE)
+        _log('caption_off enter hwnd=%s style=%s off=%s' % (hex(hwnd), hex(style), off))
+        if not style:
+            return False
+        want = (style & ~_WS_CAPTION) if off else (style | _WS_CAPTION)
+        if want != style:
+            put(h, _GWL_STYLE, want)
+            u.SetWindowPos(h, None, 0, 0, 0, 0, _SWP_FLAGS)
+        # 返回**读回来的真实状态**：WinForms 会在 resize 时按 FormBorderStyle
+        # 把样式写回去，所以「发过 SetWindowLongPtr」不等于「现在是目标状态」。
+        try:
+            u.RedrawWindow(h, None, None,
+                           _RDW_FRAME | _RDW_INVALIDATE | _RDW_UPDATENOW)
+        except Exception:
+            pass
+        after = get(h, _GWL_STYLE)
+        if want != style:
+            _log('caption_off hwnd=%s before=%s want=%s after=%s off=%s'
+                 % (hex(hwnd), hex(style), hex(want), hex(after), off))
+        return bool(after & _WS_CAPTION) != bool(off)
+    except Exception as e:
+        _log('caption_off failed: %r' % (e,))
+        return False
+
+
+def recheck_caption(hwnd, delay=0.0):
+    """过一会儿再确认一次系统标题栏真的没回来（第 181 项）。
+
+    为什么需要：WinForms 会在窗口布局 / DPI 变化后按 `FormBorderStyle`
+    重新写回 `WS_CAPTION`，时机**晚于** after_start —— 源码运行时实测：
+    日志已经打过 stripped，一秒后读样式位又是 True，前端于是画出第二条标题栏。
+    这里只做「读一次、不对就重摘」，幂等、无副作用。
+    """
+    try:
+        if delay:
+            time.sleep(delay)
+        if not hwnd:
+            return False
+        return caption_off(hwnd, True)
+    except Exception as e:
+        _log('recheck_caption failed: %r' % (e,))
+        return False
+
+
+def caption_drag(hwnd):
+    """按住自绘标题栏拖动：把这一下当成「按住系统标题栏」，后面交给系统。
+    用 SendMessage 而不是 PostMessage —— 拖动循环要在这条消息里跑完。"""
+    if not hwnd:
+        return False
+    try:
+        ctypes, u, _g, _p = _win_ptr_funcs()
+        u.ReleaseCapture()
+        u.SendMessageW(ctypes.c_void_p(hwnd), _WM_NCLBUTTONDOWN, _HTCAPTION, 0)
+        return True
+    except Exception as e:
+        _log('caption_drag failed: %r' % (e,))
+        return False
+
+
+def window_cmd(hwnd, cmd):
+    """自绘标题栏三键：min / max（切换）/ restore。"""
+    if not hwnd:
+        return False
+    try:
+        ctypes, u, _g, _p = _win_ptr_funcs()
+        h = ctypes.c_void_p(hwnd)
+        if cmd == 'min':
+            u.ShowWindow(h, _SW_MINIMIZE)
+        elif cmd == 'max':
+            u.ShowWindow(h, _SW_RESTORE if u.IsZoomed(h) else _SW_MAXIMIZE)
+        elif cmd == 'restore':
+            u.ShowWindow(h, _SW_RESTORE)
+        else:
+            return False
+        return True
+    except Exception as e:
+        _log('window_cmd(%s) failed: %r' % (cmd, e))
+        return False
+
+
+def window_maximized(hwnd):
+    try:
+        ctypes, u, _g, _p = _win_ptr_funcs()
+        return bool(hwnd) and bool(u.IsZoomed(ctypes.c_void_p(hwnd)))
+    except Exception:
+        return False
 
 def round_corners(hwnd):
     """Win11 的 DWM 圆角；Win10 上这个属性号不被识别，返回非 0，忽略即可。
@@ -1086,11 +1388,20 @@ class Api:
         self._open_mini = None      # App 注入：唤出快搜窗（欢迎页按钮用）
         self._hide_main = None      # App 注入：收起详情窗（顶栏/标题栏「快搜」按钮用）
 
-    def set_dark(self, dark):
-        """页面切主题时同步系统标题栏，免得「黑内容 + 白标题栏」。"""
+    def set_dark(self, dark, bg=None):
+        """页面切主题时同步系统标题栏，免得「黑内容 + 白标题栏」。
+
+        bg 是这套配色的底色（'#RRGGBB'，第 191 项）：暖纸、夜航蓝这些自定义配色
+        既不是浅色也不是深色，只靠 dark 布尔值刷出来的框永远差一截。
+        """
         try:
-            ok = dark_caption(find_hwnd(MAIN_TITLE), bool(dark))
-            _log('set_dark(%s) → %s' % (bool(dark), ok))
+            _hw = find_hwnd(MAIN_TITLE)
+            ok = dark_caption(_hw, bool(dark))
+            # 深色开关会把 caption 色重置回系统值 → 顶部白带回来（第 184 项）。
+            # 这里必须用前端报来的 dark：页面认的是 localStorage.sb_theme，
+            # 用配置猜会在用户切主题那一刻对不上（深框套浅页）。
+            paint_frame(_hw, bool(dark), _hex_rgb(bg))
+            _log('set_dark(%s, %s) → %s' % (bool(dark), bg, ok))
             return ok
         except Exception:
             return False
@@ -1113,6 +1424,206 @@ class Api:
             return True
         except Exception:
             return False
+
+    # ── 自绘标题栏（第 180 项）──────────────────────────────────────
+    # 前端只负责画；窗口动作全在这里做。拖动必须交给系统（WM_NCLBUTTONDOWN），
+    # 自己按像素 MoveWindow 会丢掉 Aero Snap、还会和 WebView2 的刷新打架。
+    def titlebar_drag(self):
+        """按住标题栏拖动（系统接管，含贴边吸附）。"""
+        try:
+            return caption_drag(find_hwnd(MAIN_TITLE))
+        except Exception:
+            return False
+
+    def titlebar_cmd(self, cmd):
+        """min / max / close。close 走 pywebview 的 destroy，让 closing 钩子照常跑。"""
+        try:
+            c = str(cmd or '')
+            if c == 'close':
+                if self._win is not None:
+                    self._win.destroy()
+                    return True
+                return False
+            return window_cmd(find_hwnd(MAIN_TITLE), c)
+        except Exception as e:
+            _log('titlebar_cmd(%r) failed: %r' % (cmd, e))
+            return False
+
+    def titlebar_state(self):
+        """最大化状态 → 前端换 □ / ❐ 图标。"""
+        try:
+            return {'max': window_maximized(find_hwnd(MAIN_TITLE))}
+        except Exception:
+            return {'max': False}
+
+    def titlebar_rect(self):
+        """自绘标题栏拖动：返回窗口当前屏幕坐标（第 182 项）。
+
+        为什么不用 `WM_NCLBUTTONDOWN(HTCAPTION)` 那套（第 180 项的做法）：
+        它依赖系统进入 modal 拖动循环，在 pywebview 的 JS 桥线程里**实测完全不动**
+        （SendMessage 被封送到 UI 线程后拿不到拖动循环，Windows 直接吞掉）。
+        改成前端逐帧报坐标 + 这里 SetWindowPos，100% 可控、不依赖消息循环。
+        """
+        try:
+            hwnd = find_hwnd(MAIN_TITLE)
+            if not hwnd:
+                return None
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            r = ctypes.wintypes.RECT()
+            if not u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
+                return None
+            return {'x': int(r.left), 'y': int(r.top),
+                    'max': bool(u.IsZoomed(ctypes.c_void_p(hwnd)))}
+        except Exception as e:
+            # 用 _log_always：这类异常（名字写错、结构缺失）会被吞成「功能没反应」，
+            # 只在调试日志里可见等于没有 —— 必须落到常规错误日志
+            _log_always('titlebar_rect failed: %r' % (e,))
+            return None
+
+    def titlebar_restore(self, mouse_x=None):
+        """拖动开始时如果在最大化状态：先还原，再把窗口摆到鼠标下方（第 182 项）。
+
+        为什么必须处理：**最大化窗口的 SetWindowPos 会被系统忽略**，
+        用户在上面拖就会觉得「完全拖不动」——而这正是最常出现的状态。
+        还原后按鼠标在标题栏的水平位置反推窗口左上角，人手感接近原生。
+        """
+        try:
+            hwnd = find_hwnd(MAIN_TITLE)
+            if not hwnd:
+                return None
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            h = ctypes.c_void_p(hwnd)
+            if u.IsZoomed(h):
+                u.ShowWindow(h, _SW_RESTORE)
+                time.sleep(0.02)
+            r = ctypes.wintypes.RECT()
+            if not u.GetWindowRect(h, ctypes.byref(r)):
+                return None
+            w = int(r.right - r.left)
+            x = int(r.left)
+            if mouse_x is not None:
+                # 鼠标落在标题栏中间，手感对齐原生「抓住哪就从哪起」
+                x = int(mouse_x) - w // 2
+            # 夹回工作区：从最大化拖出时鼠标靠边，上面算出来会有一半在屏幕外
+            # （实测 x=-361），看着像窗口「跑丢」了
+            wa = _monitor_work(u.MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST))
+            if wa:
+                x = max(wa[0] + 8, min(x, wa[2] - w - 8))
+            u.SetWindowPos(h, None, x, int(r.top), 0, 0,
+                           _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
+            return {'x': x, 'y': int(r.top)}
+        except Exception as e:
+            _log_always('titlebar_restore failed: %r' % (e,))
+            return None
+
+    def titlebar_move(self, x, y):
+        """把窗口挪到屏幕坐标 (x, y)，尺寸不变（第 182 项）。
+
+        拖动时前端按帧调用，所以这必须是「最轻」的一条：
+        只 SetWindowPos，不重新布局、不动焦点、不触发 WebView2 刷新。
+        """
+        try:
+            hwnd = find_hwnd(MAIN_TITLE)
+            if not hwnd:
+                return False
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            u.SetWindowPos(ctypes.c_void_p(hwnd), None, int(x), int(y), 0, 0,
+                           _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
+            # 只记第一次：这一行能区分「前端没调到」和「调到了但窗口不动」
+            if not getattr(self, '_tb_move_logged', False):
+                self._tb_move_logged = True
+                _log_always('titlebar_move 首次调用 → %s,%s' % (x, y))
+            return True
+        except Exception as e:
+            _log_always('titlebar_move(%s,%s) failed: %r' % (x, y, e))
+            return False
+
+    def titlebar_snap(self):
+        """松手时贴边吸附（第 182 项）：顶上最大化、左右各半屏。
+
+        摘掉 WS_CAPTION 后系统不再提供 Aero Snap，而拖动改成了自己 SetWindowPos，
+        所以这两条得自己补。只在「贴着边缘松手」时动手，平时什么都不做。
+        容差 6px：太小了用户拖不准，太大了窗口从边缘弹开很突兀。
+        """
+        try:
+            hwnd = find_hwnd(MAIN_TITLE)
+            if not hwnd:
+                return False
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            h = ctypes.c_void_p(hwnd)
+            r = ctypes.wintypes.RECT()
+            if not u.GetWindowRect(h, ctypes.byref(r)):
+                return False
+            hmon = u.MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)
+            wa = _monitor_work(hmon)
+            if not wa:
+                return False
+            wl, wt_, wr, wb = wa
+            tol = 6
+            sw = _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_SHOWWINDOW
+            if int(r.top) <= wt_ + tol:
+                u.ShowWindow(h, _SW_MAXIMIZE)
+                return True
+            if int(r.left) <= wl + tol:
+                u.SetWindowPos(h, None, wl, wt_, (wr - wl) // 2, wb - wt_, sw)
+                return True
+            if int(r.right) >= wr - tol:
+                half = (wr - wl) // 2
+                u.SetWindowPos(h, None, wl + half, wt_, half, wb - wt_, sw)
+                return True
+            return False
+        except Exception as e:
+            _log_always('titlebar_snap failed: %r' % (e,))
+            return False
+
+    def _titlebar_guard(self):
+        """常驻守卫（第 181 项）：WinForms 会把 WS_CAPTION 写回来，且不止一次。
+
+        实测：日志已经打过 stripped，1 秒后读样式位又是 True；触发点不确定
+        （窗口 Show 之后、WebView2 布局完成、DPI 变化、用户缩放窗口……）。
+        「摘一次 + 延迟两次」覆盖不全，只能持续盯：每秒读一次样式位，
+        真被写回就重摘。
+
+        成本：平时只有一次 GetWindowLongPtr（微秒级，不碰窗口、不重绘）；
+        只有发现被写回才 SetWindowLongPtr + SetWindowPos。窗口销毁即退出。
+        """
+        import ctypes
+        hwnd = self.hwnd_main
+        if not hwnd:
+            return
+        prev_had_caption = False
+        while True:
+            time.sleep(1.0)
+            try:
+                if not self.custom_titlebar:
+                    return
+                if not ctypes.windll.user32.IsWindow(ctypes.c_void_p(hwnd)):
+                    return
+                # 先看样式位：.NET 每次写回 CAPTION，顶部那条 caption 带也会跟着
+                # 变回系统色（白）。所以「写回过」就要重刷外框底色（第 184 项）。
+                try:
+                    _g = getattr(ctypes.windll.user32, 'GetWindowLongPtrW')
+                    _g.restype = ctypes.c_ssize_t
+                    _g.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                    had = bool(_g(ctypes.c_void_p(hwnd), -16) & _WS_CAPTION)
+                except Exception:
+                    had = False
+                if not caption_off(hwnd, True):
+                    self.custom_titlebar = False
+                    _log('custom titlebar: 守卫发现样式被写回且摘不回来，退回系统标题栏')
+                    try:
+                        import brain as _b
+                        _b.TITLEBAR_ACTIVE = False
+                    except Exception:
+                        pass
+                    return
+                if had or not prev_had_caption:
+                    # 写回刚发生 / 第一轮：外框底色与 caption 带要重新压一遍
+                    paint_frame(hwnd)
+                prev_had_caption = had
+            except Exception as e:
+                _log('titlebar guard: %r' % (e,))
+                return
 
     def pick_folder(self):
         if webview is None or self._win is None:
@@ -1323,6 +1834,8 @@ class App:
         self.main_api = None
         self.mini_api = MiniApi(self)
         self.hwnd_mini = None
+        # 窗口是否摘了系统标题栏（第 180 项）：after_start 里定，别的代码只读
+        self.custom_titlebar = False
         self.hwnd_main = None
         self.tray = None
         self.mini_visible = False
@@ -1384,11 +1897,15 @@ class App:
         # 这个事件，于是「从快搜窗点展示更多 → show_main」会卡满 20 秒再抛
         # WebViewException，最后被旧的兜底逻辑丢进系统浏览器。
         # silent（开机自启）时不显示窗口，改为在 after_start 等窗口真正 shown 之后再 hide。
+        # background_color 决定 WinForms 的 BackColor —— 摘掉标题栏后，WS_THICKFRAME
+        # 留下的那圈 7px 缩放边框就是拿它填的。pywebview 默认 #FFFFFF，于是窗口四周
+        # 有一圈纯白，标题栏却是浅灰，看着像「两层」（第 184 项）。
         self.main = webview.create_window(
             MAIN_TITLE, self.main_url,
             width=MW, height=MH, x=_mx, y=_my,
             min_size=main_min_size(MW, MH),
             text_select=True, js_api=self.main_api, hidden=False,
+            background_color=ui_bg_hex(),
         )
         self.main_api._win = self.main
         self.main.events.closing += self._on_main_closing
@@ -1399,7 +1916,11 @@ class App:
             time.sleep(0.6)
             try:
                 hw = self.hwnd_main or find_hwnd(MAIN_TITLE)
-                if hw and dark_caption(hw, effective_dark()):
+                ok = bool(hw) and dark_caption(hw, effective_dark())
+                if hw:
+                    # 深色开关会重置 caption 色 → 顶部白带回来（第 184 项），必须补刷
+                    paint_frame(hw)
+                if ok:
                     _log('dark caption applied (%s)' % effective_dark())
                     return
             except Exception as e:
@@ -1589,7 +2110,42 @@ class App:
         # 现在尺寸校验收口在 _fit_main_size：它用 SetWindowPos（不改可见性）且
         # 只在 CSS 视口真的偏了才动手，所以静默启动也能安全调用 —— 不再需要
         # 「非 silent 才修正」这种按缩放/启动方式分叉的逻辑。
+        # 自绘标题栏（第 180 项）：先摘系统标题栏，再让 _fit_main_size 按新的
+        # 客户区重算 —— 反过来的话窗口会被撑高一个标题栏的高度。
+        self.custom_titlebar = False
+        if self._titlebar_enabled():
+            self.custom_titlebar = caption_off(self.hwnd_main, True)
+            if self.custom_titlebar:
+                round_corners(self.hwnd_main)
+                paint_frame(self.hwnd_main)
+                _log('custom titlebar: WS_CAPTION stripped')
+            else:
+                _log('custom titlebar: 摘除失败，退回系统标题栏')
         self._fit_main_size()
+        # ⚠️ 必须在 _fit_main_size **之后**再确认一次样式位。
+        # 实测（第 181 项）：日志已经打过 stripped，可 fit 里一旦真的 resize，
+        # WinForms 会按 FormBorderStyle 把 WS_CAPTION 原样写回来 ——
+        # 窗口又有了系统标题栏，而前端照着 ping 照画 HTML 标题栏 → **两条标题栏**。
+        # 判断「到底摘没摘」只能读样式位，不能信第一次的返回值。
+        if self.custom_titlebar:
+            if not caption_off(self.hwnd_main, True):
+                self.custom_titlebar = False
+                _log('custom titlebar: fit 后样式被写回，退回系统标题栏')
+            else:
+                # 常驻守卫（不是「延迟两次」）：实测写回不止一次，resize / DPI /
+                # 布局变化都会重新触发，所以只能持续盯
+                try:
+                    threading.Thread(target=self._titlebar_guard, daemon=True).start()
+                except Exception:
+                    pass
+        # 把「实际」结果告诉 brain：/api/ping.titlebar 必须反映窗口现状，
+        # 不能读配置 —— 用户改了开关没重启时，配置是新值、窗口是旧样式，
+        # 只看配置会出现双标题栏（第 180 项）。
+        try:
+            import brain as _b
+            _b.TITLEBAR_ACTIVE = bool(self.custom_titlebar)
+        except Exception:
+            pass
         self._dbg_autohelp()
         round_corners(self.hwnd_mini)
         soft_shadow(self.hwnd_mini)
@@ -1837,7 +2393,7 @@ class App:
         threading.Thread(target=_refocus, daemon=True).start()
 
     # -- 主窗口 -------------------------------------------------------
-    def show_main(self, q=None, panel=None):
+    def show_main(self, q=None, panel=None, focus=None):
         """从快搜窗跳过来：show 主窗口 + 设搜索词。
 
         这里【绝不能】在出错时退回 webbrowser.open。那是「窗口组件加载失败就退到
@@ -1854,6 +2410,10 @@ class App:
             qs.append('q=' + quote(q))
         if panel:
             qs.append('panel=' + panel)
+        if focus:
+            # 第 175 项：托盘「反馈 / 报错」要直接摊到错误日志那一块，
+            # 否则用户点完只看到设置页，还得自己去「更多设置」里翻。
+            qs.append('focus=' + focus)
         rel = '/web/' + ('?' + '&'.join(qs) if qs else '')
         target = self.url + rel
 
@@ -1877,6 +2437,14 @@ class App:
                 try:
                     import win32con
                     import win32gui
+                    # 最小化窗口的 IsWindowVisible() 仍返回 True，Form.Show() 也不会
+                    # 还原它（系统把窗口挪到 -32000,-32000 屏幕外）。点托盘/任务栏
+                    # 图标时日志「show_main 成功、visible_now=True、fg 是自己」全绿，
+                    # 屏幕却毫无变化 —— 2026-11-12 实测 iconic=True 复现。
+                    # 必须先 SW_RESTORE，否则下面的 topmost / 抢前台全落在屏幕外。
+                    if win32gui.IsIconic(hwnd):
+                        _log_always('show_main: 窗口处于最小化，先 SW_RESTORE 拉回屏幕')
+                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                     if not win32gui.IsWindowVisible(hwnd):
                         _log('show_main: Form.Show() 没生效，用 Win32 SW_SHOW 兜底')
                         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
@@ -1884,6 +2452,7 @@ class App:
                     _log(f'show_main: SW_SHOW fallback FAILED: {e}')
                 try:
                     dark_caption(hwnd, effective_dark())
+                    paint_frame(hwnd)        # 同上：每次显示都把外框底色压回去
                 except Exception as e:
                     _log('dark caption on show failed: %r' % (e,))
                 # 让 WebView2 重建渲染表面：给它补发一条 WM_SIZE。
@@ -1983,6 +2552,20 @@ class App:
         return brain.app_dir() / 'settings.json'
 
     @staticmethod
+    def _titlebar_enabled():
+        """自绘标题栏（第 180 项）。默认开：原生标题栏那种「按钮在窗口最左上、
+        操作在内容区中间」的割裂感用户明确不要。读不到配置也当开。"""
+        import json as _j
+        try:
+            p = App._settings_path()
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+                return bool(d.get('titlebar', True))
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
     def _hotkey_enabled():
         """读 settings.json 的 hotkey 字段。默认开；文件不存在或格式错也开。"""
         import json as _j
@@ -2056,6 +2639,10 @@ class App:
                 self.tray = None
         except Exception:
             self.tray = None
+        try:
+            _start_auto_update(self)
+        except Exception as e:
+            _log('start auto-update failed: %r' % (e,))
 
     def _dbg_autohelp(self):
         """临时诊断：SB_AUTOHELP=1 时 8 秒后自己点一次「使用帮助」，把 traceback 写进日志。"""
@@ -2074,7 +2661,7 @@ class App:
                 _log('AUTOHELP EXC: ' + traceback.format_exc().replace(chr(10), ' | '))
         threading.Thread(target=run, daemon=True).start()
 
-    def open_panel(self, name):
+    def open_panel(self, name, focus=None):
         """托盘里点「设置 / 关于 / 使用帮助」：把主窗口叫出来并直接摊开对应的面板。
 
         以前的做法是 show_main() 之后 evaluate_js 注入——那条路有两个坑：
@@ -2082,7 +2669,7 @@ class App:
         现在面板走 URL 参数，页面自己在启动时摊开，稳。
         """
         try:
-            self.show_main(panel=name)
+            self.show_main(panel=name, focus=focus)
         except Exception as e:
             _log(f'open_panel({name}) FAILED: {e}')
 
@@ -2103,33 +2690,87 @@ class App:
     def tray_about(self):
         self.open_panel('about')
 
-    def tray_feedback(self):
-        """反馈：打开 GitHub 的 issues 页。
-        没有网络/没装浏览器就退回复制联系方式，别让按钮点了没反应。"""
-        url = 'https://github.com/%s/issues' % getattr(brain, 'REPO_SLUG', 'bslnssb/second-brain')
+    def tray_balloon(self, text, title='第二大脑'):
+        """托盘气泡：不依赖 WebView，界面白屏时也能给出反馈。"""
         try:
-            import webbrowser
-            ok = webbrowser.open(url)
+            import win32con
+            import win32gui
+            win32gui.Shell_NotifyIcon(
+                win32gui.NIM_MODIFY,
+                (self.tray._hwnd, 0, win32gui.NIF_INFO, 0, None, '',
+                 title, str(text)[:220], win32con.NIIF_INFO, 6000))
         except Exception:
-            ok = False
-        if not ok:
-            try:
-                import tkinter as tk
-                r = tk.Tk(); r.withdraw()
-                r.clipboard_clear(); r.clipboard_append(url); r.update(); r.destroy()
-            except Exception:
-                pass
+            pass
+
+    def tray_feedback(self):
+        """托盘「反馈 / 报错」（第 162 项）。
+
+        这是界面白屏、点不动时唯一还能点的入口：先在本机落一份 UserFeedback 报告
+        （环境信息 + debug.log 尾部），再尽力打开设置页让用户补一句描述。
+        两条路都失败时至少气泡告诉用户「已记录」。
+        """
+        rid = ''
+        try:
+            import error_report
+            rid = error_report.save_feedback('用户从托盘「反馈 / 报错」发起（未填写描述）', True) or ''
+        except Exception as e:
+            _log(f'tray_feedback save failed: {e!r}')
+        opened = False
+        try:
+            # 第 181 项：反馈/报错已从设置里搬进独立弹窗，传 panel 反而会
+            # 先把设置摊开再叠一层，所以只传 focus
+            self.open_panel(None, 'feedback')
+            opened = True
+        except Exception as e:
+            _log(f'tray_feedback open_panel failed: {e!r}')
+        if rid and opened:
+            self.tray_balloon('已记录一份反馈报告，可在设置里补充一句描述')
+        elif rid:
+            self.tray_balloon('已记录一份反馈报告（界面暂时打不开也没关系）')
+        else:
+            self.tray_balloon('记录反馈失败，请稍后再试')
 
     def quit(self):
+        """退出：每一步都计时（第 163 项）。
+
+        实测用户右键退出要等 1~2 秒。这里先量三段：取消热键、删托盘图标、关数据库。
+        关库放到后台并最多等 300ms —— SQLite WAL 本身崩溃安全，没必要为了 checkpoint
+        让用户盯着图标等；超时就直接退出，日志里会留下 done=False 供排查。
+        """
+        t0 = time.perf_counter()
+        marks = []
+
+        def mark(name):
+            marks.append('%s=%.0fms' % (name, (time.perf_counter() - t0) * 1000))
+
         try:
             if self.hotkey:
                 self.hotkey.stop()
+            mark('hotkey')
             if self.tray:
                 self.tray.quit()
-        except Exception:
-            pass
+            mark('tray')
+        except Exception as e:
+            marks.append('tray/hotkey err=%r' % (e,))
+
+        done = threading.Event()
+
+        def _close_db():
+            try:
+                brain.conn().close()
+            except Exception:
+                pass
+            done.set()
+
         try:
-            brain.conn().close()
+            threading.Thread(target=_close_db, name='quit-close-db',
+                             daemon=True).start()
+            closed = done.wait(0.3)
+        except Exception:
+            closed = False
+        mark('db')
+        try:
+            _log_always('quit timing: %s db_done=%s' % (' '.join(marks), closed))
         except Exception:
             pass
         os._exit(0)
@@ -2595,8 +3236,80 @@ def _diagnose():
     return out
 
 
+def _feedback_cli(argv):
+    """无界面反馈（第 164 项）：`SecondBrain.exe --feedback "文字"`。
+
+    界面白屏、WebView 起不来时，设置页里的入口全不可达；这条只依赖 Python 层，
+    双击安装目录里的 `报告问题.bat` 就能把描述 + 环境信息 + debug.log 尾部发出去。
+    """
+    _attach_console()
+    text = ''
+    if '--feedback' in argv:
+        i = argv.index('--feedback')
+        rest = [a for a in argv[i + 1:] if not a.startswith('--')]
+        text = ' '.join(rest).strip()
+    if not text:
+        try:
+            print('第二大脑 · 报告问题')
+            print('  界面打不开 / 白屏 / 点了没反应时用这里。')
+            print('  描述一句话（可留空直接回车，会附环境信息与最近日志）：')
+            text = input('> ').strip()
+        except Exception:
+            text = ''
+    text = text or '界面异常（用户从命令行发起，未填写描述）'
+    try:
+        import error_report
+        if not (getattr(error_report, '_CTX', {}) or {}).get('dir'):
+            error_report.configure(brain.app_dir(), getattr(brain, 'VERSION', ''))
+        rid = error_report.save_feedback(text, True)
+        if not rid:
+            print('[x] 报告没能保存，请检查数据目录是否可写')
+            return 2
+        ok, err = error_report.send_one(rid)
+        if ok:
+            print('[√] 已发送，感谢反馈')
+            return 0
+        print('[!] 已保存在本机：%s' % rid)
+        print('    暂时没发出去（%s），下次正常启动会自动补发。' % (err or '未配置接收端'))
+        return 0
+    except Exception as e:
+        print('[x] 反馈失败：%s: %s' % (type(e).__name__, e))
+        return 3
+
+
+def _start_auto_update(app):
+    """后台自动更新（第 164 项）：启动 45s 后查一次，之后每 6 小时一次。
+
+    作者推一个 Release 即可，客户端自己发现并下载；用户只需在设置里点重启更新。
+    """
+    def work():
+        # 用户要求：启动后先查一次，再进入 6 小时间隔；不要等 45 秒
+        time.sleep(8)
+        while True:
+            try:
+                info = brain.check_update()
+                if info.get('ok') and info.get('newer'):
+                    ver = str(info.get('latest') or info.get('version') or '')
+                    _log_always('auto-update: 发现 %s，开始后台下载' % ver)
+                    r = brain.download_update(info)
+                    if r.get('ok'):
+                        _log_always('auto-update: %s 已下载，等用户重启' % ver)
+                        try:
+                            app.tray_balloon('新版本 %s 已下载，设置里点「重启更新」生效' % ver)
+                        except Exception:
+                            pass
+                    else:
+                        _log_always('auto-update: 下载失败 %r' % (r.get('k') or r,))
+            except Exception as e:
+                _log('auto-update failed: %r' % (e,))
+            time.sleep(6 * 3600)
+    threading.Thread(target=work, name='auto-update', daemon=True).start()
+
+
 def _boot():
     argv = sys.argv[1:]
+    if '--feedback' in argv:
+        sys.exit(_feedback_cli(argv))
     if any(a in ('--diagnose', '/diagnose', '-diagnose') for a in argv):
         _diagnose()
         return

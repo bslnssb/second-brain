@@ -135,9 +135,20 @@ class Tray:
         self._hicon = None
         if icon_file:
             try:
+                # 旧写法用 0,0 加默认尺寸标志，拿到系统默认 32 或第一张 16，
+                # 150% DPI 的托盘要 24/32。按系统 DPI 明确选 ico 里那一档。
+                import ctypes
+                try:
+                    _u = ctypes.windll.user32
+                    _u.GetDpiForSystem.restype = ctypes.c_uint
+                    dpr = (_u.GetDpiForSystem() or 96) / 96
+                except Exception:
+                    dpr = 1
+                sz = min((16, 20, 24, 32, 40, 48),
+                         key=lambda x: abs(x - 16 * dpr))
                 self._hicon = win32gui.LoadImage(
-                    0, icon_file, win32con.IMAGE_ICON, 0, 0,
-                    win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE)
+                    0, icon_file, win32con.IMAGE_ICON, sz, sz,
+                    win32con.LR_LOADFROMFILE)
             except Exception:
                 self._hicon = None
         if not self._hicon:
@@ -202,8 +213,10 @@ class Tray:
         def wndproc(hwnd, msg, wparam, lparam):
             if msg == WM_TRAY:
                 if lparam == win32con.WM_LBUTTONUP:
-                    _tlog('LBUTTONUP → on_main')
-                    threading.Thread(target=on_menu, args=(IDI_MAIN,), daemon=True).start()
+                    # 第 171 项：单击托盘直接开「简要搜索框」（快搜窗）。
+                    # 主推的是快搜，点一下就该能打字；详细搜索留在右键菜单里。
+                    _tlog('LBUTTONUP → on_mini')
+                    threading.Thread(target=on_menu, args=(IDI_MINI,), daemon=True).start()
                 elif lparam == win32con.WM_RBUTTONUP:
                     _tlog('RBUTTONUP → building menu')
                     try:

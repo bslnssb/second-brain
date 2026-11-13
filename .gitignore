@@ -62,3 +62,9 @@ node_modules/
 发布公告.py
 诊断.bat
 setup_app_v*_backup.py
+
+# 专业版私有模块：sync_public.py 从开发根 pro/ 复制过来供打包，绝不提交
+pro/
+pro_api.py
+ocr_batch.py
+xlsx_writer.py

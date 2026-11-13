@@ -9,6 +9,8 @@ export type Ping = {
   repo?: string
   releases?: string
   issues?: string
+  /** 国内备用下载页（本机 update_sources.json 配置，空则不显示） */
+  manual_page?: string
 }
 
 /** 设置抽屉「索引范围」用：后端 scope_report() 的输出 */
@@ -35,7 +37,17 @@ export type ConfigInfo = {
 export type TimelineItem = { p: string; n?: string; m?: number; s?: number; e?: string; t?: string }
 export type TimelineGroup = { d: string; label: string; n: number; more?: boolean; items: TimelineItem[] }
 
-export type Settings = { hotkey?: boolean; theme?: string; lang?: string }
+export type Settings = {
+  hotkey?: boolean
+  /** 旧的深浅色开关，已被 palette 取代；留着只为兼容老配置文件 */
+  theme?: string
+  /** 主题配色 id（第 191 项）：真值以 localStorage.sb_palette 为准 */
+  palette?: string
+  lang?: string
+  compat?: boolean
+  /** 自绘标题栏（第 180 项）：窗口样式开机时改，要重启才生效 */
+  titlebar?: boolean
+}
 
 type Bridge = {
   open_path?: (p: string) => Promise<boolean>
@@ -43,8 +55,16 @@ type Bridge = {
   /** 顶栏/标题栏「快搜」按钮：收起详情窗（快搜窗由 open_mini 唤起） */
   hide_main?: () => Promise<boolean>
   open_mini?: () => Promise<boolean>
-  /** 原生目录选择框。浏览器里拿不到绝对路径，批量 OCR 必须走这个桥 */
+  /** 原生目录选择框。浏览器里拿不到绝对路径，整本 OCR 入队必须走这个桥 */
   pick_folder?: () => Promise<string>
+  /** 自绘标题栏（第 180 项）：拖动交给系统（含 Aero Snap） */
+  titlebar_drag?: () => Promise<boolean>
+  /** 自绘标题栏三键：min / max / close */
+  titlebar_cmd?: (cmd: 'min' | 'max' | 'close') => Promise<boolean>
+  /** 当前是否最大化，用来决定画 □ 还是 ❐ */
+  titlebar_state?: () => Promise<{ max: boolean }>
+  /** 原生文件选择框（壁纸用；也能给别的「选一个文件」场景用） */
+  pick_file?: () => Promise<string>
 }
 
 function bridge(): Bridge | undefined {
@@ -82,7 +102,7 @@ export type ExportResult = {
 export const exportResults = (rows: unknown[], q: string) =>
   api<ExportResult>('/api/export', { method: 'POST', body: JSON.stringify({ rows, q }) })
 
-/* --------------------- Pro 2：批量 OCR 队列（第 143 项） --------------------- */
+/* --------- 批量 OCR 队列（第 143 项实现，第 148 项起免费） --------- */
 /** 免费索引只识别扫描件前几页；这个队列逐页跑完整本，写回同一个正文索引。 */
 export type OcrBatchItem = {
   p: string
@@ -130,6 +150,41 @@ export async function pickFolder(): Promise<string> {
     return ''
   }
 }
+
+/** 选一个文件拿完整路径（壁纸用）。取消或浏览器模式返回空串 */
+export async function pickFile(): Promise<string> {
+  try {
+    return (await bridge()?.pick_file?.()) || ''
+  } catch {
+    return ''
+  }
+}
+
+/* --------- 全局壁纸（第 191 项） ---------
+ * 图片只从本机读、只留在本机：后端只肯返回 `settings.json` 里记的那一张，
+ * 前端拿不到「随便读一个路径」的能力。 */
+export type WallState = {
+  on: boolean
+  name?: string
+  opacity: number
+  blur: number
+  /** 文件修改时间：换图 / 重选同一张时用它让浏览器重新取图（缓存键） */
+  v?: number
+  err?: string
+}
+
+export const getWall = () => api<WallState>('/api/wall')
+
+const wallPost = (body: unknown) =>
+  api<WallState>('/api/wall', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify(body),
+  })
+
+export const setWallFile = (path: string) => wallPost({ op: 'set', path })
+export const tuneWall = (opacity: number, blur: number) => wallPost({ op: 'tune', opacity, blur })
+export const clearWall = () => wallPost({ op: 'clear' })
 
 /** 授权状态。字段与后端 license_core.parse_code 的返回一致，未激活时 edition='free'。 */
 export type LicenseState = {
@@ -245,6 +300,7 @@ export type UpdateInfo = {
   note?: string
   norelease?: boolean
   err?: string
+  manual_page?: string
 }
 
 /** 检查更新：要连 GitHub，前端要显示「检查中…」，不要放在页面加载时调 */
@@ -288,4 +344,133 @@ export async function updateStatus(): Promise<UpdateStatus> {
     /* 后端正要退出重启时读不到，下一轮再试 */
     return {}
   }
+}
+
+
+/* -------- 索引集 / 保存搜索 / 索引诊断 / 页码（新增功能，全部免费） -------- */
+export type LibSet = {
+  id: string
+  name: string
+  files: number
+  docs: number
+  scope: string
+  active: boolean
+}
+export type LibOverview = { ok: boolean; active: string; libs: LibSet[] }
+export type LibOpResult = { ok: boolean; err?: string; lib?: { id: string; name: string } }
+export const getLibsets = () => api<LibOverview>('/api/libsets')
+export const libsetOp = (op: string, extra: Record<string, unknown> = {}) =>
+  api<LibOpResult>('/api/libsets', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ op, ...extra }),
+  })
+
+export type AllHit = { p: string; b?: string; lib: string; n: string }
+export const searchAllLibs = (q: string) =>
+  api<{ ok: boolean; q: string; hits: AllHit[] }>(`/api/libsets?q=${encodeURIComponent(q)}`)
+
+export type SavedItem = { q: string; name: string; t?: number }
+export const getSaved = () => api<{ ok: boolean; items: SavedItem[] }>('/api/saved')
+export const savedOp = (op: string, extra: Record<string, unknown> = {}) =>
+  api<{ ok: boolean; err?: string; items: SavedItem[] }>('/api/saved', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ op, ...extra }),
+  })
+
+export type Diagnose = {
+  ok: boolean
+  groups: { why: string; n: number }[]
+  items: { p: string; why: string }[]
+  total: number
+}
+export const getDiagnose = (n = 60) => api<Diagnose>(`/api/diagnose?n=${n}`)
+export const retryDiagnose = (paths: string[] = []) =>
+  api<{ ok: boolean; n: number }>('/api/diagnose', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ op: 'retry', paths }),
+  })
+
+export const getPage = (p: string, q: string) =>
+  api<{ ok: boolean; page: number | null }>(`/api/page?p=${encodeURIComponent(p)}&q=${encodeURIComponent(q)}`)
+export const openPage = (p: string, n: number) =>
+  api<{ ok: boolean; page?: number; err?: string }>(`/api/open_page?p=${encodeURIComponent(p)}&n=${n}`)
+
+
+/* -------- 常规设置：错误日志上报 / 设置备份 / 兼容模式（全部免费） -------- */
+export type ErrConf = {
+  /** 本机记录错误报告，默认开启；与「自动发送」是两件事 */
+  collect: boolean
+  auto: boolean
+  /** 开发者侧是否已配置接收端；地址本身永远不回传前端 */
+  ingest: boolean
+  include_paths: boolean
+  sent: number
+  last_error: string
+}
+export type ErrItem = { id: string; at: string; kind: string; where: string; size: number }
+export type ErrState = {
+  ok: boolean
+  conf: ErrConf
+  items: ErrItem[]
+  preview: string
+  note: string
+}
+export type ErrOpResult = ErrState & {
+  err?: string
+  text?: string
+  n?: number
+  path?: string
+  state?: ErrState
+}
+export const getErrlog = () => api<ErrState>('/api/errlog')
+export const errOp = (op: string, extra: Record<string, unknown> = {}) =>
+  api<ErrOpResult>('/api/errlog', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ op, ...extra }),
+  })
+
+/** 设置备份是二进制 zip，得走 fetch + blob，不能套 api<T>() 的 JSON 解析 */
+export async function downloadSettingsBackup(): Promise<boolean> {
+  const r = await fetch('/api/backup', { headers: { 'Sec-Fetch-Site': 'same-origin' } })
+  if (!r.ok) return false
+  const u = URL.createObjectURL(await r.blob())
+  const a = document.createElement('a')
+  a.href = u
+  a.download = 'second-brain-settings.zip'
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(u), 3000)
+  return true
+}
+export const restoreSettingsBackup = (data: string) =>
+  api<{ ok: boolean; err?: string; restored?: string[]; backup_dir?: string }>('/api/backup', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ data }),
+  })
+
+/** 环境体检（第 172 项）：后端 /api/env 早就把「问题 + 修复建议」算好了，
+ *  这里只是把它接到界面上。level ∈ OK / INFO / WARN / FAIL。 */
+export type HealthItem = {
+  level: 'OK' | 'INFO' | 'WARN' | 'FAIL'
+  key: string
+  title: string
+  detail?: string
+  fix?: string
+}
+export type Health = {
+  ok: boolean
+  msg?: string
+  issues?: HealthItem[]
+  plan?: string[]
+  text?: string
+}
+export const getHealth = (force = false, lang = 'zh') => {
+  const q = new URLSearchParams()
+  if (force) q.set('force', '1')
+  q.set('lang', lang)
+  return api<Health>(`/api/env?${q.toString()}`)
 }

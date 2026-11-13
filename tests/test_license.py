@@ -282,5 +282,79 @@ class TestBrainIntegration(unittest.TestCase):
         self.assertTrue(st['clock_warn'])
 
 
+class 机器绑定(unittest.TestCase):
+    """第 170 项：u 以 hw: 开头的码绑定机器，换机必须拒签。"""
+
+    SEED = bytes.fromhex('9d61b19deffd5a60ba844af492ec2cc4'
+                         '4449c5697b326919703bac031cae7f60')
+
+    def setUp(self):
+        self.pub = L.public_key(self.SEED).hex()
+
+    def test_hwid_稳定且是16位hex(self):
+        a, b = L.hwid(), L.hwid()
+        self.assertEqual(a, b, '同一台机器两次结果必须一致')
+        self.assertEqual(len(a), 16)
+        self.assertTrue(all(c in '0123456789abcdef' for c in a), a)
+
+    def test_bind_ident_前缀(self):
+        self.assertTrue(L.bind_ident('abcdef0123456789').startswith('hw:'))
+
+    def test_绑定码本机通过(self):
+        h = L.hwid()
+        code = L.make_code(self.SEED, name='张三', ident=L.bind_ident(h), exp='2030-01-01')
+        self.assertTrue(L.parse_code(code, self.pub, hwid=h)['valid'])
+
+    def test_绑定码换机拒签(self):
+        code = L.make_code(self.SEED, ident=L.bind_ident('0123456789abcdef'))
+        res = L.parse_code(code, self.pub, hwid='fedcba9876543210')
+        self.assertFalse(res['valid'])
+        self.assertEqual(res['reason'], 'hwid')
+
+    def test_绑定码不传hwid也拒(self):
+        """调用方漏传 hwid 时必须拒绝，不能静默放行。"""
+        code = L.make_code(self.SEED, ident=L.bind_ident('0123456789abcdef'))
+        self.assertEqual(L.parse_code(code, self.pub)['reason'], 'hwid')
+
+    def test_老码不受影响(self):
+        """已经发出去的码 u 是自由文本，加了绑定校验后必须仍然可用。"""
+        code = L.make_code(self.SEED, ident='a@b.com', exp='2030-01-01')
+        self.assertTrue(L.parse_code(code, self.pub, hwid=L.hwid())['valid'])
+
+    def test_绑定码改ident会验签失败(self):
+        code = L.make_code(self.SEED, ident=L.bind_ident('0123456789abcdef'))
+        parts = code.split('.')
+        raw = __import__('zlib').decompress(L._b64d(parts[1])).replace(
+            b'0123456789abcdef', b'ffffffffffffffff')
+        forged = 'SB1.' + L._b64e(__import__('zlib').compress(raw, 9)) + '.' + parts[2]
+        self.assertEqual(L.parse_code(forged, self.pub, hwid='f' * 16)['reason'],
+                         'signature')
+
+
+class 在线核销降级(unittest.TestCase):
+    """第 170 项：没端点 / 网络挂了都不能挡住已通过本地验签的用户。"""
+
+    def setUp(self):
+        import brain
+        self.brain = brain
+
+    def test_无端点直接offline(self):
+        from unittest import mock
+        with mock.patch.object(self.brain.error_report, 'ingest_config',
+                               return_value={'enabled': False, 'url': ''}):
+            st, why = self.brain._license_online('SB1.x.y')
+        self.assertEqual(st, 'offline')
+        self.assertIn('endpoint', why)
+
+    def test_网络异常也降级(self):
+        from unittest import mock
+        with mock.patch.object(self.brain.error_report, 'ingest_config',
+                               return_value={'url': 'https://example.invalid/ingest?token=abc'}), \
+             mock.patch.object(self.brain.urllib.request, 'urlopen',
+                               side_effect=OSError('boom')):
+            st, _ = self.brain._license_online('SB1.x.y')
+        self.assertEqual(st, 'offline')
+
+
 if __name__ == '__main__':
     unittest.main()

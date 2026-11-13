@@ -1,4 +1,4 @@
-/** 批量 OCR 面板（Pro 2）的前端契约测试。
+/** 整本 OCR 面板的前端契约测试（第 148 项起免费）。
  *
  * 不测 OCR 本身，测三件容易悄悄坏掉的事：
  * 未授权时别把队列控件露出来、运行中进度与当前文件名真的显示、
@@ -52,7 +52,7 @@ describe('OcrBatchModal', () => {
     vi.unstubAllGlobals()
   })
 
-  it('未授权时只显示 Pro 说明和去激活按钮', () => {
+  it('私有模块缺失时显示说明和关于入口', () => {
     render(
       <OcrBatchModal open onClose={() => {}} status={null} pro rows={[]}
         onRefresh={() => {}} onOpenAbout={() => {}} />,

@@ -18,7 +18,8 @@ JSON 字段：
     v  格式版本（当前 1）
     t  类型：pro / trial / team
     n  署名（显示用，可空）
-    u  标识（邮箱/手机后四位，可空，只用于对账）
+    u  标识（可空）。**以 hw: 开头时表示绑定机器**：`hw:<16 位 hex>`
+       由 license_core.hwid() 算出，激活时本机指纹必须一致，否则拒签。
     e  到期日 YYYY-MM-DD，空字符串 = 永久
     i  签发时间 YYYYMMDDTHHMM
     f  功能位列表，["*"] 表示全部
@@ -215,7 +216,7 @@ def _result(valid, reason, payload=None, edition=EDITION_FREE):
     }
 
 
-def parse_code(code, pubkey_hex, today=None):
+def parse_code(code, pubkey_hex, today=None, hwid=None):
     """校验授权码，返回结构化结果（永不抛异常）。
 
     today: 'YYYY-MM-DD'，测试用；默认取本机日期。
@@ -253,10 +254,70 @@ def parse_code(code, pubkey_hex, today=None):
         if day > exp:
             return _result(False, 'expired', payload)
 
+    # 机器绑定（第 170 项）：u 以 hw: 开头就必须和本机指纹一致。
+    # 老码的 u 是自由文本（邮箱/后四位），不受影响 —— 向后兼容，不会把已发的码废掉。
+    ident = str(payload.get('u') or '')
+    if ident.startswith('hw:'):
+        want = ident[3:].strip().lower()
+        got = str(hwid or '').strip().lower()
+        if not got or got != want:
+            return _result(False, 'hwid', payload)
+
     kind = payload.get('t') or 'pro'
     if kind not in ('pro', 'trial', 'team'):
         return _result(False, 'format')
     return _result(True, 'ok', payload, edition=EDITION_PRO)
+
+
+def hwid():
+    """本机指纹：CPU 型号 + 系统盘卷序列号 + 主板标识，SHA-256 前 16 位（第 170 项）。
+
+    只求「同一台机器稳定、换机就变」，不求防伪造 —— 本地校验本来就挡不住改代码，
+    这一步的目的是让「一个码发给十个人」失效，而不是防逆向。
+
+    任何一项取不到就跳过；全取不到时返回空串，此时 `hw:` 绑定一律拒绝
+    （宁可让作者手动补签，也不静默放过）。
+    """
+    import hashlib
+    parts = []
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           'HARDWARE' + chr(92) + 'DESCRIPTION' + chr(92) + 'System'
+                           + chr(92) + 'CentralProcessor' + chr(92) + '0')
+        parts.append(str(winreg.QueryValueEx(k, 'ProcessorNameString')[0]).strip())
+        winreg.CloseKey(k)
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+        vol = wintypes.DWORD(0)
+        ctypes.windll.kernel32.GetVolumeInformationW.restype = wintypes.BOOL
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p('C:' + chr(92)), None, 0, ctypes.byref(vol),
+            None, None, None, 0)
+        if ok:
+            parts.append('%08X' % vol.value)
+    except Exception:
+        pass
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           'SYSTEM' + chr(92) + 'CurrentControlSet' + chr(92)
+                           + 'Control' + chr(92) + 'SystemInformation')
+        parts.append(str(winreg.QueryValueEx(k, 'ComputerHardwareId')[0]))
+        winreg.CloseKey(k)
+    except Exception:
+        pass
+    if not parts:
+        return ''
+    return hashlib.sha256('|'.join(parts).encode('utf-8')).hexdigest()[:16]
+
+
+def bind_ident(hwid_hex=None):
+    """把本机指纹包成 payload 的 u 字段值，签码时传给 ident。"""
+    return 'hw:' + (hwid_hex or hwid())
 
 
 def days_left(exp, today=None):

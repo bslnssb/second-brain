@@ -20,6 +20,11 @@ if not exe.exists():
           flush=True)
     sys.exit(2)
 
+# 界面打不开时的兜底入口（第 164 项）：随包分发，双击即可上报
+bat = root / '报告问题.bat'
+if not bat.exists():
+    bat.write_bytes(Path('报告问题.bat').read_bytes())
+
 n = 0
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     for p in root.rglob('*'):

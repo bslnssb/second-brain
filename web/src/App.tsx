@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { dirName, fmtSize, fmtTime, midName, sortItems, SORT_KEYS, type Hit, type SortKey } from './lib/hits'
 import { parseQSyn } from './lib/qsyn'
-import { AboutModal, HelpModal, Preview, QS, SettingsDrawer, Timeline } from './ui/panels'
+import { AboutModal, DiagnosticsModal, HelpModal, Preview, SettingsDrawer, SupportModal, Timeline, timelineCaption, WhyNotFoundModal } from './ui/panels'
+import { TitleBar } from './ui/titlebar'
 import { OcrBatchModal } from './ui/ocrbatch'
 import { setLang, t } from './lib/i18n'
 import { ContextMenu, ReverseModal, ZipToast, type MenuItem } from './ui/context'
 import { Onboarding } from './ui/onboarding'
-import { exportResults, getOcrBatch, type OcrBatchStatus } from './api'
+import { exportResults, getOcrBatch, getPage, getWall, openPage, savedOp, type OcrBatchStatus, type WallState } from './api'
+import { applyPalette, hasOwnVars, paletteBgHex, readPalette } from './lib/palette'
+import { Wallpaper } from './ui/appearance'
 import {
   IconApp,
   IconClock,
@@ -19,7 +22,10 @@ import {
   IconList,
   IconZip,
   IconGear,
+  IconHealth,
+  IconCoffee,
   IconHelp,
+  IconInfo,
   IconSearch,
   IconMini,
   IconVideo,
@@ -159,6 +165,10 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [picked, setPicked] = useState(0)
   const [dark, setDark] = useState(false)
+  /** 主题配色（第 191 项）：auto/light/dark + 12 套独立配色，全部免费 */
+  const [palette, setPalette] = useState<string>(() => readPalette())
+  /** 全局壁纸（第 191 项）：只记「开没开、多显、多糊」，图片本身由后端读本机文件 */
+  const [wall, setWall] = useState<WallState>({ on: false, opacity: 15, blur: 0 })
   const [kind, setKind] = useState<'all' | 'dir' | 'doc' | 'img' | 'video' | 'audio' | 'zip' | 'app'>('all')
   const [days, setDays] = useState(0)
   // `?panel=about` 直接打开某个面板：截图、演示录屏、排查「关于面板打不开」时用，
@@ -169,6 +179,19 @@ export default function App() {
       ? (want as 'settings' | 'help' | 'about' | 'ocr')
       : null
   })
+  /** 「为什么搜不到」弹窗（第 187 项）：从设置里搬出来，帮助面板一个按钮直达 */
+  const [whyOpen, setWhyOpen] = useState(false)
+  /** 自绘标题栏（第 180 项）：和 Python 摘系统标题栏读的是同一个开关 */
+  const [customTitle, setCustomTitle] = useState(false)
+  /** 体检与报错弹窗（第 181 项）：独立显示，不再跳设置 */
+  const [diagOpen, setDiagOpen] = useState(false)
+  /** 赞助弹窗（第 185 项）：打赏从「关于」里独立出来，标题栏/顶栏一个键直达 */
+  const [supportOpen, setSupportOpen] = useState(false)
+  /** 时间轴天数 + 条数：说明行搬到顶栏后由 App 持有（第 179 项） */
+  const [tlDays, setTlDays] = useState(14)
+  const [tlTotal, setTlTotal] = useState(0)
+  /** 非 0 即「从使用帮助重看教程」的时间戳（第 171 项） */
+  const [tourReplay, setTourReplay] = useState(0)
   // 语言切换后整棵界面要跟着换字：监听 i18n 派发的事件，用 key 强制重挂子组件
   const [langTick, setLangTick] = useState(0)
   // 安装时选过语言（安装器写了 lang.txt，/api/ping 会带回来）：
@@ -182,19 +205,48 @@ export default function App() {
       })
       .catch(() => {})
   }, [])
+  // 自绘标题栏（第 180 项）：/api/ping 的 titlebar 来自 settings.json，和 Python
+  // 启动时摘不摘系统标题栏是同一个值。这里必须**无条件**问一次，不能挂在语言那一支上
+  // （用户在本机选过语言时那一支会提前 return）。
+  useEffect(() => {
+    fetch('/api/ping')
+      .then((r) => r.json())
+      .then((v) => setCustomTitle(!!(v && v.titlebar)))
+      .catch(() => {})
+  }, [])
+
+  // 弹窗遮罩的下边界（第 189 项）：窗口最顶上那 8-9px 是 **DWM 画的 caption 带**，
+  // 不在网页里，遮罩盖不到它。遮罩要是连网页里的标题栏一起压暗，就会出现
+  // 「一条发白 + 一条发灰」的双层（用户截图指出）。所以把标题栏高度告诉 CSS，
+  // 遮罩从标题栏底下开始画：上面保持窗口底色，下面照常变暗。
+  // 写在 documentElement 上而不是根 div：导览用 createPortal 挂到 body，
+  // 挂在根 div 上它继承不到。
+  useEffect(() => {
+    document.documentElement.style.setProperty('--sb-title', customTitle ? '36px' : '0px')
+  }, [customTitle])
+
   // 托盘「关于/设置/帮助」会带 ?panel= 打开新界面：这里接住并清掉参数
   useEffect(() => {
     // cfg 是旧模板对「设置」的叫法，这里兼容一下（托盘以前传的就是 cfg）；
     // 老文档里还有 ?cfg=1 这种写法，一并认下来，别让链接悄悄失效
     const m = /[?&]panel=(help|about|settings|ocr|cfg)/.exec(location.search)
     const legacyCfg = /[?&]cfg=1(&|$)/.test(location.search)
-    if (m || legacyCfg) {
+    // focus=feedback/health 直接开「体检与报错」弹窗（第 181 项）；
+    // focus=why 直接开「为什么搜不到」弹窗（第 187 项）——
+    // 这两块都已经不在设置里了，还往设置跳等于绕远路。
+    const fm = /[?&]focus=(feedback|why|health)/.exec(location.search)
+    if (fm) {
+      if (fm[1] === 'why') setWhyOpen(true)
+      else setDiagOpen(true)
+    }
+    if ((m || legacyCfg) && fm?.[1] !== 'feedback' && fm?.[1] !== 'health') {
       setPanel(
         (m && m[1] !== 'cfg' ? m[1] : 'settings') as
           'help' | 'about' | 'settings' | 'ocr',
       )
-      history.replaceState(null, '', location.pathname)
     }
+    // 参数一律清掉：留着的话刷新一次会再弹一遍弹窗（focus=feedback 就是这种）
+    if (m || legacyCfg || fm) history.replaceState(null, '', location.pathname)
   }, [])
   useEffect(() => {
     const h = () => setLangTick((x) => x + 1)
@@ -206,7 +258,7 @@ export default function App() {
   const [view, setView] = useState<'list' | 'grid'>(() =>
     localStorage.getItem('sb_view') === 'grid' ? 'grid' : 'list',
   )
-  const [menu, setMenu] = useState<{ x: number; y: number; row: Row } | null>(null)
+  const [menu, setMenu] = useState<{ x: number; y: number; row: { p: string } } | null>(null)
   const [reverse, setReverse] = useState<string | null>(null)
   const [toast, setToast] = useState('')
   const [exporting, setExporting] = useState(false)
@@ -234,11 +286,12 @@ export default function App() {
     }
   }
 
-  /** 批量 OCR 队列状态（Pro 2）。面板开着 1 秒一刷，关着 5 秒一刷 ——
+  /** 整本 OCR 队列状态（第 148 项起免费）。面板开着 1 秒一刷，关着 5 秒一刷 ——
    *  后者只为让工具栏那个小圆点还准，关掉面板任务本身一直在后台跑。 */
   const refreshOcr = useCallback(() => {
     getOcrBatch()
       .then((d) => {
+        // d.pro 只可能是「公开源码版没有 pro/ 私有包」，不是收费墙
         if (d.pro) { setOcrPro(true); setOcr(null) }
         else { setOcrPro(false); setOcr(d) }
       })
@@ -251,18 +304,23 @@ export default function App() {
     return () => window.clearInterval(id)
   }, [ocrOpen, refreshOcr])
 
-  // 主题：跟系统（auto）或跟用户设置
+  // 主题配色（第 191 项）：auto = 跟随系统，其余是固定配色。
+  // 只在这里写 DOM —— 别处一律调 applyTheme，否则两处各写一遍必然走味。
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)')
     const apply = () => {
-      const want = localStorage.getItem('sb_theme') || 'auto'
-      const isDark = want === 'dark' || (want === 'auto' && mq.matches)
-      document.documentElement.dataset.theme = isDark ? 'dark' : 'light'
-      setDark(isDark)
+      const { dark } = applyPalette(palette, mq.matches)
+      setDark(dark)
     }
     apply()
     mq.addEventListener('change', apply)
     return () => mq.removeEventListener('change', apply)
+  }, [palette])
+
+  // 壁纸（第 191 项）：图片本身由后端按 settings.json 里的路径读，
+  // 前端只要「开没开 / 多显 / 多糊」这几项。
+  useEffect(() => {
+    getWall().then(setWall).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -278,26 +336,67 @@ export default function App() {
     const over = (e: DragEvent) => {
       e.preventDefault()
     }
-    const drop = (e: DragEvent) => {
-      e.preventDefault()
-      let p = ''
+    /** 从拖拽事件里榨出真实路径（第 171 项）。
+     *
+     *  WebView2 不暴露 File.path（那是 Electron 独有的），所以以前只读 text/plain；
+     *  而资源管理器拖文件时 text/plain 常常是空的，只有 text/uri-list 带 file:///。
+     *  三条都试一遍，再不行走原生选择框兜底 —— 绝不给一句「不是本地路径」就完事。
+     */
+    const pathOf = (e: DragEvent): string => {
       try {
-        const f = e.dataTransfer?.files?.[0]
-        if (f) p = (f as File & { path?: string; fullPath?: string }).path || (f as File & { fullPath?: string }).fullPath || ''
+        const f = e.dataTransfer?.files?.[0] as (File & { path?: string }) | undefined
+        if (f?.path) return f.path
       } catch {
-        /* 拿不到文件对象就退回 text/plain */
+        /* 没有 File.path 很正常，继续往下试 */
       }
-      if (!p) {
+      for (const kind of ['text/uri-list', 'text/plain']) {
         try {
-          p = e.dataTransfer?.getData('text/plain') || ''
+          const all = e.dataTransfer?.getData(kind) || ''
+          // uri-list 可能多行、第一行可能是 # 注释；逐行找带盘符/UNC 的那条
+          for (const line of all.split(/\r?\n/)) {
+            let v = line.trim()
+            if (!v || v.startsWith('#')) continue
+            if (v.toLowerCase().startsWith('file:')) {
+              v = v.slice(5)
+              while (v.startsWith('/')) v = v.slice(1)
+            }
+            try {
+              v = decodeURIComponent(v)
+            } catch {
+              /* 已经是明文就跳过解码 */
+            }
+            // D:////a////b 或 D:/a/b，或 \\\\server\\share\\a
+            if (/^[a-zA-Z]:[\\/]/.test(v) || v.startsWith('\\\\')) return v
+          }
         } catch {
-          p = ''
+          /* 某些类型读不了，忽略 */
         }
       }
-      p = p.replace(/^file:\/\/\//, '')
-      // 盘符 + 反斜杠或斜杠：D:\a\b.txt 或 D:/a/b.txt
-      if (/^[a-zA-Z]:[\\/]/.test(p)) setReverse(p)
-      else setToast('拖进来的不是本地文件路径')
+      return ''
+    }
+
+    const drop = (e: DragEvent) => {
+      e.preventDefault()
+      const p = pathOf(e)
+      if (p) {
+        setReverse(p)
+        return
+      }
+      // 拿不到路径：让主进程弹原生文件选择框，用户选一次就好
+      const api = (window as { pywebview?: { api?: { pick_file?: () => Promise<string> } } })
+        .pywebview?.api
+      if (api?.pick_file) {
+        setToast(t('rev_pick'))
+        api
+          .pick_file()
+          .then((q) => {
+            if (q) setReverse(q)
+            else setToast('')
+          })
+          .catch(() => setToast(''))
+      } else {
+        setToast(t('rev_pick'))
+      }
     }
     window.addEventListener('dragover', over)
     window.addEventListener('drop', drop)
@@ -317,25 +416,53 @@ export default function App() {
     () => (localStorage.getItem('sb_scope') as 'all' | 'name' | 'body') || 'all',
   )
 
-  const applyTheme = useCallback((t: string) => {
-    localStorage.setItem('sb_theme', t)
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const isDark = t === 'dark' || (t === 'auto' && mq.matches)
-    document.documentElement.dataset.theme = isDark ? 'dark' : 'light'
-    setDark(isDark)
+  // 换配色：立刻生效 + 记到 localStorage（applyPalette 里做）+ 报给后端存一份。
+  // 后端那份只为了「下次启动时窗口外框颜色别闪」——真正的准星永远是 localStorage。
+  const applyTheme = useCallback((id: string) => {
+    setPalette(id)
+    void api('/api/settings', { method: 'POST', body: JSON.stringify({ palette: id }) }).catch(() => {})
   }, [])
 
   // 深色变化同步系统标题栏（第 45 项）。React 主界面从没接过这个桥——旧模板时代
   // 标题栏能跟着变深，换 React 后一直靠后端启动时读 settings.json 兜底；
   // 桥不可用（浏览器模式）时静默跳过。
+  //
+  // ⚠️ 不能只在挂载时试一次：`window.pywebview.api` 是 pywebview 注入的，
+  // 首屏 effect 跑的时候它往往还没到，`?.()` 静默跳过 → 窗口外框永远停在启动时
+  // 的那个颜色（深色页套一圈浅色外框，第 184 项）。所以要等 `pywebviewready`
+  // 再补一次，并最多轮询 5 秒兜底。
   useEffect(() => {
-    try {
-      const api = (window as unknown as { pywebview?: { api?: { set_dark?: (d: boolean) => void } } }).pywebview?.api
-      api?.set_dark?.(dark)
-    } catch {
-      /* 浏览器模式没有原生桥 */
+    type W = { pywebview?: { api?: { set_dark?: (d: boolean, bg?: string | null) => void } } }
+    // 自定义配色不是标准深浅色：窗口外框必须拿到**这套配色的底色**，
+    // 否则「暖纸」页面会套一圈冷灰边（第 184 项踩过的那三个白/灰来源之一）。
+    const bg = hasOwnVars(palette) ? paletteBgHex(palette, window.matchMedia('(prefers-color-scheme: dark)').matches) : null
+    let done = false
+    const push = () => {
+      try {
+        const api = (window as unknown as W).pywebview?.api
+        if (!api?.set_dark) return false
+        api.set_dark(dark, bg)
+        done = true
+        return true
+      } catch {
+        return false
+      }
     }
-  }, [dark])
+    if (push()) return
+    const onReady = () => {
+      push()
+    }
+    window.addEventListener('pywebviewready', onReady)
+    const id = window.setInterval(() => {
+      if (push() || done) window.clearInterval(id)
+    }, 300)
+    const stop = window.setTimeout(() => window.clearInterval(id), 5000)
+    return () => {
+      window.removeEventListener('pywebviewready', onReady)
+      window.clearInterval(id)
+      window.clearTimeout(stop)
+    }
+  }, [dark, palette])
 
   // 首启建完库：页脚数字和时间轴要立刻跟上，否则用户搜到了、下面还写着 0
   const onFirstIndexed = useCallback(() => {
@@ -503,7 +630,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [shown, picked, cycleSort, panel, menu, reverse])
 
-  const menuItems = (row: Row): MenuItem[] => [
+  const menuItems = (row: { p: string }): MenuItem[] => [
     { label: t('ctx_open'), onClick: () => void openRow(row.p) },
     {
       label: t('ctx_reveal'),
@@ -555,6 +682,12 @@ export default function App() {
       },
     },
     {
+      label: t('ex_ctx_save'),
+      onClick: () => {
+        if (q.trim()) void savedOp('add', { q: q.trim() }).catch(() => {})
+      },
+    },
+    {
       label: t('ctx_zip'),
       onClick: async () => {
         try {
@@ -572,10 +705,40 @@ export default function App() {
     },
   ]
 
+  // 切到简要搜索：唤起快搜窗 → 收起详情窗。标题栏和顶栏两个入口共用。
+  const openMini = () => {
+    try {
+      const api = (window as unknown as {
+        pywebview?: { api?: { open_mini?: () => void; hide_main?: () => void } }
+      }).pywebview?.api
+      api?.open_mini?.()
+      setTimeout(() => api?.hide_main?.(), 120)
+    } catch {
+      /* 浏览器里没有原生桥，安静失败 */
+    }
+  }
+
   const n = (v: number) => v.toLocaleString()
 
   return (
-    <div key={langTick} className="flex h-full flex-col bg-bg text-ink">
+    <>
+      {/* 全局壁纸（第 191 项）：铺在界面底下。开着时根容器底色去掉，
+          侧栏/顶栏/列表（本来都是透明的）就能透出图片；卡片和弹窗是实色，文字不受影响。 */}
+      <Wallpaper wall={wall} />
+      <div
+        key={langTick}
+        className="relative z-10 flex h-full flex-col bg-bg text-ink"
+        style={wall.on ? { background: 'transparent' } : undefined}
+      >
+      {/* 自绘标题栏（第 180 项）：只有 /api/ping.titlebar 为真才画 —— 那时 Python
+          已经把系统标题栏摘掉了，画不出来就是没有标题栏的死窗口 */}
+      {customTitle && (
+        <TitleBar
+          onMini={openMini}
+          onDiag={() => setDiagOpen(true)}
+          onSupport={() => setSupportOpen(true)}
+        />
+      )}
       {/* 顶栏 */}
       <header className="flex flex-col gap-2 px-4 pb-2 pt-3">
         <div className="relative">
@@ -599,7 +762,9 @@ export default function App() {
             </button>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        {/* flex-wrap：顶栏右侧现在有 5 个图标按钮，窄窗口下必须能换行，
+            否则会被裁掉（第 178 项加体检/报错时实测 640px 宽会溢出） */}
+        <div className="flex flex-wrap items-center gap-2">
         <div className="flex h-8 shrink-0 items-center rounded-lg border border-line p-0.5 text-[12px]">
           {(['all', 'name', 'body'] as const).map((k) => (
             <button
@@ -617,6 +782,30 @@ export default function App() {
             </button>
           ))}
         </div>
+        {/* 时间轴说明行搬到这里（第 179 项）：原来它单独占一行，
+            「全部/文件名/正文」这一行中间空着一大片。窄窗口下可截断/换行。 */}
+        {!q.trim() && (
+          <>
+            <span className="min-w-0 truncate text-[11px] text-sub" title={timelineCaption(tlDays, tlTotal)}>
+              {timelineCaption(tlDays, tlTotal)}
+            </span>
+            <div className="flex shrink-0 items-center gap-1">
+              {([7, 30] as const).map((d) => (
+                <button
+                  key={d}
+                  onClick={() => setTlDays(d)}
+                  className={`rounded-md border px-1.5 py-[2px] text-[11px] ${
+                    tlDays === d
+                      ? 'border-accent/60 text-accent'
+                      : 'border-line text-sub hover:text-ink'
+                  }`}
+                >
+                  {t(d === 7 ? 'd7' : 'd30')}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
         <div className="ml-auto" />
         {rows.length > 0 && (
           <button
@@ -630,18 +819,6 @@ export default function App() {
             {exporting ? t('exp_doing') : t('exp_btn')}
           </button>
         )}
-        <button
-          className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-sub hover:text-ink"
-          onClick={() => setPanel('ocr')}
-          title={t('ocr_title')}
-          data-act="ocr-open"
-        >
-          <IconDoc size={14} />
-          {t('ocr_btn')}
-          {ocr?.run === 'running' && (
-            <span className="ml-0.5 inline-block h-1.5 w-1.5 rounded-full bg-accent" />
-          )}
-        </button>
         <button
           className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-sub hover:text-ink"
           onClick={cycleSort}
@@ -682,24 +859,45 @@ export default function App() {
         >
           <IconHelp size={15} />
         </button>
-        <button
-          data-act="mini"
-          onClick={() => {
-            // 切到简要搜索：唤起快搜窗，再把详细窗收起（原生桥不可用时什么都不做）
-            try {
-              const api = (window as unknown as { pywebview?: { api?: { open_mini?: () => void; hide_main?: () => void } } }).pywebview?.api
-              api?.open_mini?.()
-              setTimeout(() => api?.hide_main?.(), 120)
-            } catch {
-              /* ignore */
-            }
-          }}
-          title={t('hdr_mini')}
-          aria-label={t('hdr_mini')}
-          className="grid h-9 w-9 place-items-center rounded-lg border border-line text-sub hover:text-ink"
-        >
-          <IconMini size={15} />
-        </button>
+        {/* 快搜：有自绘标题栏时它已经在标题栏里，这里不重复（第 180 项） */}
+        {!customTitle && (
+          <button
+            data-act="mini"
+            onClick={openMini}
+            title={t('hdr_mini')}
+            aria-label={t('hdr_mini')}
+            className="grid h-9 w-9 place-items-center rounded-lg border border-line text-sub hover:text-ink"
+          >
+            <IconMini size={15} />
+          </button>
+        )}
+        {/* 体检与报错（第 181 项）：合成**一个文字按钮**。原来两颗纯图标，
+            用户原话「不然其他人不知道这个按钮是干嘛的」，所以带字。
+            点了开独立弹窗，不再跳设置。 */}
+        {!customTitle && (
+          <button
+            data-act="diag"
+            onClick={() => setDiagOpen(true)}
+            title={t('diag_title')}
+            aria-label={t('diag_title')}
+            className="grid h-9 w-9 place-items-center rounded-lg border border-line text-sub hover:text-ink"
+          >
+            <IconHealth size={15} />
+          </button>
+        )}
+        {/* 赞助（第 185 项）：没有自绘标题栏时（或摘标题栏失败）顶栏必须有入口，
+            否则打赏就彻底找不到了。第 188 项起也是纯图标，跟旁边一排同尺寸。 */}
+        {!customTitle && (
+          <button
+            data-act="support"
+            onClick={() => setSupportOpen(true)}
+            title={t('sp_title')}
+            aria-label={t('sp_title')}
+            className="grid h-9 w-9 place-items-center rounded-lg border border-line text-sub hover:text-ink"
+          >
+            <IconCoffee size={15} />
+          </button>
+        )}
         <button
           className="grid h-9 w-9 place-items-center rounded-lg border border-line text-sub hover:text-ink"
           onClick={() => setPanel('settings')}
@@ -734,22 +932,22 @@ export default function App() {
 
       <div className="relative mt-2 flex min-h-0 flex-1">
       {/* 侧栏筛选 */}
-      <aside className="flex w-[150px] shrink-0 flex-col overflow-auto border-r border-line px-2 pb-2 text-[13px]">
-        <div className="px-1 pb-1 pt-1 text-[11px] text-sub">{t('type')}</div>
+      <aside className="flex w-[172px] shrink-0 flex-col overflow-auto border-r border-line px-2.5 pb-3 text-[13px]">
+        <div className="px-1.5 pb-1.5 pt-2 text-[12px] text-sub">{t('type')}</div>
         {([
-          ['all', t('kinds'), <IconGrid size={14} />],
-          ['dir', t('kind_dir'), <IconFolder size={14} />],
-          ['doc', t('kind_doc'), <IconDoc size={14} />],
-          ['img', t('kind_img'), <IconImage size={14} />],
-          ['video', t('kind_video'), <IconVideo size={14} />],
-          ['audio', t('kind_audio'), <IconAudio size={14} />],
-          ['zip', t('kind_zip'), <IconZip size={14} />],
-          ['app', t('kind_app'), <IconApp size={14} />],
+          ['all', t('kinds'), <IconGrid size={16} />],
+          ['dir', t('kind_dir'), <IconFolder size={16} />],
+          ['doc', t('kind_doc'), <IconDoc size={16} />],
+          ['img', t('kind_img'), <IconImage size={16} />],
+          ['video', t('kind_video'), <IconVideo size={16} />],
+          ['audio', t('kind_audio'), <IconAudio size={16} />],
+          ['zip', t('kind_zip'), <IconZip size={16} />],
+          ['app', t('kind_app'), <IconApp size={16} />],
         ] as const).map(([k, label, ic]) => (
           <button
             key={k}
             onClick={() => setKind(k)}
-            className={`mb-0.5 flex w-full items-center gap-2 rounded px-1.5 py-[5px] text-left ${
+            className={`mb-1 flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[13.5px] ${
               kind === k ? 'bg-card text-ink' : 'text-sub hover:text-ink'
             }`}
           >
@@ -757,63 +955,50 @@ export default function App() {
             {label}
           </button>
         ))}
-        <div className="mx-1 mt-2 border-t border-line pt-2 text-[11px] text-sub">{t('time')}</div>
+        <div className="mx-1.5 mt-2.5 border-t border-line pb-1.5 pt-2.5 text-[12px] text-sub">{t('time')}</div>
         {([[0, t('days_all')], [1, t('today')], [7, t('d7')], [30, t('d30')], [365, t('year')]] as const).map(([d, label]) => (
           <button
             key={d}
             onClick={() => setDays(d)}
-            className={`mb-0.5 flex w-full items-center gap-2 rounded px-1.5 py-[5px] text-left ${
+            className={`mb-1 flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[13.5px] ${
               days === d ? 'bg-card text-ink' : 'text-sub hover:text-ink'
             }`}
           >
             <span className={days === d ? 'text-accent' : ''}>
-              <IconClock size={14} />
+              <IconClock size={16} />
             </span>
             {label}
           </button>
         ))}
-        {/* 侧栏语法速览：这些前缀直接写进搜索框生效（点击插入并聚焦）。
-            原来的「路径包含」输入框删掉了——那是另一套本地过滤，和搜索语法并存
-            让人以为语法不好使；要按路径过滤就写 `词尾/` 限定文件夹或 `-排除`。 */}
-        <div className="mx-1 mt-2 border-t border-line pt-2 text-[11px] text-sub">{t('help_qs')}</div>
-        <div className="mx-1 mt-1 flex flex-wrap gap-1 pb-1">
-          {QS().map(([syn, desc]) => (
-            <button
-              key={syn}
-              title={desc}
-              onClick={() =>
-                setQ((prev) => (prev.trim() ? prev.trimEnd() + ' ' + syn + ' ' : syn + ' '))
-              }
-              className="rounded bg-card px-1.5 py-0.5 font-mono text-[10.5px] text-sub hover:text-accent hover:outline hover:outline-line"
-            >
-              {syn}
-            </button>
-          ))}
-        </div>
-        {([['help', t('help')], ['settings', t('settings')], ['about', t('about')]] as const).map(([k, label]) => (
+        {/* 语法速览已收进「使用帮助」：主界面重复一遍只是噪音（第 171 项）。
+            三个入口原来只有文字：比上面「类型 / 时间」两组少一列图标、行高也更矮，
+            看着像忘了画（第 190 项用户："弄个图标吧，不然感觉有点丑"）。
+            现在图标、行高、左内边距和上面两组完全对齐，只保留「不是筛选、不带选中态」。 */}
+        <div className="mx-1.5 mb-2 mt-3 border-t border-line" />
+        {([
+          ['help', t('help'), <IconHelp size={16} />],
+          ['settings', t('settings'), <IconGear size={16} />],
+          ['about', t('about'), <IconInfo size={16} />],
+        ] as const).map(([k, label, ic]) => (
           <button
             key={k}
             onClick={() => setPanel(k)}
-            className="mb-0.5 flex w-full rounded px-1.5 py-1 text-left text-sub hover:text-ink"
+            className="mb-1 flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[13.5px] text-sub hover:text-ink"
           >
+            {ic}
             {label}
           </button>
         ))}
-        <div className="mt-auto pt-3 text-[10px] leading-4 text-sub">
-          <div className="mx-1 border-t border-line pt-2">
-            <b className="font-medium text-ink">{n(stats.files)}</b> {t('files_indexed')}
-          </div>
-          <div className="mx-1">
-            <b className="font-medium text-ink">{n(stats.docs)}</b> {t('docs_indexed')}
-          </div>
-          <div className="mx-1 mt-1 opacity-70">{ver}</div>
-        </div>
+        {/* 文件和正文数量不在这里重复：右下角状态栏一直显示（第 173 项） */}
       </aside>
 
       {/* 列表 */}
-      <div className="min-w-0 flex-1 overflow-auto">
+      {/* 外层只管布局、不滚；真正的滚动交给 main。原因：时间轴的列头在 main 里
+          `sticky top-0`，若滚动发生在 main 的**父级**，sticky 会跟着内容一起走
+          （最近 14 天那种没有搜索词时列头一滚就没，第 179 项用户实测）。 */}
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {q.trim() && (
-          <div className="sticky top-0 z-[1] flex items-center gap-2 border-b border-line bg-bg px-2 py-1 text-[11px] text-sub">
+          <div className="z-[1] flex shrink-0 items-center gap-2 border-b border-line bg-bg px-2 py-1 text-[11px] text-sub">
             <span className="w-4 shrink-0" />
             <span className="min-w-0 flex-1">{t('col_name')}</span>
             <span className="w-24 shrink-0">{t('col_type')}</span>
@@ -825,12 +1010,15 @@ export default function App() {
         {!q.trim() && (
           <Timeline
             key={reload}          /* 首启建库完成后 onIndexed 会 +1，这里强制重取时间轴 */
+            days={tlDays}
+            onTotal={setTlTotal}
             onPick={(p) => openRow(p)}
             kind={kind}
             sort={sort}
             view={view}
             selected={tlRow?.p}
             onHover={(r) => setTlRow({ ...r, ty: 'file' } as Row)}
+            onMenu={(e, p) => setMenu({ x: e.clientX, y: e.clientY, row: { p } })}
           />
         )}
 
@@ -929,7 +1117,22 @@ export default function App() {
                       </span>
                     )}
                   </span>
-                  <span className="w-24 shrink-0 truncate text-[11px] text-sub">{typeLabel(r)}</span>
+                  {r.ty === 'hit' && /\.pdf$/i.test(r.p) ? (
+                    <button
+                      className="w-24 shrink-0 truncate text-left text-[11px] text-accent hover:underline"
+                      onClick={async (e) => {
+                        e.stopPropagation()
+                        try {
+                          const pr = await getPage(r.p, q)
+                          if (!pr.page) { setToast(t('ex_page_none')); return }
+                          await openPage(r.p, pr.page)
+                          setToast(t('ex_page_open').replace('{n}', String(pr.page)))
+                        } catch { setToast(t('ex_page_none')) }
+                      }}
+                    >{t('ex_page_btn')}</button>
+                  ) : (
+                    <span className="w-24 shrink-0 truncate text-[11px] text-sub">{typeLabel(r)}</span>
+                  )}
                   <span className="w-20 shrink-0 text-right text-[11px] text-sub">{fmtSize(r.s)}</span>
                   <span className="w-28 shrink-0 text-right font-mono text-[11px] text-sub">{fmtTime(r.m)}</span>
                 </div>
@@ -984,11 +1187,18 @@ export default function App() {
       <SettingsDrawer
         open={panel === 'settings'}
         onClose={() => setPanel(null)}
-        onTheme={applyTheme}
+        palette={palette}
+        onPalette={applyTheme}
+        wall={wall}
+        onWall={setWall}
         onRefreshed={() => {
           api<Stats>('/api/stats').then(setStats).catch(() => {})
           setToast('维护任务跑完了')
         }}
+        currentQ={q}
+        onPickSearch={(x) => setQ(x)}
+        onOpenOcr={() => setPanel('ocr')}
+        ocrRunning={ocr?.run === 'running'}
       />
       </div>
 
@@ -996,8 +1206,23 @@ export default function App() {
       {reverse && <ReverseModal path={reverse} onClose={() => setReverse(null)} />}
       {toast && <ZipToast text={toast} onClose={() => setToast('')} />}
 
-      <HelpModal open={panel === 'help'} onClose={() => setPanel(null)} />
-      <AboutModal open={panel === 'about'} onClose={() => setPanel(null)} />
+      <DiagnosticsModal open={diagOpen} onClose={() => setDiagOpen(false)} />
+      {/* 为什么搜不到（第 187 项）：帮助里点按钮直接弹，不再跳设置 */}
+      <WhyNotFoundModal open={whyOpen} onClose={() => setWhyOpen(false)} />
+      {/* 赞助（第 185 项）：自带弹窗，和「关于」平级。关于里点按钮也会走这里 */}
+      <SupportModal open={supportOpen} onClose={() => setSupportOpen(false)} />
+      <HelpModal open={panel === 'help'} onClose={() => setPanel(null)}
+        onWhyNotFound={() => { setPanel(null); setWhyOpen(true) }}
+        onReplayTour={() => setTourReplay(Date.now())} />
+      <AboutModal
+        open={panel === 'about'}
+        onClose={() => setPanel(null)}
+        onSupport={() => {
+          // 先关关于再开赞助：两个都是 z-30 的遮罩，叠在一起会互相压住
+          setPanel(null)
+          setSupportOpen(true)
+        }}
+      />
       <OcrBatchModal
         open={ocrOpen}
         onClose={() => setPanel(null)}
@@ -1009,7 +1234,8 @@ export default function App() {
       />
 
       {/* 首启引导：装完第一次打开自动建库（老用户 need=false，完全无感） */}
-      <Onboarding onOpenSettings={() => setPanel('settings')} onIndexed={onFirstIndexed} />
+      <Onboarding replay={tourReplay} onOpenSettings={() => setPanel('settings')}
+        onIndexed={onFirstIndexed} />
 
       {/* 页脚 */}
       <footer className="flex items-center gap-3 border-t border-line px-3 py-1.5 text-[11px] text-sub">
@@ -1037,6 +1263,7 @@ export default function App() {
           <IconGrid size={13} />
         </span>
       </footer>
-    </div>
+      </div>
+    </>
   )
 }

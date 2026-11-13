@@ -17,7 +17,7 @@ from pathlib import Path
 APP_ZH = '第二大脑'
 APP_EN = 'Second Brain'
 DIR_NAME = 'SecondBrain'   # 安装目录固定英文名，不跟界面语言变
-VERSION = '0.9.53'
+VERSION = '0.9.55'
 
 SILENT = os.environ.get('SB_SILENT') == '1'
 NO_LAUNCH = os.environ.get('SB_NO_LAUNCH') == '1'

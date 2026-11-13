@@ -7,6 +7,9 @@
   --sb-line: 226 231 240;
   --sb-accent: 37 99 235;
   --sb-side: 107 116 136;
+  /* 自绘标题栏的高度：弹窗遮罩从这条线往下画，别盖住标题栏（第 189 项）。
+     默认 0px（没有自绘标题栏时遮罩照旧铺满整窗），App 按 /api/ping.titlebar 改。 */
+  --sb-title: 0px;
 }
 
 [data-theme='dark'] {

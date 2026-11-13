@@ -14,6 +14,10 @@
     5. 体积：单文件 ≤ 3 MB（截图最大 0.6 MB），防止有人把 exe 或 db 塞进来
     6. 重复内容（同 sha 的两份文件）—— 以前的 icon.ico 就在根层和 assets/ 各存了一份
 
+    另外还有 1b/1c 两条私有模块边界：私有实现不能出现在 git 索引里，
+    也不能留在 HEAD 提交树中。后者只提醒不判失败 —— 本地「删除未 commit」
+    是允许的中间态，但必须明确说出来，免得把「索引干净」当成「已私有化」。
+
 为什么要有这个脚本：v0.9.44 把作者的私人笔记当成用户手册提交了，还打进了安装包。
 靠记性不可靠，靠一条命令可靠。
 
@@ -41,6 +45,17 @@ SELF_SKIP = {
     'tools/sync_public.py',
     '.github/workflows/privacy.yml',
 }
+
+# 私有实现相关路径：pro/ 包，以及分离前留在公开仓库顶层的实现与测试。
+# 1b 查索引、1c 查已提交树，两处共用同一份名单。
+PRIVATE_PATHS = frozenset((
+    'pro_api.py', 'ocr_batch.py', 'xlsx_writer.py',
+    'tests/test_ocr_batch.py', 'tests/test_xlsx.py',
+))
+
+
+def is_private_path(p: str) -> bool:
+    return p.startswith('pro/') or p in PRIVATE_PATHS
 
 # 索引库 / 扫描清单 / 私人笔记 / 日志 / 运行期配置：这些出现在仓库里就是事故
 BAD_NAMES = [
@@ -103,7 +118,7 @@ def load_words():
 
 
 def parse_manifest():
-    out = {'sync': [], 'local': [], 'build': []}
+    out = {'sync': [], 'local': [], 'build': [], 'private': []}
     for i, line in enumerate(MANIFEST.read_text(encoding='utf-8').splitlines(), 1):
         s = line.strip()
         if not s or s.startswith('#'):
@@ -174,6 +189,27 @@ def main():
     for need in REQUIRED:
         if need not in files:
             problems.append('缺必需文件：%s' % need)
+
+    # 1b) 专业版私有模块绝不能出现在公开仓库（打包副本靠 .gitignore 排除）
+    for f in files:
+        if is_private_path(f):
+            problems.append('私有模块泄漏进公开仓库：%s —— git rm --cached 并加 .gitignore' % f)
+    gi = (REPO / '.gitignore').read_text(encoding='utf-8')
+    if 'pro/' not in gi:
+        problems.append('.gitignore 没排除 pro/（打包副本会被误提交）')
+
+    # 1c) 已提交树（HEAD）也得干净。1b 只看索引：本地 git rm --cached 之后
+    #     索引会变干净，但 HEAD 提交树里可能还留着旧 Pro 实现，容易把
+    #     「索引干净」误当成「已经私有化」。CI 用干净检出（索引 = HEAD 树），
+    #     1b 自己就会硬失败，所以这里只给显式提醒，不让本地中间态把体检弄红；
+    #     真要清掉已推送的历史得重写 + 强推，那是人的决定，不是脚本能替做的。
+    head = [p for p in run_git('ls-tree', '-r', '--name-only', 'HEAD').splitlines() if p.strip()]
+    head_leaked = [f for f in head if is_private_path(f)]
+    if head_leaked:
+        warnings.append(
+            'HEAD 提交树仍含旧 Pro 实现：%s —— 本地删除只是 staged，还没 commit；'
+            'push 前必须 commit，清已推送历史需重写 + 强推'
+            % '、'.join(head_leaked[:8]))
 
     # 2) 黑名单文件名
     for f in files:

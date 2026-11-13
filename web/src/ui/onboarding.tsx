@@ -47,6 +47,8 @@ type Settings = {
 type Props = {
   onOpenSettings: () => void
   onIndexed: (files: number) => void
+  /** 非 0 即「从使用帮助重看教程」：绕过 welcome_seen，直接放欢迎页（第 171 项） */
+  replay?: number
 }
 
 // Sec-Fetch-* 是 Fetch 规范的 forbidden header：JS 手动设置会被浏览器忽略。
@@ -141,7 +143,7 @@ function MockRecent() {
   )
 }
 
-export function Onboarding({ onOpenSettings, onIndexed }: Props) {
+export function Onboarding({ onOpenSettings, onIndexed, replay = 0 }: Props) {
   const [phase, setPhase] = useState<'boot' | 'hidden' | 'welcome' | 'run' | 'done' | 'error'>('boot')
   const [st, setSt] = useState<FirstRun>({})
   const [paused, setPaused] = useState(false)
@@ -150,6 +152,15 @@ export function Onboarding({ onOpenSettings, onIndexed }: Props) {
 
   useEffect(() => {
     let alive = true
+    // 重看教程：不看 welcome_seen，也不去碰建库流程，直接放欢迎页
+    if (replay) {
+      finished.current = false
+      setMarkErr(false)
+      setPhase('welcome')
+      return () => {
+        alive = false
+      }
+    }
     const boot = async () => {
       try {
         const [d, cfg] = await Promise.all([
@@ -181,7 +192,7 @@ export function Onboarding({ onOpenSettings, onIndexed }: Props) {
     return () => {
       alive = false
     }
-  }, [])
+  }, [replay])
 
   // 建库中轮询
   useEffect(() => {
@@ -366,7 +377,10 @@ export function Onboarding({ onOpenSettings, onIndexed }: Props) {
   }
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-auto bg-black/30 p-4">
+    <div
+      className="fixed inset-x-0 bottom-0 z-50 flex items-center justify-center overflow-auto bg-black/30 p-4"
+      style={{ top: 'var(--sb-title, 0px)' }}
+    >
       <div className="max-h-[94vh] w-[760px] max-w-[96vw] overflow-auto rounded-2xl border border-line bg-bg p-6 shadow-2xl">
         <div className="text-[19px] font-semibold">{t('ob_welcome')}</div>
         <div className="mt-1 text-[12.5px] leading-relaxed text-sub">

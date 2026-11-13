@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""把开发根里「该公开的东西」按清单同步到 release/github，并把不该出现的东西报出来。
+"""把开发根里「该公开的东西」按清单同步到 上传的干净版，并把不该出现的东西报出来。
 
 为什么要有这个脚本（2026-11-06）：
-    以前发版前要手工 `cp brain.py setup_app.py release/github/`、
-    `cp -r web/src/. release/github/web/src/`、`cp -r web/dist ...`，
+    以前发版前要手工 `cp brain.py setup_app.py 上传的干净版/`、
+    `cp -r web/src/. 上传的干净版/web/src/`、`cp -r web/dist ...`，
     每次都得在脑子里过一遍「哪些该传、哪些不能传」——漏一次就把本机路径或私人笔记
     传上去了（v0.9.44 那次真发生了，`使用说明.md` 是我自己的笔记本）。
     现在清单写在 tools/public_files.txt，一条命令搞定，判断成本为零。
@@ -23,9 +23,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent          # release/github/tools
-REPO = HERE.parent                              # release/github  ← 公开仓库根
-DEV = REPO.parent.parent                        # 项目根        ← 开发目录
+HERE = Path(__file__).resolve().parent          # 上传的干净版/tools
+REPO = HERE.parent                              # 上传的干净版  ← 对外仓库根
+DEV = REPO.parent / '开发测试版'                # 开发测试版    ← 源码与运行数据
 MANIFEST = HERE / 'public_files.txt'
 
 # 仓库里允许存在、但清单不必逐条列出的东西（git 自己 + 构建产物 + 缓存）
@@ -42,8 +42,8 @@ def sha(p: Path) -> str:
 
 
 def parse_manifest():
-    """返回 {'sync': [...], 'local': [...], 'build': [...]}，值为清单里的原始模式。"""
-    out = {'sync': [], 'local': [], 'build': []}
+    """返回 {'sync','local','build','private'}，值为清单里的原始模式。"""
+    out = {'sync': [], 'local': [], 'build': [], 'private': []}
     for i, line in enumerate(MANIFEST.read_text(encoding='utf-8').splitlines(), 1):
         s = line.strip()
         if not s or s.startswith('#'):
@@ -152,15 +152,56 @@ def main():
             else:
                 same.append(rel)
 
+    # ── 专业版私有模块：镜像到打包工作区，但绝不进 git ──
+    # 公开源码版没有 pro/ 包，brain.py 会把 Pro 入口关掉；这里的副本只给
+    # PyInstaller 打 exe 用。stale 文件按镜像清掉，避免旧实现被打进包。
+    for pattern in mf['private']:
+        # 别把 __pycache__ 一起镜像过去：那是本机编译产物，不是源码，
+        # 混进打包工作区还会让 stale 清理每次都报一堆无关项。
+        files = [f for f in expand(DEV, pattern)
+                 if '__pycache__' not in f and not f.endswith(('.pyc', '.pyo'))]
+        if not files:
+            missing.append(pattern + '  （开发根 pro/ 不存在，打包会缺 Pro）')
+            continue
+        if pattern.endswith('/'):
+            dst_root = REPO / pattern.rstrip('/')
+            src_set = set(files)
+            if dst_root.is_dir():
+                for stale_file in sorted(dst_root.rglob('*')):
+                    if not stale_file.is_file():
+                        continue
+                    rel = stale_file.relative_to(REPO).as_posix()
+                    if rel not in src_set:
+                        stale.append(rel)
+                        if not args.dry_run:
+                            stale_file.unlink()
+        for rel in files:
+            src, dst = DEV / rel, REPO / rel
+            if not dst.is_file() or sha(src) != sha(dst):
+                updated.append(rel)
+                if not args.dry_run:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(src.read_bytes())
+            else:
+                same.append(rel)
+
     # ── 仓库侧：跟踪文件必须全部被清单覆盖 ──
     all_pat = mf['sync'] + mf['local'] + mf['build']
     tr = tracked()
+    leaked = sorted(p for p in tr if p.startswith('pro/') or p in
+                    ('pro_api.py', 'ocr_batch.py', 'xlsx_writer.py'))
+    if leaked:
+        print('\n[!] 私有模块被 git 跟踪（先 git rm --cached 再同步）：')
+        for q in leaked:
+            print('   ', q)
+        return 4
     orphan = sorted(p for p in tr if not covered(p, all_pat))
     absent = [p for p in mf['local'] if not p.endswith('/') and not (REPO / p).is_file()]
     absent += [p for p in mf['local'] if p.endswith('/') and not (REPO / p).is_dir()]
 
-    print('清单：%d 条 sync / %d 条 local / %d 条 build' %
-          (len(mf['sync']), len(mf['local']), len(mf['build'])))
+    print('清单：%d 条 sync / %d 条 local / %d 条 build / %d 条 private' %
+          (len(mf['sync']), len(mf['local']), len(mf['build']),
+           len(mf['private'])))
     print('开发根：%s\n公开仓库：%s\n' % (DEV, REPO))
     for label, items in (('新增', added), ('更新', updated), ('清掉的旧构建文件', stale),
                          ('缺失', missing),

@@ -101,7 +101,11 @@ export function ReverseModal({ path, onClose }: { path: string; onClose: () => v
 
   const name = baseName(path)
   return (
-    <div className="absolute inset-0 z-30 grid place-items-center bg-black/20" onClick={onClose}>
+    <div
+      className="absolute inset-x-0 bottom-0 z-30 grid place-items-center bg-black/20"
+      style={{ top: 'var(--sb-title, 0px)' }}
+      onClick={onClose}
+    >
       <div
         role="dialog"
         aria-label={t('rev_title')}

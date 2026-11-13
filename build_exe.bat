@@ -3,6 +3,9 @@ rem 编码说明：GBK(ANSI) + CRLF，不要改成 UTF-8。
 setlocal
 cd /d "%~dp0"
 
+echo 先同步：公开仓库 + 私有 pro/ 镜像（漏同步会把旧实现打进 exe）...
+python tools/sync_public.py || goto :fail
+
 echo [1/2] 打包完整版（含 OCR / PDF / Office 解析）...
 python gen_version.py || goto :fail
 python -m PyInstaller --noconfirm --clean second-brain-app.spec || goto :fail

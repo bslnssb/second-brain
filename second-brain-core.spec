@@ -35,7 +35,8 @@ datas += [('assets/icon.ico', 'assets')]
 
 # hotkey / tray 在函数里 import（进程起来才装钩子和托盘），显式列出避免漏收
 hiddenimports += ['pypdf', 'scan_docs', 'selftest', 'hotkey', 'tray', 'pypinyin',
-                  'license_core', 'xlsx_writer', 'ocr_batch',
+                  'license_core', 'libsets', 'pro', 'pro.pro_api', 'pro.ocr_batch', 'pro.xlsx_writer',
+                  'error_report', 'settings_backup',  # 错误日志 / 设置备份
                   'pythoncom', 'win32com.client',
                   'win32gui', 'win32api', 'win32con', 'win32process', 'win32file']
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { t } from '../lib/i18n'
 import { ErrorBoundary } from './errorboundary'
 
 function Boom(): never {
@@ -8,7 +9,9 @@ function Boom(): never {
 
 describe('ErrorBoundary', () => {
   afterEach(() => {
+    cleanup()
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   it('正常时原样渲染子树', () => {
@@ -29,6 +32,32 @@ describe('ErrorBoundary', () => {
       </ErrorBoundary>,
     )
     expect(screen.getByText('boom-from-render')).toBeTruthy()
-    expect(screen.getByRole('button')).toBeTruthy()
+    // 第 162 项起兜底页有两个按钮：重新载入 + 报告此问题
+    expect(screen.getAllByRole('button')).toHaveLength(2)
+    expect(screen.getByText(t('eb_report'))).toBeTruthy()
+  })
+
+  it('点「报告此问题」会把错误写进本机报告（op=feedback）', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const fn = vi.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ ok: true, conf: {}, items: [], preview: '', note: '' }),
+    }))
+    vi.stubGlobal('fetch', fn)
+    render(
+      <ErrorBoundary>
+        <Boom />
+      </ErrorBoundary>,
+    )
+    fireEvent.click(screen.getByText(t('eb_report')))
+    await waitFor(() => {
+      expect(fn).toHaveBeenCalled()
+      const [, init] = fn.mock.calls[0] as unknown as [string, RequestInit]
+      const body = JSON.parse(String(init.body))
+      expect(body.op).toBe('feedback')
+      expect(body.text).toContain('boom-from-render')
+    })
+    expect(await screen.findByText(t('eb_reported'))).toBeTruthy()
+    vi.unstubAllGlobals()
   })
 })

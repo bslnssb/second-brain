@@ -52,7 +52,14 @@ import apprank
 
 import license_core
 
-import ocr_batch
+try:
+    from pro import pro_api
+except ModuleNotFoundError as e:
+    # pro 包整体不存在 = 公开源码版，正常降级为免费。
+    # 包内某个模块缺失是打包事故，不能静默吞掉，否则会变成「装了 exe 却没 Pro」。
+    if e.name != 'pro':
+        raise
+    pro_api = None
 
 import scan_docs
 
@@ -61,6 +68,8 @@ import sqlite3
 import subprocess
 
 import sys
+
+_B = sys.modules[__name__]   # 传给私有 pro_api 的能力上下文
 
 import threading
 
@@ -78,9 +87,9 @@ from pathlib import Path
 
 
 
-APP_VERSION = 'v0.9.53'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.55'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 
-BUILD_DATE = '2026-11-07'
+BUILD_DATE = '2026-11-09'
 
 PY_VER = sys.version.split()[0]
 
@@ -152,7 +161,23 @@ def url_allowed(u):
 
     u = (u or '').strip()
 
-    return u == OFFICIAL_REPO or u.startswith(OFFICIAL_REPO + '/')
+    if u == OFFICIAL_REPO or u.startswith(OFFICIAL_REPO + '/'):
+
+        return True
+
+    # 备用下载页（国内网盘 / Gitee 页面）：只放行本机配置里那一个精确 URL，
+
+    # 不按域名放行，避免「配了网盘就顺手能打开任意网址」。
+
+    try:
+
+        _, page = update_sources()
+
+    except Exception:
+
+        page = ''
+
+    return bool(page) and u == page
 
 
 
@@ -245,7 +270,8 @@ def license_state(recheck=False):
 
             if code:
 
-                res = license_core.parse_code(code, LICENSE_PUBKEY_HEX)
+                res = license_core.parse_code(code, LICENSE_PUBKEY_HEX,
+                                     hwid=license_core.hwid())
 
                 for k in ('valid', 'reason', 'edition', 'kind', 'name', 'ident',
 
@@ -310,6 +336,96 @@ def license_feature(name):
 
 
 
+def _license_online(code):
+
+    """在线核销一次（第 170 项）。
+
+    只把「码的 SHA-256 前 40 位 + 本机指纹」发给作者侧的核销端点：
+    明文码永远不会离开本机。端点不可用、超时、返回怪东西一律降级为 offline ——
+    本地 Ed25519 验签已经通过了，不能因为没网就把付费用户挡在门外。
+
+    返回 (状态, 说明)，状态：ok / bound / revoked / offline。
+    """
+
+    try:
+
+        conf = error_report.ingest_config()
+
+        url = str(conf.get('url') or '')
+
+    except Exception:
+
+        url = ''
+
+    if not url:
+
+        return ('offline', 'no endpoint')
+
+    try:
+
+        parts = urllib.parse.urlsplit(url)
+
+        base = '%s://%s%s' % (parts.scheme, parts.netloc, parts.path.rsplit('/', 1)[0])
+
+        token = urllib.parse.parse_qs(parts.query).get('token', [''])[0]
+
+        if not token:
+
+            return ('offline', 'no token')
+
+        digest = hashlib.sha256(code.encode('utf-8')).hexdigest()[:40]
+
+        body = json.dumps({'code': digest, 'hwid': license_core.hwid()}).encode('utf-8')
+
+        req = urllib.request.Request(
+
+            base + '/activate?token=' + urllib.parse.quote(token),
+
+            data=body,
+
+            headers={'Content-Type': 'application/json',
+
+                     'User-Agent': 'SecondBrain-License/1'})
+
+        with urllib.request.urlopen(req, timeout=4) as f:
+
+            d = json.loads(f.read().decode('utf-8') or '{}')
+
+        if d.get('ok'):
+
+            return ('ok', str(d.get('bound') or ''))
+
+        err = str(d.get('err') or '')
+
+        if err in ('bound', 'revoked'):
+
+            return (err, str(d.get('bound') or ''))
+
+        return ('offline', err or 'unknown')
+
+    except urllib.error.HTTPError as e:
+
+        try:
+
+            d = json.loads(e.read().decode('utf-8') or '{}')
+
+        except Exception:
+
+            d = {}
+
+        err = str(d.get('err') or '')
+
+        if err in ('bound', 'revoked'):
+
+            return (err, '')
+
+        return ('offline', 'http %s' % e.code)
+
+    except Exception as e:
+
+        return ('offline', '%s: %s' % (type(e).__name__, str(e)[:80]))
+
+
 
 def license_activate(code):
 
@@ -317,17 +433,30 @@ def license_activate(code):
 
     code = (code or '').strip().replace('\n', '').replace('\r', '').replace(' ', '')
 
-    res = license_core.parse_code(code, LICENSE_PUBKEY_HEX)
+    res = license_core.parse_code(code, LICENSE_PUBKEY_HEX,
+                                     hwid=license_core.hwid())
 
     if not res['valid']:
 
         return {'ok': False, 'reason': res['reason'], 'state': license_state()}
 
+    # 本地验签 + 机器指纹都过了，再尽力在线核销一次（第 170 项）。
+    # offline 不等于失败：没网、端点没配都照常激活，只是这台机器不会被记进台账。
+    online, odetail = _license_online(code)
+
+    if online in ('bound', 'revoked'):
+
+        return {'ok': False, 'reason': online, 'detail': odetail, 'state': license_state()}
+
     p = license_path()
 
     payload = {'code': code, 'activated': time.strftime('%Y-%m-%d %H:%M'),
 
-               'last_seen': time.strftime('%Y-%m-%d')}
+               'last_seen': time.strftime('%Y-%m-%d'),
+
+               'hwid': license_core.hwid(),
+
+               'online': online}
 
     try:
 
@@ -538,6 +667,60 @@ _DL_MIRRORS = ('https://ghfast.top/', 'https://ghproxy.net/', 'https://gh-proxy.
 
 
 
+def update_sources():
+
+    """国内下载源（本机可编辑，不进仓库、不进同步清单）。
+
+
+
+    文件：app_dir()/update_sources.json
+
+        {
+
+          "urls": ["https://<国内直链>/SecondBrain-v0.9.xx-portable.zip"],
+
+          "manual_page": "https://<网盘或 Gitee 的下载页>"
+
+        }
+
+
+
+    urls 必须是**能直接下载的 https 直链**（COS/OSS/Gitee 附件/自建服务器都行）；
+
+    网盘分享页通常需要登录或跳转，程序没法直接下，放到 manual_page 里给用户手动点。
+
+    返回 (直链列表, 手动下载页)。文件不存在/写坏都静默按空处理，绝不拖垮检查更新。
+
+    """
+
+    urls, page = [], ''
+
+    try:
+
+        d = json.loads((app_dir() / 'update_sources.json').read_text(encoding='utf-8'))
+
+        if isinstance(d, dict):
+
+            urls = [str(x).strip() for x in (d.get('urls') or [])
+
+                    if str(x).strip().startswith('https://')][:8]
+
+            page = str(d.get('manual_page') or '').strip()[:300]
+
+            if not page.startswith('https://'):
+
+                page = ''
+
+    except Exception:
+
+        pass
+
+    return urls, page
+
+
+
+
+
 def _ver_from_json(info):
 
     """把 version.json 的内容整理成和 GitHub Release 一样的返回结构。"""
@@ -562,7 +745,11 @@ def _ver_from_json(info):
 
            'published': str(info.get('published') or '')[:10],
 
-           'newer': False, 'legacy': False, 'asset': None}
+           'newer': False, 'legacy': False, 'asset': None,
+
+           'manual_page': str(info.get('manual_page') or '')[:300],
+
+           'asset_urls': []}
 
     if latest[0] == 6:
 
@@ -576,11 +763,17 @@ def _ver_from_json(info):
 
         name = str(a.get('name') or '')
 
-        if name.lower().endswith('.zip'):
+        u = str(a.get('url') or '').strip()
 
-            out['asset'] = {'name': name, 'url': a.get('url'), 'size': a.get('size') or 0}
+        if not name.lower().endswith('.zip') or not u:
 
-            break
+            continue
+
+        if not out['asset']:
+
+            out['asset'] = {'name': name, 'url': u, 'size': a.get('size') or 0}
+
+        out['asset_urls'].append(u)
 
     return out
 
@@ -606,9 +799,17 @@ _UPD = {'state': 'idle', 'pct': 0, 'err': '', 'k': '', 'bat': ''}
 
 
 
-def _safe_asset_url(u):
+def _safe_asset_url(u, extra_hosts=None):
 
-    """升级包只从 GitHub 的 https 地址下（json 里的 url 是外部数据）。"""
+    """升级包只从 https 下，且域名必须是 GitHub 官方或配置里出现过的国内源。
+
+
+
+    json / 配置文件都是外部数据，不能拿它当任意 URL 发射器；extra_hosts 由
+
+    _update_candidates() 从配置里的直链域名算出，只放行「用户自己填过的那些」。
+
+    """
 
     try:
 
@@ -624,11 +825,121 @@ def _safe_asset_url(u):
 
         return ''
 
-    if (sp.hostname or '').lower() not in _UPD_HOSTS:
+    h = (sp.hostname or '').lower()
+
+    if h not in _UPD_HOSTS and h not in (extra_hosts or ()):
 
         return ''
 
     return str(u)
+
+
+
+
+
+def _github_asset():
+
+    """version.json 没写 assets 时，回 GitHub Release API 要一个 zip 直链。
+
+
+
+    以前 version.json 只有 version/notes，没有可下载地址 —— 走国内 jsDelivr 源
+
+    查到新版后，一键升级会直接报 upd_noasset。这里补上兜底。
+
+    """
+
+    try:
+
+        d = json.loads(_http_get(
+
+            'https://api.github.com/repos/%s/releases/latest' % REPO_SLUG,
+
+            timeout=8, limit=2 * 1024 * 1024).decode('utf-8', 'replace'))
+
+        for a in d.get('assets') or []:
+
+            n = str(a.get('name') or '')
+
+            if n.lower().endswith('.zip') and 'core' not in n.lower():
+
+                return str(a.get('browser_download_url') or '')
+
+    except Exception:
+
+        pass
+
+    return ''
+
+
+
+
+
+def _update_candidates(info, local_urls, github_url=''):
+
+    """下载优先级：本机国内直链 → version.json 的多个直链 → GitHub 加速前缀 → GitHub 官方。
+
+
+
+    原来把 GitHub 官方放第一位，国内常常直接超时；现在国内源优先，官方垫底。
+
+    """
+
+    from urllib.parse import urlsplit
+
+    raw = list(local_urls) + list(info.get('asset_urls') or [])
+
+    hosts = set()
+
+    for u in raw:
+
+        try:
+
+            h = (urlsplit(str(u)).hostname or '').lower()
+
+            if h:
+
+                hosts.add(h)
+
+        except Exception:
+
+            pass
+
+    out = []
+
+
+
+    def add(u):
+
+        su = _safe_asset_url(u, hosts)
+
+        if su and su not in out:
+
+            out.append(su)
+
+
+
+    for u in raw:
+
+        add(u)                       # 国内直链（配置 + version.json）
+
+    gh = _safe_asset_url(github_url)
+
+    if gh:
+
+        for m in _DL_MIRRORS:        # 加速前缀先试，官方最后
+
+            mu = m + gh
+
+            if mu not in out:
+
+                out.append(mu)
+
+        if gh not in out:
+
+            out.append(gh)
+
+    return out
 
 
 
@@ -658,11 +969,19 @@ def download_update(info=None):
 
     asset = info.get('asset') or {}
 
-    url = _safe_asset_url(asset.get('url'))
+    _local_urls, _local_page = update_sources()
 
-    if not url:
+    # version.json 可能只写了版本号没写 assets —— 回 GitHub API 兜底要一个 zip
 
-        return {'ok': False, 'k': 'upd_noasset'}
+    url = _safe_asset_url(asset.get('url')) or _github_asset()
+
+    _cands = _update_candidates(info, _local_urls, url)
+
+    if not _cands:
+
+        return {'ok': False, 'k': 'upd_noasset',
+
+                'err': '没找到可下载的安装包；可在 update_sources.json 里填国内直链'}
 
 
 
@@ -688,9 +1007,7 @@ def download_update(info=None):
 
         zpath = base / _nm
 
-        # 直连 + 三个加速前缀，谁先通就用谁（每次都不通才报错）
-
-        _cands = [url] + [m + url for m in _DL_MIRRORS]
+        # 国内直链 → 加速前缀 → GitHub 官方，谁先通就用谁
 
         _last = None
 
@@ -872,6 +1189,28 @@ DATA_FALLBACK = False
 
 
 
+# 窗口**实际**有没有摘掉系统标题栏（第 180 项）。启动时由 app_window 写入，
+# None 表示「还不知道，按配置猜」。前端必须看这个值而不是配置值：
+# 用户在设置里改了开关但没重启时，配置已经是新值、窗口样式还是旧值 ——
+# 只看配置会出现「系统标题栏还在 + HTML 也画了一条」的双标题栏。
+TITLEBAR_ACTIVE = None
+
+
+def titlebar_on():
+    """这条 HTML 标题栏该不该画：以窗口实际样式为准，配置只作兜底（第 180 项）。
+
+    窗口样式只在启动时改，所以配置值只影响「下次开窗」；前端据它决定要不要画
+    HTML 标题栏 —— 两边必须同一个来源，否则会出现「系统标题栏没了、HTML 也没画」
+    的光秃秃窗口，或者两条标题栏叠着。
+    """
+    if TITLEBAR_ACTIVE is not None:
+        return bool(TITLEBAR_ACTIVE)
+    try:
+        cfg = json.loads((app_dir() / 'settings.json').read_text(encoding='utf-8'))
+        return bool(cfg.get('titlebar', True))
+    except Exception:
+        return True
+
 def boot_lang():
 
     """界面语言从哪来：安装器写的 lang.txt → settings.json 的 lang → 空串（前端自己猜）。
@@ -944,194 +1283,6 @@ def boot_lang():
 
 
 
-
-
-def export_dir():
-    """导出文件的落地目录：`我的文档/第二大脑导出`。
-
-    不写 app_dir()：程序可能装在 Program Files 或某个深层目录，用户点完
-    「导出」根本找不到文件在哪；也不直接扔桌面，那会把桌面弄乱。
-    Documents 在 OneDrive 重定向时可能不是默认名，所以加一层 `文档` 兜底。
-    """
-    base = Path.home() / 'Documents'
-    if not base.is_dir():
-        base = Path.home() / '文档'
-    d = base / '第二大脑导出'
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _export_slug(s):
-    """把搜索词变成能当文件名的片段。Windows 文件名不许 \\ / : * ? " < > |。"""
-    s = re.sub(r'[\\/:*?"<>|\s]+', '_', str(s or '')).strip('._')
-    return (s or '结果')[:40]
-
-
-# ------------------------------------------------ Pro 2：批量 OCR 队列（第 143 项）
-# 免费索引对扫描件只抽前 OCR_PAGES 页 / OCR_BUDGET 秒 —— 建搜索特征够用，
-# 但一本 60 页的影印合同，后 54 页是搜不到的。这个队列做**全页** OCR 并写回
-# 同一张 docs 表：搜索框、语法、快搜窗全都不用改，结果立刻可搜。
-# 门控只挂在新增的 /api/ocr_batch 上，现有 28 个 API 一个都没上锁。
-OCRQ_FEATURE = 'ocr_batch'
-OCRQ_EXTS = frozenset(('.pdf', '.png', '.jpg', '.jpeg', '.bmp',
-                       '.webp', '.tif', '.tiff'))
-OCRQ_MAX_FILES = 2000
-OCRQ_MAX_BYTES = 80 * 1024 * 1024
-OCRQ_PAGE_BUDGET = 240.0      # 单篇 4 分钟；超了就交出已识别部分，别让队列挂死
-_OCRQ = None
-_OCRQ_LOCK = threading.Lock()
-_OCRQ_RIDS = {}
-
-
-def _ocrq_allowed(p):
-    """只认扫描件格式的真实文件。别让「选了整个 D 盘」变成几千个无关文件。"""
-    try:
-        if Path(p).suffix.lower() not in OCRQ_EXTS:
-            return False
-        return os.path.isfile(p) and os.stat(p).st_size <= OCRQ_MAX_BYTES
-    except (OSError, ValueError):
-        return False
-
-
-def _ocrq_expand(d):
-    """枚举目录。必须剪 reparse point —— junction 会让 os.walk 成环（第 122 项踩过）。"""
-    out = []
-    try:
-        raw = str(d or '').strip()
-        if not raw or raw.startswith('\\\\') or len(raw) > 400:
-            return out                       # UNC 网络路径可能挂几十秒，不碰
-        root = str(Path(raw).resolve())
-        if not os.path.isdir(root):
-            return out
-        for base, dirs, files in os.walk(root):
-            dirs[:] = [x for x in dirs
-                       if not x.startswith('.')
-                       and not _is_reparse_dir(os.path.join(base, x))]
-            for name in files:
-                p = os.path.join(base, name)
-                if Path(name).suffix.lower() in OCRQ_EXTS and _ocrq_allowed(p):
-                    out.append(p)
-                    if len(out) >= OCRQ_MAX_FILES:
-                        return out
-    except Exception:
-        pass
-    return out
-
-
-def _pdf_text_chars(path, limit=3):
-    """前几页有没有文字层。有文字层的 PDF 不值得花几分钟做全页 OCR。"""
-    try:
-        import pymupdf
-        doc = pymupdf.open(str(path))
-        try:
-            if doc.needs_pass and not doc.authenticate(''):
-                return -1
-            n = 0
-            for i in range(min(limit, doc.page_count)):
-                n += len((doc[i].get_text() or '').strip())
-            return n
-        finally:
-            doc.close()
-    except Exception:
-        return -1
-
-
-def ocr_image_file(path, on_page=None):
-    """单张图片 OCR。和 ocr_pdf 一样把长边压到 2200px，防超大位图在 C 层卡死。"""
-    import io
-    from PIL import Image
-    ocr = _get_ocr()          # 顺带解除 PIL 的 MAX_IMAGE_PIXELS 限制
-    with Image.open(str(path)) as src:
-        w, h = src.size
-        z = min(1.0, 2200 / max(w, h)) if max(w, h) else 1.0
-        im = src.resize((max(1, int(w * z)), max(1, int(h * z)))) if z < 1.0 else src
-        try:
-            buf = io.BytesIO()
-            im.convert('RGB').save(buf, 'PNG')
-            res, _ = ocr(buf.getvalue())
-        finally:
-            if im is not src:
-                im.close()
-    if on_page:
-        on_page(1, 1)
-    if not res:
-        return None
-    return '\n'.join(line[1] for line in res).strip() or None
-
-
-def _ocrq_run(path, on_page):
-    p = Path(path)
-    if p.suffix.lower() == '.pdf':
-        if _pdf_text_chars(p) > 80:
-            return {'skip': '已有文字层，不需要 OCR'}
-        return {'text': ocr_pdf(p, pages=None, budget=OCRQ_PAGE_BUDGET,
-                                on_page=on_page) or ''}
-    try:
-        return {'text': ocr_image_file(p, on_page) or ''}
-    except Exception as e:
-        return {'err': '图片识别失败：%s' % e}
-
-
-def _ocrq_begin():
-    """开工前缓存一次 path→rowid。每篇都重扫全表（UNINDEXED 列）要 1.4 秒，
-    2000 篇就是 47 分钟白等；缓存过期时 _doc_del 自己有慢路径兜底。"""
-    global _OCRQ_RIDS
-    with con_lock:
-        _OCRQ_RIDS = {os.path.normcase(p): r
-                      for p, r in _doc_rids(conn()).items()}
-
-
-def _ocrq_sink(path, text):
-    """把全页 OCR 结果写回正文索引，写完这一刻就能搜到。
-
-    三张表必须成对：docs（FTS5 正文）、bigram（2 字中文倒排）、
-    meta（记 size/mtime，否则下次「按范围更新」会拿 6 页 OCR 覆盖掉全页结果）。
-    """
-    text = (text or '').encode('utf-8', 'ignore').decode('utf-8').strip()[:MAX_BODY]
-    if not text:
-        return '正文为空'
-    try:
-        st = os.stat(path)
-    except OSError:
-        return '文件已不存在'
-    with con_lock:
-        con = conn()
-        try:
-            _doc_del(con, _OCRQ_RIDS, path)
-            cur = con.execute('INSERT INTO docs VALUES(?,?,?)',
-                              (path, Path(path).suffix.lower(), text))
-            _OCRQ_RIDS[os.path.normcase(path)] = cur.lastrowid
-            _bigram_add(con, cur.lastrowid, text)
-            con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
-                        'VALUES(?,?,?,?,?)',
-                        (path, time.time(), st.st_size, st.st_mtime, None))
-            con.commit()
-        except Exception as e:
-            try:
-                con.rollback()
-            except Exception:
-                pass
-            return str(e)
-    return None
-
-
-def ocr_batch_queue():
-    """惰性构造：软件启动时不加载状态、更不自动续跑，等用户打开面板才动。"""
-    global _OCRQ
-    with _OCRQ_LOCK:
-        if _OCRQ is None:
-            _OCRQ = ocr_batch.Queue(
-                state_path=app_dir() / 'ocr_batch.json',
-                runner=_ocrq_run,
-                sink=_ocrq_sink,
-                expand=_ocrq_expand,
-                allowed=_ocrq_allowed,
-                begin=_ocrq_begin,
-                may_run=lambda: not _job_busy(),
-                authorized=lambda: license_feature(OCRQ_FEATURE),
-                max_items=OCRQ_MAX_FILES,
-            )
-        return _OCRQ
 
 
 def app_dir():
@@ -1217,6 +1368,417 @@ def app_dir():
 
 
 DB = app_dir() / 'brain.db'
+
+SCOPE_FILE = app_dir() / 'scope.json'
+
+
+
+# 索引集：DB / SCOPE_FILE 都是运行时可重赋值的全局。所有 sqlite3.connect(DB)
+
+# 与 scope 读取都在调用时取值，切库只要改这两个变量并关掉旧连接，
+
+# 不必逐个改那 8 处引用，也不用迁移已有的 brain.db。
+
+import libsets
+
+import error_report
+
+import settings_backup
+
+
+
+def _apply_lib_paths(d, lib_id):
+
+    """把全局 DB / SCOPE_FILE 指向某个索引集；调用方必须已持有 con_lock。"""
+
+    global DB, SCOPE_FILE, _con
+
+    lib = libsets.active_lib(d, lib_id)
+
+    if not lib:
+
+        return False
+
+    if globals().get('_con') is not None:
+
+        try:
+
+            _con.close()
+
+        except Exception:
+
+            pass
+
+        _con = None
+
+    DB = libsets.db_path(app_dir(), lib)
+
+    SCOPE_FILE = libsets.scope_path(app_dir(), lib)
+
+    try:
+
+        DB.parent.mkdir(parents=True, exist_ok=True)
+
+    except OSError:
+
+        pass
+
+    return True
+
+
+
+def _boot_lib_paths():
+
+    """启动时恢复上次的活动索引集；默认库就是原有的 brain.db，零迁移。"""
+
+    try:
+
+        d = libsets.load(app_dir())
+
+        _apply_lib_paths(d, d['active'])
+
+    except Exception:
+
+        pass
+
+
+
+def switch_lib(lib_id):
+
+    """切换索引集：全程持 con_lock，切完立刻建表，返回 (ok, 说明)。"""
+
+    with con_lock:
+
+        d = libsets.load(app_dir())
+
+        if not _apply_lib_paths(d, lib_id):
+
+            return False, '索引集不存在'
+
+        libsets.set_active(app_dir(), lib_id)
+
+        try:
+
+            conn()
+
+        except Exception:
+
+            pass
+
+        return True, lib_id
+
+
+
+def lib_overview():
+
+    """索引集列表 + 每个库的文件/正文条数（独立只读连接，不影响全局 conn）。"""
+
+    d = libsets.load(app_dir())
+
+    out = []
+
+    for lib in d['libs']:
+
+        fp = libsets.db_path(app_dir(), lib)
+
+        files = docs = 0
+
+        try:
+
+            c = sqlite3.connect(fp.as_uri() + '?mode=ro', uri=True, timeout=1)
+
+            try:
+
+                files = c.execute('SELECT count(*) FROM files').fetchone()[0]
+
+                docs = c.execute('SELECT count(*) FROM docs').fetchone()[0]
+
+            finally:
+
+                c.close()
+
+        except Exception:
+
+            pass
+
+        out.append({'id': lib['id'], 'name': lib['name'], 'files': files,
+
+                    'docs': docs, 'scope': str(libsets.scope_path(app_dir(), lib)),
+
+                    'active': lib['id'] == d['active']})
+
+    return {'ok': True, 'active': d['active'], 'libs': out}
+
+
+
+def lib_search_all(q, limit=30):
+
+    """跨索引集搜索：串行切换活动库复用 search_rows，finally 一定切回原库。"""
+
+    d = libsets.load(app_dir())
+
+    orig = d['active']
+
+    out = []
+
+    with con_lock:
+
+        try:
+
+            for lib in d['libs']:
+
+                if not _apply_lib_paths(d, lib['id']):
+
+                    continue
+
+                try:
+
+                    rows = search_rows(conn(), q, limit)
+
+                except Exception:
+
+                    rows = []
+
+                for pp, snip in rows:
+
+                    out.append({'p': pp, 'b': snip, 'lib': lib['id'], 'n': lib['name']})
+
+        finally:
+
+            _apply_lib_paths(d, orig)
+
+    return out[:limit]
+
+
+
+def saved_path():
+
+    return app_dir() / 'saved_searches.json'
+
+
+
+def saved_load():
+
+    try:
+
+        d = json.loads(saved_path().read_text(encoding='utf-8'))
+
+        if isinstance(d, dict) and isinstance(d.get('items'), list):
+
+            return [x for x in d['items'] if isinstance(x, dict) and str(x.get('q') or '').strip()][:100]
+
+    except Exception:
+
+        pass
+
+    return []
+
+
+
+def saved_save(items):
+
+    pp = saved_path()
+
+    tmp = pp.with_name(pp.name + '.tmp')
+
+    tmp.write_text(json.dumps({'items': items[:100]}, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    os.replace(str(tmp), str(pp))
+
+    return True
+
+
+
+def saved_add(q, name=''):
+
+    items = saved_load()
+
+    q = str(q or '').strip()[:200]
+
+    if not q:
+
+        return False, '空的搜索词'
+
+    if any(x.get('q') == q for x in items):
+
+        return False, '已经保存过了'
+
+    items.insert(0, {'q': q, 'name': str(name or '').strip()[:40] or q, 't': time.time()})
+
+    saved_save(items)
+
+    return True, ''
+
+
+
+def saved_remove(q):
+
+    items = saved_load()
+
+    left = [x for x in items if x.get('q') != q]
+
+    saved_save(left)
+
+    return len(items) != len(left)
+
+
+
+def diagnose(limit=60):
+
+    """「为什么搜不到」：按 meta.reason 分组 + 列出前 N 条失败文件。"""
+
+    try:
+
+        with con_lock:
+
+            c = conn()
+
+            groups = c.execute("SELECT COALESCE(reason,'?'), COUNT(*) FROM meta WHERE reason IS NOT NULL GROUP BY 1 ORDER BY 2 DESC").fetchall()
+
+            rows = c.execute('SELECT path, reason FROM meta WHERE reason IS NOT NULL ORDER BY path LIMIT ?', (max(1, min(limit, 300)),)).fetchall()
+
+        return {'ok': True, 'groups': [{'why': r[0], 'n': r[1]} for r in groups],
+
+                'items': [{'p': r[0], 'why': r[1]} for r in rows],
+
+                'total': sum(r[1] for r in groups)}
+
+    except Exception as e:
+
+        return {'ok': False, 'err': str(e), 'groups': [], 'items': [], 'total': 0}
+
+
+
+def diagnose_retry(paths):
+
+    """把失败条目重新排进正文队列；_bodyq_offer 要 6 元组，第 6 位是 mtime。"""
+
+    rows = []
+
+    for pp in (paths or [])[:100]:
+
+        pp = str(pp).strip()
+
+        if not pp:
+
+            continue
+
+        try:
+
+            mt = os.path.getmtime(pp)
+
+        except OSError:
+
+            mt = time.time()
+
+        rows.append((pp, 0, 0, 0, 0, mt))
+
+    _bodyq_offer(rows, [])
+
+    return {'ok': True, 'n': len(rows)}
+
+
+
+_PAGE_CACHE = {}
+
+
+
+def pdf_page_for(path, kw, max_pages=30):
+
+    """命中 PDF 时按需定位页码：读文本层前 N 页找关键词，带 mtime 缓存。
+
+    不改动索引结构；扫描件（无文本层）返回 None，由界面提示。"""
+
+    pp = str(path or '')
+
+    k = str(kw or '').strip().lower()
+
+    if not pp.lower().endswith('.pdf') or not k:
+
+        return None
+
+    try:
+
+        mt = os.path.getmtime(pp)
+
+    except OSError:
+
+        return None
+
+    key = (pp, int(mt), k[:40])
+
+    if key in _PAGE_CACHE:
+
+        return _PAGE_CACHE[key]
+
+    page = None
+
+    try:
+
+        from pypdf import PdfReader
+
+        r = PdfReader(pp)
+
+        for i, pg in enumerate(r.pages[:max_pages]):
+
+            if k in (pg.extract_text() or '').lower():
+
+                page = i + 1
+
+                break
+
+    except Exception:
+
+        page = None
+
+    if len(_PAGE_CACHE) > 500:
+
+        _PAGE_CACHE.clear()
+
+    _PAGE_CACHE[key] = page
+
+    return page
+
+
+
+def pdf_page_url(path, n):
+
+    """只给索引里的本地 PDF 生成 file://...#page=N；外部路径一律拒绝。"""
+
+    pp = str(path or '').strip()
+
+    if not pp.lower().endswith('.pdf') or not _local_only(pp):
+
+        return None
+
+    if not os.path.isfile(pp):
+
+        return None
+
+    with con_lock:
+
+        try:
+
+            ok = bool(conn().execute('SELECT 1 FROM meta WHERE path=? LIMIT 1', (pp,)).fetchone())
+
+        except Exception:
+
+            ok = False
+
+    if not ok and not ev_recent(pp):
+
+        return None
+
+    try:
+
+        nn = max(1, min(int(n), 9999))
+
+        return Path(pp).as_uri() + '#page=%d' % nn
+
+    except Exception:
+
+        return None
+
 
 MAX_BODY = 2 * 1024 * 1024  # 单文档正文上限 2MB
 
@@ -2271,7 +2833,7 @@ def _scope_conf(scope_path=None):
 
     try:
 
-        sp = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+        sp = Path(scope_path) if scope_path else SCOPE_FILE
 
         return json.loads(sp.read_text(encoding='utf-8')) or {}
 
@@ -5369,7 +5931,7 @@ def scope_report(con):
 
     调用方必须已持有 con_lock。"""
 
-    sp = app_dir() / 'scope.json'
+    sp = SCOPE_FILE
 
     try:
 
@@ -7751,6 +8313,93 @@ def _place_boost(path):
 
 
 
+def _dedupe_nested(items):
+
+    """同一个安装目录里叠着的同名 exe，只留最外层那条。
+
+
+
+    真实案例（2026-11-13）：搜「豆包」给出三条同名结果 ——
+
+    D:\\Doubao\\Doubao.exe、D:\\Doubao\\app\\Doubao.exe、D:\\Doubao\\app\\launcher\\Doubao.exe。
+
+    用户点了中间那条（launcher 副本），它只会去**自己所在目录**找 app\\ 子目录，
+
+    于是弹 "Can't find main exe file"（实测复现，窗口标题「错误」）。
+
+
+
+    用户不需要知道一个程序内部有几层启动器。只合并「文件名相同 + 一条路径落在
+
+    另一条的目录树里」的，所以 C:\\Python312\\python.exe 与别处的 python.exe
+
+    这种同名无关的不会被误合。
+
+    """
+
+    appext = ('.exe', '.bat', '.cmd', '.msi')
+
+    groups = {}
+
+    for i, it in enumerate(items):
+
+        if str(it.get('e') or '').lower() not in appext:
+
+            continue
+
+        stem = os.path.splitext(os.path.basename(str(it.get('p') or '')))[0].lower()
+
+        groups.setdefault(stem, []).append(i)
+
+    drop = set()
+
+    for idxs in groups.values():
+
+        if len(idxs) < 2:
+
+            continue
+
+        idxs.sort(key=lambda i: len(str(items[i].get('p') or '')))      # 层级浅的在前
+
+        kept = []
+
+        for i in idxs:
+
+            d = os.path.dirname(os.path.normcase(str(items[i].get('p') or '')))
+
+            host = None
+
+            for j in kept:
+
+                qd = os.path.dirname(os.path.normcase(str(items[j].get('p') or '')))
+
+                if d == qd or d.startswith(qd + os.sep):
+
+                    host = j
+
+                    break
+
+            if host is None:
+
+                kept.append(i)
+
+            else:
+
+                drop.add(i)
+
+                host_it = items[host]
+
+                host_it['alts'] = (int(host_it.get('alts') or 0) + 1
+
+                                   + int(items[i].get('alts') or 0))
+
+    if not drop:
+
+        return items
+
+    return [it for k, it in enumerate(items) if k not in drop]
+
+
 def merge_same_target(items, limit=None):
 
     """把指向同一个程序的多个入口合并成一条，保留分最高的那条，记下 alts 数量。
@@ -7800,6 +8449,9 @@ def merge_same_target(items, limit=None):
                 it['alts'] = keep['alts']
 
                 out[j] = it
+
+    out = _dedupe_nested(out)
+
 
     return out[:limit] if limit else out
 
@@ -10809,7 +11461,7 @@ def _scope_dirs(scope_path=None):
 
     try:
 
-        sp = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+        sp = Path(scope_path) if scope_path else SCOPE_FILE
 
         data = json.loads(sp.read_text(encoding='utf-8'))
 
@@ -11237,6 +11889,218 @@ def _settings_read():
 
 
 
+# ── 主题配色 / 全局壁纸（第 191 项）──────────────────────────────────────
+
+# 配色 id 必须和前端 web/src/lib/palette.ts 的 PALETTES 一一对应：
+
+# 前端认 localStorage，后端这份只用来**校验**别写进奇怪的值，preflight 会逐项比对。
+
+PALETTE_IDS = ('auto', 'light', 'dark', 'paper', 'amber', 'pure', 'mint', 'blue',
+
+               'lilac', 'sakura', 'graphite', 'night', 'contrast', 'black', 'cyber')
+
+# 壁纸只认这几种位图：故意不收 svg（能带脚本）、不收 ico（多尺寸糊成一团）
+
+WALL_EXT = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')
+
+WALL_MAX_BYTES = 40 * 1024 * 1024
+
+WALL_MIME = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+
+             '.webp': 'image/webp', '.bmp': 'image/bmp', '.gif': 'image/gif'}
+
+def _wall_path():
+
+    """settings.json 里记的那张图。**只认这里** —— 接口不接受前端传路径来读文件。"""
+
+    try:
+
+        return str(_settings_read().get('wall') or '')
+
+    except Exception:
+
+        return ''
+
+def _wall_ok(p=None):
+
+    p = _wall_path() if p is None else p
+
+    try:
+
+        return (bool(p) and os.path.isfile(p)
+
+                and os.path.splitext(p)[1].lower() in WALL_EXT
+
+                and os.path.getsize(p) <= WALL_MAX_BYTES)
+
+    except Exception:
+
+        return False
+
+def _wall_int(v, lo, hi, dflt):
+
+    try:
+
+        n = int(v)
+
+    except Exception:
+
+        return dflt
+
+    return max(lo, min(hi, n))
+
+def _wall_state():
+
+    """给界面看的状态。图片读不出来时 on=False —— 界面照常可用，不会白屏。"""
+
+    try:
+
+        d = _settings_read()
+
+    except Exception:
+
+        d = {}
+
+    p = str(d.get('wall') or '')
+
+    ok = _wall_ok(p)
+
+    st = {'on': ok,
+
+          'name': os.path.basename(p) if ok else '',
+
+          'opacity': _wall_int(d.get('wall_opacity', 15), 5, 100, 15),
+
+          'blur': _wall_int(d.get('wall_blur', 0), 0, 30, 0),
+
+          'v': 0}
+
+    if ok:
+
+        try:
+
+            st['v'] = int(os.path.getmtime(p))
+
+        except Exception:
+
+            pass
+
+    elif p:
+
+        st['err'] = 'wall_missing'      # 文件被删/挪走：界面提示换一张
+
+    return st
+
+def _wall_image():
+
+    """返回 (bytes, content-type)。路径只来自配置，前端拿不到「随便读文件」的能力。"""
+
+    p = _wall_path()
+
+    if not _wall_ok(p):
+
+        return (json.dumps({'ok': False, 'err': 'wall_missing'},
+
+                           ensure_ascii=False).encode(),
+
+                'application/json; charset=utf-8')
+
+    b = b''
+
+    try:
+
+        with open(p, 'rb') as f:
+
+            b = f.read(WALL_MAX_BYTES + 1)
+
+    except Exception:
+
+        b = b''
+
+    if not b or len(b) > WALL_MAX_BYTES:
+
+        return (json.dumps({'ok': False, 'err': 'wall_unreadable'},
+
+                           ensure_ascii=False).encode(),
+
+                'application/json; charset=utf-8')
+
+    return b, WALL_MIME.get(os.path.splitext(p)[1].lower(), 'application/octet-stream')
+
+def _wall_apply(req):
+
+    """壁纸的三个动作：set（选了新图）/ tune（两个滑杆）/ clear。"""
+
+    op = str(req.get('op') or '')
+
+    if op == 'clear':
+
+        _settings_update({'wall': ''})
+
+        return _wall_state()
+
+    if op == 'set':
+
+        p = str(req.get('path') or '')
+
+        ext = os.path.splitext(p)[1].lower()
+
+        st = _wall_state()
+
+        if ext not in WALL_EXT:
+
+            st['err'] = 'wall_bad_ext'
+
+            return st
+
+        try:
+
+            size = os.path.getsize(p) if os.path.isfile(p) else -1
+
+        except Exception:
+
+            size = -1
+
+        if size < 0:
+
+            st['err'] = 'wall_missing'
+
+            return st
+
+        if size > WALL_MAX_BYTES:
+
+            st['err'] = 'wall_too_big'
+
+            return st
+
+        _settings_update({'wall': p})
+
+        return _wall_state()
+
+    if op == 'tune':
+
+        patch = {}
+
+        if 'opacity' in req:
+
+            patch['wall_opacity'] = _wall_int(req.get('opacity'), 5, 100, 15)
+
+        if 'blur' in req:
+
+            patch['wall_blur'] = _wall_int(req.get('blur'), 0, 30, 0)
+
+        if patch:
+
+            _settings_update(patch)
+
+        return _wall_state()
+
+    st = _wall_state()
+
+    st['err'] = 'wall_bad_op'
+
+    return st
+
 def _settings_update(patch):
 
     """合并 patch 并原子落盘，返回 (ok, data)。所有写配置的地方都必须走这里。
@@ -11381,7 +12245,7 @@ def _bg_content_then_full():
 
         try:
 
-            _refresh_names_from_csv(str(app_dir() / 'scope.json'))
+            _refresh_names_from_csv(str(SCOPE_FILE))
 
         except Exception:
 
@@ -11483,7 +12347,7 @@ def _bg_full_disk():
 
             try:
 
-                _refresh_names_from_csv(str(app_dir() / 'scope.json'))
+                _refresh_names_from_csv(str(SCOPE_FILE))
 
             except Exception:
 
@@ -11659,7 +12523,7 @@ def first_run_auto():
 
 
 
-def _safe_scope_dir(p):
+def _safe_scope_dir(p, allow_unc=False):
 
     """索引范围只接受「本机已存在的目录」。
 
@@ -11685,7 +12549,23 @@ def _safe_scope_dir(p):
 
     if q.startswith('\\') or q.startswith('//'):
 
-        return None
+        # 网络共享目录默认拒绝（SMB 协商会带出 NetNTLMv2）；只有用户在
+        # 「索引范围」里主动添加时才放行，且必须真实可达、长度受限。
+        if not allow_unc or len(q) > 260 or q.count('\\') < 3:
+
+            return None
+
+        try:
+
+            if not os.path.isdir(q):
+
+                return None
+
+        except OSError:
+
+            return None
+
+        return q
 
     if not (len(q) > 2 and q[1] == ':'):
 
@@ -11711,7 +12591,7 @@ def _safe_scope_dir(p):
 
 
 
-def safe_scope_list(targets):
+def safe_scope_list(targets, allow_unc=False):
 
     """把界面传来的一串路径过滤成可信范围；全被滤掉时返回 None。"""
 
@@ -11719,7 +12599,7 @@ def safe_scope_list(targets):
 
     for t in (targets or []):
 
-        q = _safe_scope_dir(t)
+        q = _safe_scope_dir(t, allow_unc)
 
         if q and q not in out:
 
@@ -11741,7 +12621,7 @@ def save_scope(targets, scope_path=None):
 
     try:
 
-        sp = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+        sp = Path(scope_path) if scope_path else SCOPE_FILE
 
         try:
 
@@ -12167,7 +13047,7 @@ def _update_scope_path(old, new, scope_path=None):
 
     """把 scope.json 里指向 old 的那行改成 new（改前留一份 .bak）。"""
 
-    sp = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+    sp = Path(scope_path) if scope_path else SCOPE_FILE
 
     try:
 
@@ -12241,7 +13121,7 @@ def repair_scope(miss=None, scope_path=None, ask=True):
 
     ask=True 且控制台可交互时，候选不唯一会让人选号；否则只打印候选。"""
 
-    sp = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+    sp = Path(scope_path) if scope_path else SCOPE_FILE
 
     if miss is None:
 
@@ -12721,7 +13601,7 @@ def _refresh_names_from_csv(scope_path=None):
 
     try:
 
-        sp = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+        sp = Path(scope_path) if scope_path else SCOPE_FILE
 
         cfg = json.loads(sp.read_text(encoding='utf-8'))
 
@@ -13073,7 +13953,7 @@ def update(targets=None, scope_path=None):
 
         _prog(state='busy', phase='scan', err='')
 
-        scope = Path(scope_path) if scope_path else app_dir() / 'scope.json'
+        scope = Path(scope_path) if scope_path else SCOPE_FILE
 
         if not scope.exists():
 
@@ -13236,6 +14116,63 @@ def update(targets=None, scope_path=None):
 _con = None
 
 con_lock = threading.RLock()
+
+_boot_lib_paths()
+
+
+
+
+
+def _boot_compat():
+
+    """兼容模式（软件渲染）：用户显式打开时，强制给 WebView2 加 --disable-gpu。
+
+    必须在 webview.start() 之前设置环境变量；自动降级逻辑在
+
+    app_window.py 的 _apply_render_fallback()，两者叠加不冲突。
+
+    """
+
+    try:
+
+        d = json.loads((app_dir() / 'settings.json').read_text(encoding='utf-8'))
+
+        if isinstance(d, dict) and d.get('compat'):
+
+            cur = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS') or ''
+
+            if '--disable-gpu' not in cur:
+
+                os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (cur + ' --disable-gpu').strip()
+
+    except Exception:
+
+        pass
+
+
+
+
+
+def _boot_care():
+
+    """错误日志：默认零副作用。只有用户打开开关时才会补发历史报告。"""
+
+    try:
+
+        error_report.bootstrap(app_dir(), APP_VERSION)
+
+    except Exception:
+
+        pass
+
+
+
+
+
+_boot_compat()
+
+_boot_care()
+
 
 
 
@@ -18459,13 +19396,17 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                                    'lang': boot_lang(),
 
+                                   'titlebar': titlebar_on(),
+
                                    'fallback': bool(DATA_FALLBACK),
 
                                    'repo': OFFICIAL_REPO,
 
                                    'releases': OFFICIAL_RELEASES,
 
-                                   'issues': OFFICIAL_ISSUES},
+                                   'issues': OFFICIAL_ISSUES,
+
+                                   'manual_page': update_sources()[1]},
 
                                   ensure_ascii=False).encode()
 
@@ -18483,7 +19424,20 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 _force = 'force=1' in self.path
 
+
+
+                # 体检文案要跟界面语言走（第 174/176 项）：
+                # 五种语言各有自己的表（env_check._EN + env_msgs），
+                # 以前西/葡/印地全指向英文，用户切过去看到整页英文
+                _qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+
+
+                _lang = ((_qs.get('lang') or ['zh'])[0] or 'zh')[:8]
+
                 if (not _force and _ENV_CACHE.get('t')
+
+                        and _ENV_CACHE.get('lang') == _lang
 
                         and _now - _ENV_CACHE['t'] < 90):
 
@@ -18497,13 +19451,13 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         _inf = env_check.probe_all(data_dir=str(app_dir()), db_path=str(DB))
 
-                        _iss = env_check.judge(_inf)
+                        _iss = env_check.judge(_inf, _lang)
 
                         body = json.dumps({'ok': True, 'info': _inf, 'issues': _iss,
 
                                            'plan': env_check.plan(_inf),
 
-                                           'text': env_check.render(_inf, _iss)},
+                                           'text': env_check.render(_inf, _iss, lang=_lang)},
 
                                           ensure_ascii=False).encode()
 
@@ -18517,7 +19471,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                                           ensure_ascii=False).encode()
 
-                    _ENV_CACHE = {'t': _now, 'body': body}
+                    _ENV_CACHE = {'t': _now, 'lang': _lang, 'body': body}
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -18555,7 +19509,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
             elif self.path.startswith('/api/config'):
 
-                sp = app_dir() / 'scope.json'
+                sp = SCOPE_FILE
 
                 with con_lock:
 
@@ -18601,7 +19555,13 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 # 检查更新：慢（要连 GitHub），放线程里等，前端显示「检查中…」
 
-                body = json.dumps(check_update(), ensure_ascii=False).encode()
+                _r = check_update()
+
+                _lu, _lp = update_sources()
+
+                _r['manual_page'] = _lp or _r.get('manual_page') or ''
+
+                body = json.dumps(_r, ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -18626,22 +19586,13 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/ocr_batch'):
-
-                # Pro 2（第 143 项）：批量 OCR 队列状态，面板每 1 秒轮询一次。
-                # 只读，所以不写状态文件、不加载 OCR 引擎。
-
-                if not license_feature(OCRQ_FEATURE):
-
+                # Pro 2：队列状态，面板每 1 秒轮询一次。实现在私有 pro/ 包，
+                # 公开源码版没有该包时关闭入口；门控在这里，不在私有模块里。
+                if pro_api is None:
                     body = json.dumps({'ok': False, 'pro': True},
-
                                       ensure_ascii=False).encode()
-
                 else:
-
-                    body = json.dumps(ocr_batch_queue().status(),
-
-                                      ensure_ascii=False).encode()
-
+                    body = pro_api.ocr_batch_get(_B)
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/firstrun'):
@@ -18679,6 +19630,136 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                                   ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/libsets'):
+
+                # 索引集（多库）：不带 q 返回列表，带 q 做跨库合并搜（免费）。
+
+                qs = parse_qs(urlparse(self.path).query)
+
+                q = (qs.get('q', [''])[0] or '').strip()
+
+                if q:
+
+                    body = json.dumps({'ok': True, 'q': q, 'hits': lib_search_all(q, 30)},
+
+                                      ensure_ascii=False).encode()
+
+                else:
+
+                    body = json.dumps(lib_overview(), ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
+            elif self.path.startswith('/api/saved'):
+
+                body = json.dumps({'ok': True, 'items': saved_load()},
+
+                                  ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
+            elif self.path.startswith('/api/diagnose'):
+
+                qs = parse_qs(urlparse(self.path).query)
+
+                try:
+
+                    lim = max(1, min(int(qs.get('n', ['60'])[0]), 300))
+
+                except (ValueError, TypeError):
+
+                    lim = 60
+
+                body = json.dumps(diagnose(lim), ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
+            elif self.path.startswith('/api/page'):
+
+                qs = parse_qs(urlparse(self.path).query)
+
+                pp = (qs.get('p', [''])[0] or '').strip()
+
+                kw = (qs.get('q', [''])[0] or '').strip()
+
+                body = json.dumps({'ok': True, 'page': pdf_page_for(pp, kw)},
+
+                                  ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
+            elif self.path.startswith('/api/open_page'):
+
+                qs = parse_qs(urlparse(self.path).query)
+
+                pp = (qs.get('p', [''])[0] or '').strip()
+
+                nn = (qs.get('n', ['1'])[0] or '1').strip()
+
+                u = pdf_page_url(pp, nn)
+
+                if not u:
+
+                    body = json.dumps({'ok': False, 'err': '不是索引里的本地 PDF'},
+
+                                      ensure_ascii=False).encode()
+
+                else:
+
+                    try:
+
+                        import webbrowser
+
+                        webbrowser.open(u)
+
+                        body = json.dumps({'ok': True, 'page': int(nn)},
+
+                                          ensure_ascii=False).encode()
+
+                    except Exception as e:
+
+                        body = json.dumps({'ok': False, 'err': str(e)},
+
+                                          ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/errlog'):
+
+                # 错误日志：状态 + 本地报告列表 + 最近一份全文预览（发送前可审阅）
+
+                body = json.dumps(error_report.status(), ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/backup'):
+
+                # 设置备份是二进制 zip，得自己完成响应并 return，不能落到末尾的 JSON 响应
+
+                name, raw = settings_backup.make_backup(app_dir(), APP_VERSION)
+
+                self.send_response(200)
+
+                self.send_header('Content-Type', 'application/zip')
+
+                self.send_header('Content-Disposition', 'attachment; filename="second-brain-settings.zip"')
+
+                self.send_header('Content-Length', str(len(raw)))
+
+                self.end_headers()
+
+                self.wfile.write(raw)
+
+                return
 
             elif self.path.startswith('/api/stats'):
 
@@ -18722,7 +19803,29 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 d.setdefault('theme', 'auto')
 
+                d.setdefault('palette', 'auto')
+
+                d.setdefault('wall', '')
+
+                d.setdefault('wall_opacity', 30)
+
+                d.setdefault('wall_blur', 0)
+
+                d.setdefault('compat', False)
+
                 body = json.dumps(d, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/wall/image'):
+
+                _b, ctype = _wall_image()
+
+                body = _b
+
+            elif self.path.startswith('/api/wall'):
+
+                body = json.dumps(_wall_state(), ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -19893,6 +20996,20 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 return
 
+            if self.path.startswith('/api/wall'):
+
+                body = json.dumps(_wall_apply(req), ensure_ascii=False).encode()
+
+                self.send_response(200)
+
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                self.end_headers()
+
+                self.wfile.write(body)
+
+                return
+
             if self.path.startswith('/api/settings'):
 
                 # 先校验再写：非法值不该触发一次落盘。所有键合成一个 patch，
@@ -19900,6 +21017,10 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 # 由 _settings_update 加锁合并 + 原子替换，避免并发互相抹掉。
 
                 patch = {}
+
+                if 'compat' in req:
+
+                    patch['compat'] = bool(req['compat'])
 
                 if 'hotkey' in req:
 
@@ -19924,6 +21045,36 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                         return
 
                     patch['theme'] = req['theme']
+
+                if 'palette' in req:
+
+                    # 配色 id 用白名单校验：前端写错了不至于把界面刷成透明/纯白
+
+                    if req['palette'] not in PALETTE_IDS:
+
+                        body = json.dumps({'ok': False, 'err': 'palette 不在白名单里',
+
+                                           'k': 'e_bad_palette'}, ensure_ascii=False).encode()
+
+                        self.send_response(400)
+
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                        self.end_headers()
+
+                        self.wfile.write(body)
+
+                        return
+
+                    patch['palette'] = req['palette']
+
+                if 'titlebar' in req:
+
+                    # 自绘标题栏（第 180 项）：只收布尔。窗口样式开机时改，
+
+                    # 所以改完要重启才生效 —— 界面上的说明也这么写。
+
+                    patch['titlebar'] = bool(req['titlebar'])
 
                 if 'welcome_seen' in req:
 
@@ -19991,7 +21142,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 exc = [str(d).strip() for d in req.get('exclude_dirs', []) if str(d).strip()]
 
-                dirs = safe_scope_list(raw)     # 只收本机存在的目录，挡掉远程共享/手打错路径
+                dirs = safe_scope_list(raw, True)  # 显式添加的共享盘也收；其余仍只收本机存在的目录
 
                 if not dirs:
 
@@ -20001,7 +21152,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 else:
 
-                    sp = app_dir() / 'scope.json'
+                    sp = SCOPE_FILE
 
                     try:
 
@@ -20037,7 +21188,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         # `c://users//x` 和 `c:\users\x` 是同一个目录，直接比会全被当成「跳过」。
 
-                        dropped = [d for d in raw if not _safe_scope_dir(d)]
+                        dropped = [d for d in raw if not _safe_scope_dir(d, True)]
 
                         body = json.dumps({'ok': True, 'include_dirs': dirs,
 
@@ -20052,6 +21203,220 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                         body = json.dumps({'ok': False, 'err': '索引范围没保存（没有本机存在的文件夹，或写盘失败）',
 
                                            'k': 'e_scope_save'}, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/libsets'):
+
+                op = str(req.get('op') or '').strip()
+
+                if op == 'create':
+
+                    lib, err = libsets.create(app_dir(), req.get('name') or '')
+
+                    body = json.dumps({'ok': bool(lib), 'lib': lib, 'err': err},
+
+                                      ensure_ascii=False).encode()
+
+                elif op == 'switch':
+
+                    ok, why = switch_lib(str(req.get('id') or ''))
+
+                    body = json.dumps({'ok': ok, 'err': why}, ensure_ascii=False).encode()
+
+                elif op == 'rename':
+
+                    ok, why = libsets.rename(app_dir(), str(req.get('id') or ''),
+
+                                             req.get('name') or '')
+
+                    body = json.dumps({'ok': ok, 'err': why}, ensure_ascii=False).encode()
+
+                elif op == 'delete':
+
+                    lid = str(req.get('id') or '')
+
+                    # 删当前库前先切回默认：否则连接还开着，Windows 上删不掉 db 文件。
+
+                    d = libsets.load(app_dir())
+
+                    if d['active'] == lid:
+
+                        switch_lib('default')
+
+                    ok, why = libsets.remove(app_dir(), lid)
+
+                    body = json.dumps({'ok': ok, 'err': why}, ensure_ascii=False).encode()
+
+                else:
+
+                    body = json.dumps({'ok': False, 'err': '未知操作'},
+
+                                      ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
+            elif self.path.startswith('/api/saved'):
+
+                op = str(req.get('op') or 'add').strip()
+
+                if op == 'add':
+
+                    ok, why = saved_add(req.get('q'), req.get('name'))
+
+                elif op == 'remove':
+
+                    ok, why = saved_remove(req.get('q')), ''
+
+                else:
+
+                    ok, why = False, '未知操作'
+
+                body = json.dumps({'ok': ok, 'err': why, 'items': saved_load()},
+
+                                  ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
+            elif self.path.startswith('/api/diagnose'):
+
+                op = str(req.get('op') or '').strip()
+
+                if op == 'retry':
+
+                    paths = req.get('paths')
+
+                    if not isinstance(paths, list) or not paths:
+
+                        paths = [x.get('p') for x in diagnose(300)['items']]
+
+                    body = json.dumps(diagnose_retry(paths), ensure_ascii=False).encode()
+
+                else:
+
+                    body = json.dumps({'ok': False, 'err': '未知操作'},
+
+                                      ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/errlog'):
+
+                op = str(req.get('op') or '').strip()
+
+                cur = error_report.load_conf()
+
+                if op == 'set':
+
+                    # 接收端只从开发者侧 error_ingest.json 读；客户端给的地址一律拒绝，
+
+                    # 免得有人通过 API 把报告引到自己服务器，或把地址又带回界面。
+
+                    if str(req.get('url') or '').strip():
+
+                        out = {'ok': False, 'err': '接收端由开发者配置，客户端不可指定'}
+
+                    else:
+
+                        # auto / include_paths 已恒开（第 162 项），界面也不再有开关；
+
+                        # 这里只接受 collect，其余字段一律忽略。
+
+                        error_report.save_conf({
+
+                            'collect': bool(req['collect']) if 'collect' in req else cur['collect'],
+
+                        })
+
+                        out = error_report.status()
+
+                elif op == 'test':
+
+                    # 只生成预览，不落盘：让用户没遇到错误时也能看清「将要发送什么」
+
+                    demo = error_report.build('manual-preview', RuntimeError,
+
+                        RuntimeError('预览示例：这不是真实错误'), None, cur['include_paths'])
+
+                    out = {'ok': True, 'text': error_report.markdown(demo)}
+
+                elif op == 'preview':
+
+                    rid = str(req.get('id') or '')
+
+                    r = error_report.get_report(rid) if rid else None
+
+                    if r is None:
+
+                        items = error_report.list_reports()
+
+                        r = error_report.get_report(items[0]['id']) if items else None
+
+                    out = {'ok': r is not None, 'text': error_report.markdown(r) if r else ''}
+
+                elif op == 'send':
+
+                    rid = str(req.get('id') or '')
+
+                    if not rid:
+
+                        items = error_report.list_reports()
+
+                        rid = items[0]['id'] if items else ''
+
+                    ok, err = error_report.send_one(rid) if rid else (False, '没有待发送的报告')
+
+                    out = {'ok': ok, 'err': err, 'state': error_report.status()}
+
+                elif op == 'feedback':
+
+                    # 界面看着不对但没抛异常时，用户主动写一句描述生成报告。
+
+                    # 不受 collect 开关影响（那是自动捕获的开关），同样二次脱敏。
+
+                    txt = str(req.get('text') or '')[:2000]
+
+                    rid = error_report.save_feedback(txt, cur['include_paths'])
+
+                    out = {'ok': rid is not None, 'err': '' if rid else '请先写一句描述', 'state': error_report.status()}
+
+                elif op == 'export':
+
+                    fp = error_report.export_report(str(req.get('id') or ''))
+
+                    out = {'ok': fp is not None, 'path': str(fp) if fp else ''}
+
+                elif op == 'clear':
+
+                    out = {'ok': True, 'n': error_report.clear_reports(), 'state': error_report.status()}
+
+                else:
+
+                    out = {'ok': False, 'err': '未知 op'}
+
+                body = json.dumps(out, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/backup'):
+
+                import base64
+
+                try:
+
+                    raw = base64.b64decode(str(req.get('data') or ''), validate=True)
+
+                except Exception:
+
+                    raw = b''
+
+                body = json.dumps(settings_backup.restore(app_dir(), raw),
+
+                                  ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -20256,103 +21621,25 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/export'):
-                # Pro（第 140 项）：把当前搜索结果导出成 Excel。
-                # 只挂**新增**功能 —— 现有 28 个 API 一个都没上锁，反锁等于口碑自杀。
-                if not license_feature('export'):
+                # Pro（第 140 项）：门控只挂在新增 API 上，28 个已发 API 一个没锁。
+                # 实现在私有 pro/ 包；公开源码版没有该包时关闭入口。
+                if pro_api is None or not license_feature('export'):
                     body = json.dumps({'ok': False, 'pro': True},
                                       ensure_ascii=False).encode()
                 else:
-                    rows = req.get('rows') or []
-                    if not isinstance(rows, list) or not rows:
-                        body = json.dumps({'ok': False, 'k': 'e_nothing'},
-                                          ensure_ascii=False).encode()
-                    else:
-                        try:
-                            import xlsx_writer
-                            rows = rows[:5000]
-                            q = str(req.get('q') or '').strip()[:40] or '搜索结果'
-                            p = export_dir() / ('导出_%s_%s.xlsx' % (
-                                _export_slug(q), time.strftime('%Y%m%d-%H%M%S')))
-                            p.write_bytes(xlsx_writer.build_xlsx(
-                                xlsx_writer.result_rows(rows), head=xlsx_writer.HEAD,
-                                widths=xlsx_writer.WIDTHS, sheet=q))
-                            subprocess.Popen(['explorer', '/select,', str(p)])
-                            body = json.dumps({'ok': True, 'path': str(p), 'n': len(rows)},
-                                              ensure_ascii=False).encode()
-                        except Exception as e:
-                            body = json.dumps({'ok': False, 'err': str(e)},
-                                              ensure_ascii=False).encode()
+                    body = pro_api.export(req, _B)
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/ocr_batch'):
-
                 # Pro 2（第 143 项）：所有动作走**同一个路径**、由 body 的 op 区分。
                 # 刻意不拆 /api/ocr_batch_add 之类：POST 分发是 startswith 链，
                 # 多一个前缀就多一次「顺序写反被上一个分支吃掉」的机会 ——
                 # /api/license_clear 必须排在 /api/license 前，就是这么来的。
-
-                if not license_feature(OCRQ_FEATURE):
-
+                if pro_api is None:
                     body = json.dumps({'ok': False, 'pro': True},
-
                                       ensure_ascii=False).encode()
-
                 else:
-
-                    q = ocr_batch_queue()
-
-                    op = str(req.get('op') or '').strip()
-
-                    paths = req.get('paths') if isinstance(req.get('paths'), list) else []
-
-                    dirs = req.get('dirs') if isinstance(req.get('dirs'), list) else []
-
-                    extra = {}
-
-                    if op == 'add':
-
-                        extra['added'] = q.add(
-
-                            paths=[str(x)[:400] for x in paths[:500]],
-
-                            dirs=[str(x)[:400] for x in dirs[:8]])
-
-                    elif op == 'pause':
-
-                        q.pause()
-
-                    elif op == 'resume':
-
-                        q.resume()
-
-                    elif op == 'cancel':
-
-                        q.cancel()
-
-                    elif op == 'retry':
-
-                        extra['retried'] = q.retry_failed()
-
-                    elif op == 'clear':
-
-                        q.clear()
-
-                    else:
-
-                        op = ''
-
-                    st = q.status()
-
-                    st.update(extra)
-
-                    st['ok'] = bool(op)
-
-                    if not op:
-
-                        st['k'] = 'e_bad_op'
-
-                    body = json.dumps(st, ensure_ascii=False).encode()
-
+                    body = pro_api.ocr_batch_post(req, _B)
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/update_apply'):

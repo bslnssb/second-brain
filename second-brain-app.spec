@@ -47,9 +47,10 @@ if _webdist.is_dir():
 # 显式列出来省得 PyInstaller 漏掉；win32* 由 pywin32 自带的 hook 收集。
 # win32file 是 v0.9.47 实时索引用的（brain._watch_worker 里函数内 import），
 # 不列出来 PyInstaller 不会收 —— 源码跑得好好的，exe 一启动监听就静默失败。
-hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest', 'env_check',
-                  'hotkey', 'tray', 'pypinyin', 'license_core',
-                  'xlsx_writer', 'ocr_batch',   # Pro：导出 Excel / 批量 OCR 队列
+hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest', 'env_check', 'env_msgs',   # 体检文案的西/葡/印地语表（环境体检要五语言）
+                  'hotkey', 'tray', 'pypinyin', 'license_core', 'libsets',
+                  'error_report', 'settings_backup',  # 错误日志 / 设置备份
+                  'pro', 'pro.pro_api', 'pro.ocr_batch', 'pro.xlsx_writer',  # Pro 私有包
                   'pythoncom', 'win32com.client',
                   'win32gui', 'win32api', 'win32con', 'win32process', 'win32file']
 

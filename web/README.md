@@ -25,7 +25,7 @@ pnpm test                 # vitest：语法解析 / 排序 / 省略 / 时间格�
 pnpm typecheck            # tsc --noEmit
 ```
 
-`release/github/second-brain-app.spec` 会把 `web/dist` 打进 `_internal/web`，
+`上传的干净版/second-brain-app.spec` 会把 `web/dist` 打进 `_internal/web`，
 运行期由 `brain.web_ui_dir()` 依次找：`_internal/web` → `<数据目录>/web/dist` → `<项目>/web/dist`。
 **顺序很重要**：开发时 `<项目>/web/index.html` 是 Vite 源码（引 `/src/main.tsx`），
 要是被当成成品发出去，页面就是一片白。

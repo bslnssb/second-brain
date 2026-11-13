@@ -1,33 +1,34 @@
 # 公开仓库内容清单（唯一权威）
 #
-# 这个文件回答一个问题：**release/github 里到底该有什么**。
+# 这个文件回答一个问题：**上传的干净版 里到底该有什么**。
 # 下次发版不要再凭记忆判断，跑 `python tools/sync_public.py` 和 `python tools/check_public.py`：
 #   清单里有、源目录有  → 同步过去
 #   清单里有、源目录没有 → 报错（改名或删了源文件，得改清单）
 #   仓库里有、清单里没有 → 报错（有人手滑放进来的东西）
 #
-# 三种前缀：
+# 四种前缀：
 #   sync  从开发根（../../）同步过来；开发根是唯一维护地
 #   local 只在这个仓库里维护，开发根没有（构建脚本、仓库自己的图标、CI 配置）
 #   build 构建产物，由 `npm run build` 生成在开发根 web/dist，同步过来；不进 git
+#   private 专业版私有模块，从开发根 pro/ 镜像到本仓库 pro/ 供打包；
+#           被 .gitignore 排除，git ls-files 里绝不能出现
 #
 # 目录以 / 结尾 = 整个子树。
 # 被 .gitignore 排除的东西（node_modules、dist、build、*.log）不用写在这里。
 
 # ─────────────────────────── 内核（开发根是唯一维护地） ───────────────────────────
 sync  brain.py
+sync  libsets.py
+sync  error_report.py
+sync  settings_backup.py
 # 离线授权（第 137 项）：纯标准库 Ed25519，只有公钥进 exe；
 # 签发工具在开发根 tools/make_license.py，**不进本仓库**（私钥更不进）
 sync  license_core.py
-sync  xlsx_writer.py
 # Pro 2 批量 OCR 队列的状态机（第 143 项）：纯标准库，不 import brain
-sync  ocr_batch.py
 sync  setup_app.py
 sync  selftest.py
 sync  preflight.py
 sync  tests/test_settings.py
-sync  tests/test_xlsx.py
-sync  tests/test_ocr_batch.py
 sync  tests/test_brain_pure.py
 sync  tests/test_brain_pure2.py
 sync  tests/test_autostart_setup.py
@@ -40,9 +41,15 @@ sync  tests/test_env_matrix.py
 sync  tests/test_fs_safety.py
 sync  tests/test_db_recovery.py
 sync  tests/test_env_check.py
+sync  tests/test_i18n_langs.py
+sync  tests/test_titlebar_flag.py
 sync  tests/test_qsyntax.py
 sync  tests/test_license.py
+sync  tests/test_care.py
+sync  tests/test_dedupe_nested.py
+sync  tests/test_appearance.py
 sync  env_check.py
+sync  env_msgs.py
 sync  app_window.py
 sync  hotkey.py
 sync  tray.py
@@ -61,6 +68,7 @@ sync  使用说明.es.md
 sync  使用说明.hi.md
 sync  使用说明.pt.md
 sync  version.json
+sync  update_sources.example.json
 
 # ─────────────────────────── 前端源码（构建产物见 build/） ───────────────────────────
 sync  web/index.html
@@ -124,5 +132,13 @@ local logo256.png
 local tools/
 local .github/
 
+# ─────────────────────────── 专业版私有模块（不进 git） ───────────────────────────
+# private：从开发根 pro/ 镜像到打包工作区 上传的干净版/pro/，只给 PyInstaller
+# 打 exe 用；被 .gitignore 排除。check_public.py 与 preflight.py 都会断言
+# 「git ls-files 里没有 pro/」。公开源码版没有这个包时，brain.py 的
+# `from pro import pro_api` 降级为 pro_api=None，Pro 入口关闭、免费功能不受影响。
+private pro/
+
 # ─────────────────────────── 构建产物（不进 git） ───────────────────────────
 build web/dist/
+local 报告问题.bat

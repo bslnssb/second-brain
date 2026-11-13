@@ -538,13 +538,137 @@ def platform_release():
 # 判定：把测量结果翻译成「行 / 要注意 / 不行」
 # ══════════════════════════════════════════════════════════════════
 
-def judge(info):
+# ── 体检文案（第 174 项）─────────────────────────────────────────
+# 以前 judge() 把中文写死在 30 个 add() 里，界面切到英文后上半截英文、
+# 下半截中文。这里把文案抽成表：中文留作默认（调用处传），英文走 _EN。
+# 西/葡/印地先用英文兜底 —— WebView2 / SMB / quick_check 这些术语用英文反而更准。
+_EN = {
+    'wv_missing_t': 'WebView2 runtime is missing',
+    'wv_missing_d': 'The window cannot open: you get a blank screen or it exits at once, '
+                    'even though the service is already running',
+    'wv_missing_f': 'Install it once (~2MB): %s',
+    'wv_old_t': 'WebView2 runtime is old (%s)',
+    'wv_old_d': 'Some newer APIs are missing; individual pages may render wrong',
+    'wv_old_f': 'Update to the latest version: %s',
+    'wv_ok_t': 'WebView2 runtime %s',
+
+    'data_bad_t': 'Program folder is not writable',
+    'data_bad_d': 'Data folder %s %s',
+    'data_moved': 'was switched to %s',
+    'data_nofb': 'and the fallback folder is not writable either',
+    'data_bad_f': 'Move the program to a folder you can write to (e.g. D:/SecondBrain) '
+                  'and start it again',
+    'data_ok_t': 'Data folder is writable: %s',
+    'unc_t': 'Data folder is on a network path (%s)',
+    'unc_d': 'SQLite file locking over SMB is unreliable: the index may get corrupted '
+             'or report "database is locked"',
+    'unc_f': 'Put the program on a local disk (e.g. D:/SecondBrain) and start it again',
+    'sync_t': 'Data folder is inside a sync folder (%s)',
+    'sync_d': 'The index is over 1 GB and written constantly; sync tools re-upload it '
+              'and briefly lock the files',
+    'sync_f': 'Move the program out of the sync folder; back up settings.json separately',
+
+    'disk_low_t': 'Not enough free disk space (%d MB)',
+    'disk_low_d': 'Indexing needs to write; running out mid-way leaves a partial index',
+    'disk_low_f': 'Free up at least 1 GB before indexing',
+    'disk_some_t': 'Free disk space is low (%d MB)',
+    'disk_ok_t': '%.1f GB free',
+
+    'screen_t': 'Primary display %d×%d @%d%% (logical %d×%d)',
+    'screen_small_t': 'Usable screen area is small',
+    'screen_small_d': 'Logical %d×%d; the quick window and the main window shrink to fit',
+    'screen_small_f': 'Nothing breaks, but windows will feel cramped',
+    'multi_t': '%d displays detected',
+
+    'remote_t': 'Running in a Remote Desktop session',
+    'remote_d': 'WebView2 may show black blocks or stop refreshing over RDP',
+    'remote_f': 'If it glitches, start with --disable-gpu or use a local display',
+    'gpu_t': 'Graphics is using the basic display adapter (%s)',
+    'gpu_d': 'No hardware acceleration; WebView2 may flicker or show black blocks',
+    'gpu_f': 'Install the GPU driver, or start with --disable-gpu',
+
+    'db_missing_t': 'No index yet (created on first launch)',
+    'db_ok_t': 'Index is healthy (%.1f MB)',
+    'db_busy_t': 'Index is being written; integrity check skipped',
+    'db_busy_d': 'Normal during the first scan or a rebuild — run the check again later',
+    'db_bad_t': 'Index is broken (%s)',
+    'db_bad_d': 'On startup the bad file is archived and an empty index is created; '
+                'you need to index once more',
+    'db_bad_f': 'If this repeats, check disk health (smartctl / chkdsk)',
+
+    'port_running_t': 'Another instance is running (port %d)',
+    'port_free_t': 'Port %d is available',
+    'port_full_t': 'Ports 8765–8776 are all in use',
+    'port_full_d': 'The service cannot start and the UI cannot connect',
+    'port_full_f': 'Close whatever holds these ports (netstat -ano | findstr 8765)',
+    'port_other_t': 'Port %d belongs to an instance with a different data folder',
+    'port_other_d': 'Left by another Windows session or another install; it is not reused '
+                    '(this one takes the next free port)',
+
+    'sys_t': '%s · %s · %s · %.1f GB RAM',
+    'sys_admin': 'Administrator',
+    'sys_user': 'standard user',
+    'font_ok_t': 'Microsoft YaHei is available',
+    'font_bad_t': 'Microsoft YaHei is missing',
+    'font_bad_d': 'Chinese text may show as boxes',
+    'font_bad_f': 'Install the "Microsoft YaHei" font (bundled with Windows; '
+                  'your image had it stripped)',
+    'longpath_t': 'Long path support is off',
+    'longpath_d': 'Paths over 260 characters are skipped (the rest still index fine)',
+    'longpath_f': 'If files are missing from the index, enable LongPathsEnabled and re-scan',
+    'theme_t': 'System is in dark mode',
+    'contrast_t': 'High contrast is on',
+    'nonascii_t': 'Data folder contains non-ASCII characters',
+
+    'rpt_title': 'Second Brain · environment check    %s',
+    'rpt_plan': 'Layout: main %d×%d · quick %d wide (screen %d×%d)%s',
+    'rpt_gpu': ' · hardware acceleration recommended off',
+    'rpt_concl': 'Result: %s',
+    'rpt_fail': '%d unavailable — must fix',
+    'rpt_warn': '%d to look at, still usable',
+    'rpt_ok': 'environment looks fine',
+}
+
+
+# 西/葡/印地语的文案在 env_msgs.py（第 176 项）。以前这里只有英文表、把三种语言
+# 全指到英文，用户切到那三种语言时体检面板与「复制诊断」正文仍是英文 —— 看起来
+# 就像「只有英语和中文」。模块缺失时退回英文，绝不因为翻译文件坏了让体检崩掉。
+try:
+    from env_msgs import TABLES as _TABLES
+except Exception:                                   # pragma: no cover
+    _TABLES = {}
+
+
+def _use_en(lang):
+    """非中文语言是否走英文表 —— 只用于 `render` 的旧调用兼容。"""
+    return bool(lang) and not str(lang).lower().startswith('zh')
+
+
+def _table(lang):
+    """按语言取文案表：中文返回 {}（用调用处写的中文默认值）。"""
+    l = str(lang or '').lower()
+    if not l or l.startswith('zh'):
+        return {}
+    if l.startswith('es'):
+        return _TABLES.get('es') or _EN
+    if l.startswith('pt'):
+        return _TABLES.get('pt') or _EN
+    if l.startswith('hi'):
+        return _TABLES.get('hi') or _EN
+    return _EN
+
+
+def judge(info, lang='zh'):
     """返回 [{level, key, title, detail, fix}]，level ∈ OK/INFO/WARN/FAIL。
 
     判定只依赖实测值。FAIL = 「这台机器上功能确实用不了」，WARN = 「能用但吃亏」，
     INFO = 「记录一下，出问题时有用」。
     """
     r = []
+    T = _table(lang)
+
+    def M(k, zh):
+        return T.get(k) or zh
 
     def add(level, key, title, detail='', fix=''):
         r.append({'level': level, 'key': key, 'title': title,
@@ -553,124 +677,132 @@ def judge(info):
     # ① WebView2 —— 没有它就没有界面
     wv = info.get('webview2') or ''
     if not wv:
-        add('FAIL', 'webview2', '缺少 WebView2 运行时',
-            '窗口起不来会白屏或直接退出，服务其实已经跑起来了',
-            '装一次即可（约 2MB）：%s' % _WV2_URL)
+        add('FAIL', 'webview2', M('wv_missing_t', '缺少 WebView2 运行时'),
+            M('wv_missing_d', '窗口起不来会白屏或直接退出，服务其实已经跑起来了'),
+            M('wv_missing_f', '装一次即可（约 2MB）：%s') % _WV2_URL)
     elif _ver_tuple(wv) < (100,):
-        add('WARN', 'webview2', 'WebView2 运行时偏旧（%s）' % wv,
-            '新版 API 缺失，个别页面可能显示异常',
-            '建议升级到最新版：%s' % _WV2_URL)
+        add('WARN', 'webview2', M('wv_old_t', 'WebView2 运行时偏旧（%s）') % wv,
+            M('wv_old_d', '新版 API 缺失，个别页面可能显示异常'),
+            M('wv_old_f', '建议升级到最新版：%s') % _WV2_URL)
     else:
-        add('OK', 'webview2', 'WebView2 运行时 %s' % wv)
+        add('OK', 'webview2', M('wv_ok_t', 'WebView2 运行时 %s') % wv)
 
     # ② 数据目录可写 + 空间
     if not info.get('data_writable'):
         fb_ok = info.get('fallback_writable')
-        add('WARN' if fb_ok else 'FAIL', 'data_dir', '程序目录写不进去',
-            '数据目录 %s %s' % (info.get('data_dir'),
-                              '已自动改到 %s' % info.get('fallback_dir') if fb_ok
-                              else '回落目录也写不进去'),
-            '' if fb_ok else '把程序换到有写权限的目录（如 D:\\SecondBrain）再启动')
+        add('WARN' if fb_ok else 'FAIL', 'data_dir',
+            M('data_bad_t', '程序目录写不进去'),
+            M('data_bad_d', '数据目录 %s %s')
+            % (info.get('data_dir'),
+               (M('data_moved', '已自动改到 %s') % info.get('fallback_dir')) if fb_ok
+               else M('data_nofb', '回落目录也写不进去')),
+            '' if fb_ok else M('data_bad_f',
+                               '把程序换到有写权限的目录（如 D:/SecondBrain）再启动'))
     else:
-        add('OK', 'data_dir', '数据目录可写：%s' % info.get('data_dir'))
+        add('OK', 'data_dir',
+            M('data_ok_t', '数据目录可写：%s') % info.get('data_dir'))
     if info.get('data_unc'):
-        add('WARN', 'data_unc', '数据目录在网络路径上（%s）' % info.get('data_dir'),
-            'sqlite 在 SMB 共享上的文件锁不可靠，索引可能损坏或报 database is locked',
-            '把程序放到本地磁盘（如 D:\\SecondBrain）再启动')
+        add('WARN', 'data_unc',
+            M('unc_t', '数据目录在网络路径上（%s）') % info.get('data_dir'),
+            M('unc_d', 'sqlite 在 SMB 共享上的文件锁不可靠，索引可能损坏或报 database is locked'),
+            M('unc_f', '把程序放到本地磁盘（如 D:/SecondBrain）再启动'))
     if info.get('data_sync'):
-        add('WARN', 'data_sync', '数据目录在同步盘里（%s）' % info.get('data_sync'),
-            '索引库有一千多 MB 且持续写入，同步工具会反复上传并短暂锁文件',
-            '把程序移出同步目录；要备份的话单独备份 settings.json 就够了')
+        add('WARN', 'data_sync',
+            M('sync_t', '数据目录在同步盘里（%s）') % info.get('data_sync'),
+            M('sync_d', '索引库有一千多 MB 且持续写入，同步工具会反复上传并短暂锁文件'),
+            M('sync_f', '把程序移出同步目录；要备份的话单独备份 settings.json 就够了'))
     fm = info.get('free_mb', -1)
     if fm >= 0:
         if fm < MIN_FREE_MB:
-            add('FAIL', 'disk', '磁盘剩余空间不足（%d MB）' % fm,
-                '建索引需要写入，空间不够会中途失败、索引残缺',
-                '清理出至少 1 GB 再建索引')
+            add('FAIL', 'disk', M('disk_low_t', '磁盘剩余空间不足（%d MB）') % fm,
+                M('disk_low_d', '建索引需要写入，空间不够会中途失败、索引残缺'),
+                M('disk_low_f', '清理出至少 1 GB 再建索引'))
         elif fm < 1024:
-            add('WARN', 'disk', '磁盘剩余空间偏少（%d MB）' % fm)
+            add('WARN', 'disk', M('disk_some_t', '磁盘剩余空间偏少（%d MB）') % fm)
         else:
-            add('OK', 'disk', '磁盘剩余 %.1f GB' % (fm / 1024))
+            add('OK', 'disk', M('disk_ok_t', '磁盘剩余 %.1f GB') % (fm / 1024))
 
     # ③ 屏幕与缩放 —— 小屏 + 高缩放会把窗口顶出屏幕
     prim = info.get('primary')
     if prim:
         lw, lh = prim['logical_w'], prim['logical_h']
         add('OK' if lw >= 1000 else 'INFO', 'screen',
-            '主屏 %d×%d @%d%%（逻辑 %d×%d）'
+            M('screen_t', '主屏 %d×%d @%d%%（逻辑 %d×%d）')
             % (prim['phys_w'], prim['phys_h'], prim['scale'], lw, lh))
         if lw < MINI_DESIGN_W + 40 or lh < 560:
-            add('WARN', 'screen_small', '屏幕可用区域偏小',
-                '逻辑 %d×%d，快搜窗与主窗口已按可用区收缩' % (lw, lh),
-                '功能不受影响，但窗口会比较紧凑')
+            add('WARN', 'screen_small', M('screen_small_t', '屏幕可用区域偏小'),
+                M('screen_small_d', '逻辑 %d×%d，快搜窗与主窗口已按可用区收缩') % (lw, lh),
+                M('screen_small_f', '功能不受影响，但窗口会比较紧凑'))
         if len(info.get('screens') or []) > 1:
             add('INFO', 'multi_monitor',
-                '检测到 %d 块屏幕' % len(info['screens']),
-                '; '.join('%s %d×%d@%d%%' % (s['name'].strip('\\\\.\\'), s['phys_w'],
+                M('multi_t', '检测到 %d 块屏幕') % len(info['screens']),
+                '; '.join('%s %d×%d@%d%%' % (s['name'].strip(chr(92) + '.' + chr(92)), s['phys_w'],
                                              s['phys_h'], s['scale'])
                           for s in info['screens']))
 
     # ④ 显卡 / 远程桌面 —— WebView2 的黑块白块大半出在这里
     ad = (info.get('adapter') or '').lower()
     if info.get('remote_session'):
-        add('WARN', 'remote', '当前是远程桌面会话',
-            'WebView2 在远程桌面里可能黑块或不刷新',
-            '如遇花屏，启动时加 --disable-gpu 或改用本机屏幕')
+        add('WARN', 'remote', M('remote_t', '当前是远程桌面会话'),
+            M('remote_d', 'WebView2 在远程桌面里可能黑块或不刷新'),
+            M('remote_f', '如遇花屏，启动时加 --disable-gpu 或改用本机屏幕'))
     if any(k in ad for k in ('basic display', 'basic render', '标准 vga')):
-        add('WARN', 'gpu', '显卡驱动是系统基础适配器（%s）' % info.get('adapter'),
-            '没有硬件加速，WebView2 可能闪烁或黑块',
-            '装显卡驱动；或启动时加 --disable-gpu')
+        add('WARN', 'gpu',
+            M('gpu_t', '显卡驱动是系统基础适配器（%s）') % info.get('adapter'),
+            M('gpu_d', '没有硬件加速，WebView2 可能闪烁或黑块'),
+            M('gpu_f', '装显卡驱动；或启动时加 --disable-gpu'))
 
     # ⑤ 数据库
     st = info.get('db_state')
     if st == 'missing':
-        add('INFO', 'db', '还没有索引库（首次启动会建）')
+        add('INFO', 'db', M('db_missing_t', '还没有索引库（首次启动会建）'))
     elif st == 'ok':
-        add('OK', 'db', '索引库完好（%.1f MB）' % info.get('db_mb', 0))
+        add('OK', 'db', M('db_ok_t', '索引库完好（%.1f MB）') % info.get('db_mb', 0))
     elif st == 'busy':
-        add('INFO', 'db', '索引库正在被写入，跳过完整性检查',
-            '首次扫描或重建索引时正常现象，稍后再自检一次即可')
+        add('INFO', 'db', M('db_busy_t', '索引库正在被写入，跳过完整性检查'),
+            M('db_busy_d', '首次扫描或重建索引时正常现象，稍后再自检一次即可'))
     else:
-        add('FAIL', 'db', '索引库异常（%s）' % st,
-            '启动时会自动留档坏库并重建空库，需要重新建一次索引',
-            '若反复出现，检查磁盘健康（smartctl / chkdsk）')
+        add('FAIL', 'db', M('db_bad_t', '索引库异常（%s）') % st,
+            M('db_bad_d', '启动时会自动留档坏库并重建空库，需要重新建一次索引'),
+            M('db_bad_f', '若反复出现，检查磁盘健康（smartctl / chkdsk）'))
 
     # ⑥ 端口
     fp = info.get('free_port')
     if info.get('svr_running'):
-        add('OK', 'port', '已有实例在运行（端口 %d）' % _ours_port(info))
+        add('OK', 'port', M('port_running_t', '已有实例在运行（端口 %d）') % _ours_port(info))
     elif fp:
-        add('OK', 'port', '可用端口 %d' % fp)
+        add('OK', 'port', M('port_free_t', '可用端口 %d') % fp)
     else:
-        add('FAIL', 'port', '8765–8776 全部被占用',
-            '服务起不来，界面连不上',
-            '关掉占用这些端口的程序（netstat -ano | findstr 8765）')
+        add('FAIL', 'port', M('port_full_t', '8765–8776 全部被占用'),
+            M('port_full_d', '服务起不来，界面连不上'),
+            M('port_full_f', '关掉占用这些端口的程序（netstat -ano | findstr 8765）'))
     if info.get('other_user_port'):
         add('INFO', 'port_other',
-            '端口 %d 上是**另一个数据目录**的实例' % info['other_user_port'],
-            '多用户会话 / 另一份安装留下的，不会复用（会自己换下一个端口）')
+            M('port_other_t', '端口 %d 上是**另一个数据目录**的实例') % info['other_user_port'],
+            M('port_other_d', '多用户会话 / 另一份安装留下的，不会复用（会自己换下一个端口）'))
 
     # ⑦ 系统能力（只记录，不影响判定）
-    add('INFO', 'sys', '%s · %s · %s · 内存 %.1f GB'
-        % (info.get('windows', '?'), info.get('arch', '?'),
-           '管理员' if info.get('admin') else '普通用户', info.get('mem_gb', 0)))
-    add('OK' if info.get('font_yahei') else 'WARN', 'font',
-        '微软雅黑' + ('可用' if info.get('font_yahei') else '缺失'),
-        '' if info.get('font_yahei') else '中文可能显示成方块',
-        '' if info.get('font_yahei') else '装一下「微软雅黑」字体（Windows 自带，被精简掉了）')
+    role = M('sys_admin', '管理员') if info.get('admin') else M('sys_user', '普通用户')
+    add('INFO', 'sys', M('sys_t', '%s · %s · %s · 内存 %.1f GB')
+        % (info.get('windows', '?'), info.get('arch', '?'), role, info.get('mem_gb', 0)))
+    if info.get('font_yahei'):
+        add('OK', 'font', M('font_ok_t', '微软雅黑可用'))
+    else:
+        add('WARN', 'font', M('font_bad_t', '微软雅黑缺失'),
+            M('font_bad_d', '中文可能显示成方块'),
+            M('font_bad_f', '装一下「微软雅黑」字体（Windows 自带，被精简掉了）'))
     if not info.get('long_paths'):
-        add('INFO', 'longpath', '系统未启用长路径支持',
-            '超过 260 字符的路径会被跳过（不影响其余文件）',
-            '如索引有遗漏，可开启 LongPathsEnabled 后重扫')
+        add('INFO', 'longpath', M('longpath_t', '系统未启用长路径支持'),
+            M('longpath_d', '超过 260 字符的路径会被跳过（不影响其余文件）'),
+            M('longpath_f', '如索引有遗漏，可开启 LongPathsEnabled 后重扫'))
     if info.get('dark'):
-        add('INFO', 'theme', '系统为深色模式')
+        add('INFO', 'theme', M('theme_t', '系统为深色模式'))
     if info.get('high_contrast'):
-        add('INFO', 'contrast', '系统开启了高对比度')
+        add('INFO', 'contrast', M('contrast_t', '系统开启了高对比度'))
     if not info.get('data_ascii'):
-        add('INFO', 'nonascii', '数据目录含非 ASCII 字符',
+        add('INFO', 'nonascii', M('nonascii_t', '数据目录含非 ASCII 字符'),
             info.get('data_dir', ''))
     return r
-
 
 def _ours_port(info):
     for p, v in (info.get('ports') or {}).items():
@@ -728,11 +860,16 @@ def plan(info):
 _ICON = {'OK': '[ OK ]', 'INFO': '[info]', 'WARN': '[ !! ]', 'FAIL': '[FAIL]'}
 
 
-def render(info, issues=None, color=False):
+def render(info, issues=None, color=False, lang='zh'):
     """人类可读报告。用户能直接截图发过来 —— 这就是「把现场搬过来」。"""
-    issues = issues if issues is not None else judge(info)
+    T = _table(lang)
+
+    def M(k, zh):
+        return T.get(k) or zh
+
+    issues = issues if issues is not None else judge(info, lang)
     lines = []
-    lines.append('第二大脑 · 环境自检    %s' % info.get('ts', ''))
+    lines.append(M('rpt_title', '第二大脑 · 环境自检    %s') % info.get('ts', ''))
     lines.append('=' * 64)
     for it in issues:
         lines.append('%s %s' % (_ICON.get(it['level'], it['level']), it['title']))
@@ -742,15 +879,16 @@ def render(info, issues=None, color=False):
             lines.append('       → %s' % it['fix'])
     p = plan(info)
     lines.append('-' * 64)
-    lines.append('适配结果：主窗 %d×%d · 快搜窗 %d 宽（屏 %d×%d）%s'
+    lines.append(M('rpt_plan', '适配结果：主窗 %d×%d · 快搜窗 %d 宽（屏 %d×%d）%s')
                  % (p['main_w'], p['main_h'], p['mini_w'],
                     p['logical_w'], p['logical_h'],
-                    ' · 建议关硬件加速' if p['disable_gpu'] else ''))
+                    M('rpt_gpu', ' · 建议关硬件加速') if p['disable_gpu'] else ''))
     n_fail = sum(1 for i in issues if i['level'] == 'FAIL')
     n_warn = sum(1 for i in issues if i['level'] == 'WARN')
-    lines.append('结论：%s' % ('%d 项不可用，必须先处理' % n_fail if n_fail
-                            else ('%d 项需注意，功能可用' % n_warn if n_warn
-                                  else '本机环境正常')))
+    lines.append(M('rpt_concl', '结论：%s') % (
+        M('rpt_fail', '%d 项不可用，必须先处理') % n_fail if n_fail
+        else (M('rpt_warn', '%d 项需注意，功能可用') % n_warn if n_warn
+              else M('rpt_ok', '本机环境正常'))))
     return '\n'.join(lines)
 
 
