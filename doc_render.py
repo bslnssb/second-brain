@@ -69,6 +69,11 @@ TIMEOUT_COOLDOWN = 300.0   # 卡死过的文件 5 分钟内不再试（不然每
 # 不重试、长冷却，前端直接提示「点打开看原件」。
 MAX_SANE_PAGES = 5000
 
+# 第 394 项：用户要求「在这台电脑上感觉不到卡」。转换本身降了优先级（第 392 项），
+# 但还有一笔浪费：在结果列表里连按上下键，每换一行前端就要一次页图 → 每份都排一次转换。
+# 所以任务入队后先「稳」这么久才准开工 —— 停下来的那一份才值得起一次 WPS（起引擎 3~4 秒）。
+SETTLE_DELAY = 0.35
+
 # 我们自己的引擎可能是 WPS 假装的 Word（错误信息里写着 Kingsoft WPS），所以进程名都认
 ENGINE_EXES = ('wps.exe', 'winword.exe', 'et.exe', 'excel.exe', 'wpp.exe', 'powerpnt.exe')
 
@@ -78,6 +83,7 @@ _FAILED = {}            # key -> (时间, 原因, 冷却秒数)
 _APPS = {}              # kind -> {'app':..., 'last':..., 'prog':..., 'pids':()}
 _TASKS = []             # [(key, path, out, kind, base)]，从尾部取（最新优先）
 _INFLIGHT = set()       # 已排队 / 正在转的 key
+_ENQ = {}               # key -> 入队时间（第 394 项：稳 350ms 才开工）
 _LOCK = threading.Lock()
 _WORKER = None
 _CO_INIT = threading.local()
@@ -620,15 +626,34 @@ def _fail_cooldown(box):
     return FAIL_COOLDOWN
 
 
+def _settled(task):
+    """这一份在队列里待够 SETTLE_DELAY 了吗（第 394 项）。"""
+    try:
+        return time.time() - _ENQ.get(task[0], 0.0) >= SETTLE_DELAY
+    except Exception:                    # noqa: BLE001
+        return True
+
+
 def _loop():
     _co()
     while True:
         with _LOCK:
-            task = _TASKS.pop() if _TASKS else None
+            task = _TASKS[-1] if _TASKS else None
         if task is None:
             _reap_apps()
             time.sleep(0.25)
             continue
+        if not _settled(task):
+            # 第 394 项：刚排上来的先让它「稳一稳」，用户在列表里连按上下键时
+            # 只有停下来的那一份才值得起一次 WPS（起引擎就要 3~4 秒）
+            time.sleep(0.05)
+            continue
+        with _LOCK:
+            if _TASKS and _TASKS[-1] is task:
+                _TASKS.pop()
+                _ENQ.pop(task[0], None)
+            else:                        # 这一份已经被更新的挤掉了
+                continue
         key, path, out, kind, base, mode, q = task
         qn = ' '.join(_q_tokens(q))
         box = {'mode': mode, 'q': qn}
@@ -703,10 +728,12 @@ def _enqueue(key, path, out, kind, base, mode, q=''):
                         _TASKS[i] = t[:6] + (q,)
             return
         _INFLIGHT.add(key)
+        _ENQ[key] = time.time()          # 第 394 项：从这一刻开始算「稳」
         _TASKS.append((key, path, out, kind, base, mode, q))
         while len(_TASKS) > MAX_QUEUE:
             old = _TASKS.pop(0)
             _INFLIGHT.discard(old[0])
+            _ENQ.pop(old[0], None)
     _ensure_worker()
 
 
@@ -914,6 +941,7 @@ def clear_failure(path=None):
     """单测/排障用：把失败冷却清掉。"""
     if path is None:
         _FAILED.clear()
+        _ENQ.clear()
     else:
         _FAILED.pop(_norm(path), None)
 

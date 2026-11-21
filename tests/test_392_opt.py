@@ -144,5 +144,38 @@ class TestGridNoConvert(Base):
         self.assertGreaterEqual(len(calls), 2, '转换途中要再降一次（1 秒一轮）')
 
 
+class TestSettle(Base):
+    """第 394 项：连按上下键时只有停下来的那一份才开工（起一次 WPS 要 3~4 秒）。"""
+
+    def _mk(self, name='a.docx'):
+        p = os.path.join(self.dir, name)
+        with open(p, 'wb') as f:
+            f.write(b'PK')
+        return p
+
+    def test_fresh_task_not_settled(self):
+        p = self._mk()
+        doc_render.pdf_page_source(p, self.dir, 0, '等保')
+        task = doc_render._TASKS[-1]
+        self.assertFalse(doc_render._settled(task))
+        doc_render._ENQ[task[0]] = 1.0        # 假装排队很久了
+        self.assertTrue(doc_render._settled(task))
+
+    def test_queue_drop_clears_enq(self):
+        old_delay = doc_render.SETTLE_DELAY
+        doc_render.SETTLE_DELAY = 0.35
+        try:
+            paths = [self._mk('f%d.docx' % i) for i in range(doc_render.MAX_QUEUE + 1)]
+            for p in paths:
+                doc_render.pdf_page_source(p, self.dir, 0, '等保')
+            with doc_render._LOCK:
+                self.assertEqual(len(doc_render._TASKS), doc_render.MAX_QUEUE)
+                keys = [t[0] for t in doc_render._TASKS]
+                self.assertEqual(set(doc_render._ENQ.keys()), set(keys),
+                                 '被挤掉的任务要从 _ENQ 里清掉')
+        finally:
+            doc_render.SETTLE_DELAY = old_delay
+
+
 if __name__ == '__main__':
     unittest.main()
