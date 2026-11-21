@@ -73,6 +73,10 @@ import plat.shell as plat_shell
 import plat.paths as plat_paths
 # 第 385 项：Word/Excel/PPT 借本机 Office/WPS 转 PDF 出页图（详见 doc_render.py 顶部）
 import doc_render
+# 第 387 项：转换改成「后台排队 + 复用引擎」（WPS 实例闲置才 Quit）。
+# 进程退出时把复用的实例收干净，别留后台 WPS。
+import atexit as _atexit
+_atexit.register(doc_render.shutdown_apps)
 
 # 第 243 项：音频时长探测（纯标准库，不依赖 mutagen/ffmpeg）。
 import audio_probe
@@ -13547,10 +13551,9 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
 
         if not _pdf:
 
-            with THUMB_LOCK:
-
-                THUMB_FAIL[k] = time.time()
-
+            # 第 387 项：Office 的「转不出来」统一由 doc_render 管冷却（60s，且每次
+            # 都会换干净实例重试）。这里**不许**再写 THUMB_FAIL —— 那张表是 300s，
+            # 会把排队 / 偶发 RPC 失败的文件按住 5 分钟，用户看到「图一直不出来」。
             return None
 
         path = _pdf

@@ -6,7 +6,7 @@
  * 没注册 Shell 缩略图处理器，出图只会是空白破图）。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { Preview } from './panels'
 
 const noop = () => {}
@@ -77,11 +77,36 @@ describe('Preview 详情面板的预览（第 312 项）', () => {
     expect(container.textContent).toContain('台账.xlsx')
   })
 
-  it('第 385 项：页图取不到时（没装 Office/WPS）回落成纯前端版面预览', () => {
-    const { container } = draw('D:\\doc\\方案.docx', 'docx')
-    const img = container.querySelector('img') as HTMLImageElement
-    fireEvent.error(img)
-    return waitFor(() => expect(container.textContent).toContain('版面预览'))
+  it('第 385/387 项：页图第一次取不到先自动重试（Office 要在后台转 PDF）', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = draw('D:\\doc\\方案.docx', 'docx')
+      const img = container.querySelector('img') as HTMLImageElement
+      fireEvent.error(img)
+      // 不能一失败就判死：图还在、给「正在排版」的提示
+      expect(container.querySelector('img')).toBeTruthy()
+      expect(container.textContent).toContain('排版')
+      expect(container.textContent).not.toContain('版面预览')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('第 387 项：重试到上限才回落成纯前端版面预览（真的没 Office/WPS）', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = draw('D:\\doc\\方案.docx', 'docx')
+      for (let i = 0; i < 32; i++) {
+        const im = container.querySelector('img') as HTMLImageElement | null
+        if (im) fireEvent.error(im)
+        act(() => {
+          vi.advanceTimersByTime(3000)
+        })
+      }
+      expect(container.textContent).toContain('版面预览')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('exe / 音频 / 文件夹：既不画图也不自动读正文', () => {

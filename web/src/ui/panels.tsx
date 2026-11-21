@@ -4067,7 +4067,33 @@ export function Preview({
   const isPdf = PAGE_EXT.includes(String(row.e || row.p.split('.').pop() || '').replace(/^\./, '').toLowerCase())
   const thumbSrc = (xl: boolean) =>
     `/api/thumb?p=${encodeURIComponent(row.p)}&big=1${xl ? '&xl=1' : ''}` +
-    (isPdf ? `&pg=${page}&q=${encodeURIComponent(q)}` : '')
+    (isPdf ? `&pg=${page}` : '') +
+    /* 第 387 项：只有 PDF 用关键词高亮。Office 页图不吃 q —— 以前每敲一个字 URL 就变，
+       转换/渲染被重复排一遍，是「卡」的来源之一。 */
+    (thumbExt === 'pdf' ? `&q=${encodeURIComponent(q)}` : '') +
+    /* 重试用：只用来打破浏览器对 204 的缓存，让同一个地址能真的重发 */
+    (pgTry ? `&t=${pgTry}` : '')
+
+  /* 第 387 项：Office 首次预览要后台把文档转成 PDF，**几秒到几十秒都有可能**
+     （实测 57MB 的 docx 25 秒都转不完，第 385 项那版的同步超时就是在这里把整机拖卡的）。
+     所以详情栏不再「失败一次就判死」：隔一会儿自动重发，最多 30 次（约 70 秒）。
+     PDF 与图片不依赖转换，仍旧一次失败就回落。 */
+  const isOfficePage = isPdf && thumbExt !== 'pdf'
+  const [pgTry, setPgTry] = useState(0)
+  const [thmbOk, setThmbOk] = useState(false)
+  const retryTimer = useRef<number | null>(null)
+  useEffect(() => {
+    setPgTry(0)
+    setThmbOk(false)
+    if (retryTimer.current) window.clearTimeout(retryTimer.current)
+    retryTimer.current = null
+  }, [row.p, page])
+  useEffect(
+    () => () => {
+      if (retryTimer.current) window.clearTimeout(retryTimer.current)
+    },
+    [],
+  )
   const zoomRef = useRef<HTMLDivElement | null>(null)
   /* 第 332 项：← → 的语义改成「先在当前文件里翻页，翻到头才换文件」。
      用户原话：「点击→他会跳转到下一个文件，而不是下一页……如果最后一页也看完了→
@@ -4115,6 +4141,19 @@ export function Preview({
       .catch(() => {})
     return () => { alive = false }
   }, [row.p])
+  /* 第 387 项：Office 是「先排队、几秒后才出图」，刚选中时 pdfmeta 还是 0（PDF 还没转出来）。
+     等页图真出来（thmbOk）再补问一次，翻页器才会显示「1 / 24」而不是只有一张图。 */
+  useEffect(() => {
+    if (!isPdf || !thmbOk || pages > 0) return
+    let alive = true
+    fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}`, { headers: { 'Sec-Fetch-Site': 'same-origin' } })
+      .then((r) => r.json())
+      .then((j: { pages?: number }) => {
+        if (alive && j && j.pages) setPages(Number(j.pages))
+      })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [row.p, thmbOk, pages, isPdf])
   useEffect(() => {
     if (!zoom) return
     const el = zoomRef.current
@@ -4279,9 +4318,29 @@ export function Preview({
             src={thumbSrc(expand)}
             alt=""
             className={`${expand ? 'max-h-[70vh]' : 'max-h-[420px]'} w-auto max-w-full object-contain`}
-            onError={() => setThumbBad(true)}
+            onLoad={() => setThmbOk(true)}
+            onError={() => {
+              /* 第 387 项：Office 在后台排队转换，这里等它转好；其它格式一次失败就回落。 */
+              const cap = isOfficePage ? 30 : 1
+              if (pgTry + 1 < cap) {
+                if (retryTimer.current) window.clearTimeout(retryTimer.current)
+                retryTimer.current = window.setTimeout(
+                  () => setPgTry((v) => v + 1),
+                  pgTry < 4 ? 1200 : 2500,
+                )
+              } else {
+                setThumbBad(true)
+              }
+            }}
           />
         </button>
+      )}
+      {canThumb && isOfficePage && !thmbOk && (
+        <div className="-mt-0.5 mb-2 text-center text-[10px] text-sub">
+          {thumbBad
+            ? '预览转换失败（本机 Office/WPS 没响应），点「预览版面」可以再试一次'
+            : '首次预览正在排版转换，大文件要十几秒（转好会缓存，下次秒开）'}
+        </div>
       )}
       {isPdf && pages > 1 && (
         <div className="mb-2 flex items-center justify-center gap-2 text-[11px] text-sub">
