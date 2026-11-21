@@ -23828,6 +23828,9 @@ def make_server(port=8765):
                 d.setdefault('sb_time', True)
                 # 第 338 项：左栏类型后面那列数字（全部 109763 / 图片 22842…）默认**关**。
                 d.setdefault('sb_counts', False)
+                # 第 386 项：详情栏「默认展开」默认**关** —— 保持原来那条窄栏，
+                # 谁喜欢一选中就摊开看大图，在设置 → 常规里自己打开。
+                d.setdefault('dtl_expand', False)
                 # 第 275 项：空状态列几条（默认 4，1..10）。
                 try:
                     d['qs_home_count'] = max(1, min(10, int(d.get('qs_home_count', 4) or 4)))
@@ -26175,7 +26178,7 @@ def make_server(port=8765):
 
                 # 第 327 项：左栏三块（类型分类 / 文件夹分组 / 时间筛选）可以关掉，
                 # 关掉只是不显示，筛选状态还在，重新打开照旧。
-                for _sbk in ('sb_types', 'sb_folders', 'sb_time', 'sb_counts'):
+                for _sbk in ('sb_types', 'sb_folders', 'sb_time', 'sb_counts', 'dtl_expand'):
 
                     if _sbk in req:
 

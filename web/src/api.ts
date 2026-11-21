@@ -99,6 +99,8 @@ export type Settings = {
   sb_time?: boolean
   /** 第 338 项：左栏类型后面那列条数（默认关）；也是老配置缺键时按 false 处理 */
   sb_counts?: boolean
+  /** 第 386 项：详情栏默认展开（默认关 = 原来那条窄栏）；缺键同样按 false 处理 */
+  dtl_expand?: boolean
   /** 桌面常驻悬浮球/悬浮窗开关 */
   floating_ball?: boolean
   floating_ball_x?: number

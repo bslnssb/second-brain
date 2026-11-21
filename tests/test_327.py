@@ -114,7 +114,9 @@ class ContractTest(unittest.TestCase):
 
     def test_settings_keys_whitelisted(self):
         # 一次循环收这几个键（第 338 项把 sb_counts 也加进来了）
-        self.assertTrue("for _sbk in ('sb_types', 'sb_folders', 'sb_time', 'sb_counts')" in self.b)
+        self.assertTrue(
+            "for _sbk in ('sb_types', 'sb_folders', 'sb_time', 'sb_counts', 'dtl_expand')" in self.b
+        )
         self.assertTrue("patch[_sbk] = bool(req[_sbk])" in self.b)
 
     def test_frontend_switches(self):

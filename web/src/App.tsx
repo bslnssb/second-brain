@@ -304,6 +304,8 @@ export default function App() {
   /* 第 327 项：左栏三块（类型 / 文件夹 / 时间）能不能显示，做成设置项。
      默认全开；关掉只是「不画出来」，筛选状态本身保留，重新打开还是原来那样。 */
   const [sb, setSb] = useState({ types: true, folders: false, time: true, counts: false })
+  /* 第 386 项：详情栏默认展开（设置 → 常规）。默认关，老行为不变。 */
+  const [dtlExpand, setDtlExpand] = useState(false)
   // `?panel=about` 直接打开某个面板：截图、演示录屏、排查「关于面板打不开」时用，
   // 正常使用没有任何人会带这个参数（和 /mini 的 ?q= 预填同一类调试入口）。
   const [panel, setPanel] = useState<null | 'settings' | 'about' | 'ocr'>(() => {
@@ -577,7 +579,10 @@ export default function App() {
   // 一次性取回来即可 —— 设置里改完会同时回调 sbFromSettings，不用再拉一遍。
   useEffect(() => {
     getSettings()
-      .then((r) => setSb(sbFromSettings(r)))
+      .then((r) => {
+        setSb(sbFromSettings(r))
+        setDtlExpand(r.dtl_expand === true)
+      })
       .catch(() => {})
   }, [])
 
@@ -2112,6 +2117,7 @@ export default function App() {
         <Preview
           row={activeRow!}
           q={syn.q || q}
+          defaultExpand={dtlExpand}
           onClose={() => setPv(false)}
           onOpen={() => openRow(activeRow!.p)}
           onReveal={async () => {
@@ -2168,14 +2174,15 @@ export default function App() {
         ocrRunning={ocr?.run === 'running'}
         onOpenSupport={() => setSupportOpen(true)}
         /* 第 327 项：设置里关掉左栏某一块，抽屉不用关也不用重开，主界面立刻跟着变 */
-        onSettings={(p) =>
+        onSettings={(p) => {
+          setDtlExpand((cur) => (p.dtl_expand !== undefined ? p.dtl_expand : cur))
           setSb((cur) => ({
             types: p.sb_types !== undefined ? p.sb_types : cur.types,
             folders: p.sb_folders !== undefined ? p.sb_folders : cur.folders,
             time: p.sb_time !== undefined ? p.sb_time : cur.time,
             counts: p.sb_counts !== undefined ? p.sb_counts : cur.counts,
           }))
-        }
+        }}
       />
       </div>
 

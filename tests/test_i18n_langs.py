@@ -75,7 +75,8 @@ class TestI18n(unittest.TestCase):
         # 859：第 366 项整理索引库 +10 键（maint_compact* / compact_banner / e_compact_busy）
         # 863：第 369 项截图翻译三入口 +4 键（snip_trans_btn / snip_menu_pure / snip_menu_trans / snip_menu_hint）
         # 878：第 380 项关于页「开源组件」+15 键（oss_* 清单 / 列头 / 模型指纹 / 目录 / 复制）
-        self.assertEqual(878, len(self.D['ZH']))
+        # 881：第 386 项详情栏「默认展开」+3 键（dtl_expand / _label / _tip）
+        self.assertEqual(881, len(self.D['ZH']))
         for n in ('EN', 'ES', 'PT', 'HI'):
             self.assertEqual(len(self.D['ZH']), len(self.D[n]), n)
 

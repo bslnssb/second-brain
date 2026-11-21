@@ -1278,6 +1278,15 @@ export function SettingsDrawer({ open, onClose, palette, onPalette, wall, onWall
                   }}
                 />
               </Row>
+              {/* 第 386 项：详情栏要不要默认展开。有人就喜欢一选中就摊开看大图，
+                  默认仍按原来的窄栏走，别把所有人一起改掉。 */}
+              <Row title={t('dtl_expand')} tip={t('dtl_expand_tip')}>
+                <Toggle
+                  label={t('dtl_expand_label')}
+                  on={s.dtl_expand === true}
+                  onClick={() => patch({ dtl_expand: s.dtl_expand !== true })}
+                />
+              </Row>
               {careBlock}
               </>
           )}
@@ -3972,6 +3981,7 @@ function Marked({ text }: { text: string }) {
 export function Preview({
   row,
   q = '',
+  defaultExpand = false,
   onClose,
   onOpen,
   onReveal,
@@ -3981,6 +3991,8 @@ export function Preview({
   row: { p: string; n?: string; s?: number; m?: number; e?: string; b?: string; snip?: string; t?: string }
   /** 当前搜索词：取正文时用它定位命中位置 */
   q?: string
+  /** 第 386 项：详情栏默认展开（设置里那个开关；缺省 = 原来那条窄栏） */
+  defaultExpand?: boolean
   onClose: () => void
   onOpen: () => void
   onReveal: () => void
@@ -4034,7 +4046,12 @@ export function Preview({
   /* 第 325 项：PDF 翻页 + 「展开」。
      用户明确要求：默认宽度保持原样，只有点「展开」才把面板与页面图放大。
      页码从 1 开始（用户看到的就是「12 / 36」），后端按 0 基收。 */
-  const [expand, setExpand] = useState(false)
+  /* 第 386 项：初始是否展开由设置决定；用户点右上角「展开/收起」仍可随时改，
+     只在设置里的值真的变了时才重新套一次（选别的文件不会被重置）。 */
+  const [expand, setExpand] = useState(!!defaultExpand)
+  useEffect(() => {
+    setExpand(!!defaultExpand)
+  }, [defaultExpand])
   const [page, setPage] = useState(1)
   const [pages, setPages] = useState(0)
   /* 第 332 项：Word/Excel/PPT 没有分页图，正文按 900 字一块当「页」翻。

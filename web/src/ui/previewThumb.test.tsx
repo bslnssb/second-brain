@@ -206,3 +206,49 @@ describe('Preview 详情面板的预览（第 312 项）', () => {
   })
 })
 
+describe('详情栏默认展开（第 386 项）', () => {
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  const draw = (defaultExpand?: boolean) =>
+    render(
+      <Preview
+        row={{ p: 'D:\\doc\\方案.docx', e: 'docx', t: 'file' }}
+        q=""
+        defaultExpand={defaultExpand}
+        onClose={noop}
+        onOpen={noop}
+        onReveal={noop}
+        onCopy={noop}
+      />,
+    )
+
+  it('不传 / 传 false 时保持窄栏（老行为不变）', () => {
+    for (const v of [undefined, false]) {
+      const { container } = draw(v)
+      const aside = container.querySelector('aside') as HTMLElement
+      expect(aside.className).toContain('w-[340px]')
+      expect(aside.className).not.toContain('w-[560px]')
+      cleanup()
+    }
+  })
+
+  it('打开设置后选中文件就是大栏', () => {
+    const { container } = draw(true)
+    const aside = container.querySelector('aside') as HTMLElement
+    expect(aside.className).toContain('w-[560px]')
+  })
+
+  it('点「收起」还能自己缩回去（设置只管初始值）', () => {
+    const { container } = draw(true)
+    const aside = container.querySelector('aside') as HTMLElement
+    const btn = Array.from(container.querySelectorAll('button')).find((b) =>
+      /collapse|收起|Collapse/i.test(b.textContent || ''),
+    )
+    expect(btn).toBeTruthy()
+    fireEvent.click(btn!)
+    expect(aside.className).toContain('w-[340px]')
+  })
+})

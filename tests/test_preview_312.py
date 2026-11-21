@@ -105,8 +105,9 @@ class PreviewThumb312(unittest.TestCase):
             self.assertIn("'%s'" % e, body)
         for e in ('xls', 'xlsx', 'et'):
             self.assertNotIn("'%s'" % e, body)
-        self.assertRegex(src, r"const INLINE_PRIMARY = \[(.*?)\]")
-        m3 = re.search(r'const INLINE_PRIMARY = \[(.*?)\]', src, re.S)
+        # 第 386 项后 INLINE_PRIMARY 直接复用 SHEET_EXT（同一份 Excel 家族名单）
+        self.assertIn('const INLINE_PRIMARY = SHEET_EXT', src)
+        m3 = re.search(r"const SHEET_EXT = \[(.*?)\]", src, re.S)
         self.assertTrue(m3, 'Excel 走表格的名单不见了')
         for e in ('xls', 'xlsx', 'et'):
             self.assertIn("'%s'" % e, m3.group(1))
