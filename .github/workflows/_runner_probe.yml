@@ -1,0 +1,27 @@
+name: runner-probe
+
+# 一次性探针（第 382 项排查用）：mac 任务秒取消，annotation 报
+#   The configuration 'macos-14-arm64-us-default' is not supported
+# 所以拿五个标签各起一个「只 print 一行」的 job，看哪些标签能用。
+# 用完就删，不留在这个仓库里当天常 workflow。
+
+on:
+  push:
+    paths:
+      - '.github/workflows/_runner_probe.yml'
+
+jobs:
+  probe:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15, macos-15-intel, macos-latest]
+    steps:
+      - name: 这个标签能起来吗
+        run: |
+          echo "runner=${{ matrix.os }}"
+          uname -a
+          sw_vers || true
