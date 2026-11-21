@@ -16,13 +16,27 @@
 """
 import io
 import struct
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, IcoImagePlugin
 
 OUT = Path(__file__).resolve().parent / 'assets'
-OUT.mkdir(exist_ok=True)
+
+# 第 389 项：这个脚本是**旧版绘制逻辑**，assets/icon.ico 从 2026-11-14 起已经是
+# 「放大镜 + M 字标」的品牌图标（由 tmp/gen_logo_20261114.py 逐尺寸生成）。
+# 2026-11-21 22:06 有人重跑了一次，把品牌图标覆盖成了「青绿扁平方块 + 白放大镜」——
+# 更糟的是脚本「沿用旧底色」取的是 (3,24) 那个点，在品牌图标里正好落在青绿镜环上，
+# 于是整张变成青绿色（用户第二天发现图标变了才追出来）。
+# 所以现在默认**拒绝执行**，要重做旧版风格必须显式 --force。
+if '--force' not in sys.argv:
+    print('拒绝重跑：assets/icon.ico 当前是 2026-11-14 的「放大镜 + M」品牌图标。\n'
+          '这个脚本画的是旧版「圆角方块 + 放大镜」，直接跑会覆盖品牌图标。\n'
+          '要重做图标请改 tmp/gen_logo_20261114.py；确实要旧版样子请加 --force。')
+    raise SystemExit(2)
+
 FG = (255, 255, 255, 255)
+OUT.mkdir(exist_ok=True)
 
 # 沿用旧图标的底色，避免这次「顺手」改了品牌色
 try:
