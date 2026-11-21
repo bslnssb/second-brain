@@ -4054,6 +4054,8 @@ export function Preview({
   }, [defaultExpand])
   const [page, setPage] = useState(1)
   const [pages, setPages] = useState(0)
+  /* 第 390 项：关键词命中第几页（0 = 不知道/没命中，Word 文本框里的字 Find 搜不到就会是 0） */
+  const [hitPg, setHitPg] = useState(0)
   /* 第 332 项：Word/Excel/PPT 没有分页图，正文按 900 字一块当「页」翻。
      textPage 1 基；textPages 由 /api/peek?pg= 返回。 */
   const [textPage, setTextPage] = useState(1)
@@ -4068,9 +4070,10 @@ export function Preview({
   const thumbSrc = (xl: boolean) =>
     `/api/thumb?p=${encodeURIComponent(row.p)}&big=1${xl ? '&xl=1' : ''}` +
     (isPdf ? `&pg=${page}` : '') +
-    /* 第 387 项：只有 PDF 用关键词高亮。Office 页图不吃 q —— 以前每敲一个字 URL 就变，
-       转换/渲染被重复排一遍，是「卡」的来源之一。 */
-    (thumbExt === 'pdf' ? `&q=${encodeURIComponent(q)}` : '') +
+    /* 第 390 项：Office 页图也带 q —— 后端用它在 Word 里定出命中页、只导那几页。
+       第 387 项当初去掉 q 是怕每敲一个字就重排一次转换；现在 key 按文件去重、
+       已经排队没开工的任务只会把 q 换新，不会重复转换，所以可以带回来。 */
+    (isPdf ? `&q=${encodeURIComponent(q)}` : '') +
     /* 重试用：只用来打破浏览器对 204 的缓存，让同一个地址能真的重发 */
     (pgTry ? `&t=${pgTry}` : '')
 
@@ -4082,6 +4085,8 @@ export function Preview({
   const [pgTry, setPgTry] = useState(0)
   const [thmbOk, setThmbOk] = useState(false)
   const retryTimer = useRef<number | null>(null)
+  /* 第 390 项：「已经自动跳到命中页」只跳一次 —— 用户自己翻走之后不许再拽回来 */
+  const jumpedHit = useRef(false)
   useEffect(() => {
     setPgTry(0)
     setThmbOk(false)
@@ -4127,35 +4132,36 @@ export function Preview({
      只重置「这一张取不到图」的标记和缩放倍数。 */
   useEffect(() => { setThumbBad(false); setScale(1) }, [row.p])
   /* 第 325 项：换文件时页码归 1，并问一下这个 PDF 有多少页（不问就没有「/ 36」）。
-     pdfmeta 只回一个数字，不读正文，一次几十毫秒。 */
+     第 387 项：Office 是「先排队、几秒后才出图」，刚选中时 pdfmeta 还是 0（PDF 还没转出来）。
+     第 388 项：页数要**轮询**到拿到为止，否则翻页器一直不出现（真机截图踩到）。
+     第 390 项：后端还会回「关键词命中第几页」，这里拿到就直接停在那一页 ——
+     180 页的 docx 用户要看的就那一页，不是第 1 页。用户自己翻过页之后就不再跳。 */
   useEffect(() => {
     setPage(1)
     setPages(0)
+    setHitPg(0)
+    jumpedHit.current = false
     if (!isPdf) return
-    let alive = true
-    fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}`, { headers: { 'Sec-Fetch-Site': 'same-origin' } })
-      .then((r) => r.json())
-      .then((j: { pages?: number }) => {
-        if (alive && j && j.pages) setPages(Number(j.pages))
-      })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [row.p])
-  /* 第 387 项：Office 是「先排队、几秒后才出图」，刚选中时 pdfmeta 还是 0（PDF 还没转出来）。
-     等页图真出来（thmbOk）再补问一次，翻页器才会显示「1 / 24」而不是只有一张图。
-     第 388 项：页图现在来自「头一份」（1~3 秒就有），但页数是转换时才记下的，
-     第一次问照样是 0 —— 所以要**轮询**到拿到页数为止，否则翻页器一直不出现（真机截图踩到）。 */
-  useEffect(() => {
-    if (!isPdf || pages > 0) return
     let alive = true
     let tries = 0
     let timer: number | null = null
     const ask = () => {
-      fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}`, { headers: { 'Sec-Fetch-Site': 'same-origin' } })
+      fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}&q=${encodeURIComponent(q)}`,
+        { headers: { 'Sec-Fetch-Site': 'same-origin' } })
         .then((r) => r.json())
-        .then((j: { pages?: number }) => {
-          if (!alive) return
-          if (j && j.pages) { setPages(Number(j.pages)); return }
+        .then((j: { pages?: number; hit?: number; done?: boolean }) => {
+          if (!alive || !j) return
+          const p = Number(j.pages || 0)
+          if (p) setPages(p)
+          const hit = Number(j.hit || 0)
+          if (hit !== hitPg) setHitPg(hit)
+          if (hit > 1 && !jumpedHit.current) {
+            jumpedHit.current = true
+            setPage(hit)
+          }
+          /* 页数到手、而且已按当前查询词算过（done）就不用再问了；
+             Office 换了关键词时会重导那一段，done 变 true 之前继续等 → 才能跳到新的命中页 */
+          if (p > 0 && j.done !== false) return
           if (++tries < 20) timer = window.setTimeout(ask, 1500)
         })
         .catch(() => {
@@ -4167,7 +4173,7 @@ export function Preview({
       alive = false
       if (timer) window.clearTimeout(timer)
     }
-  }, [row.p, pages, isPdf])
+  }, [row.p, isPdf])
   useEffect(() => {
     if (!zoom) return
     const el = zoomRef.current
@@ -4367,6 +4373,19 @@ export function Preview({
             ‹
           </button>
           <span className="tabular-nums">{page} / {pages}</span>
+          {/* 第 390 项：命中页 —— 用户翻走了还能一键跳回去；停在命中页时直接标出来 */}
+          {hitPg > 0 && page !== hitPg && (
+            <button
+              onClick={() => setPage(hitPg)}
+              title={`关键词命中第 ${hitPg} 页`}
+              className="rounded border border-line px-1.5 py-0.5 text-[10px] hover:text-ink"
+            >
+              命中 {hitPg}
+            </button>
+          )}
+          {hitPg > 0 && page === hitPg && (
+            <span className="text-[10px] opacity-70">命中页</span>
+          )}
           <button
             disabled={page >= pages}
             onClick={() => setPage((p) => Math.min(pages, p + 1))}

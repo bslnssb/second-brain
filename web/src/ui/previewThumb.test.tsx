@@ -121,6 +121,70 @@ describe('Preview 详情面板的预览（第 312 项）', () => {
     await waitFor(() => expect(container.textContent).toContain('/ 180'), { timeout: 6000 })
   })
 
+  it('第 390 项：Office 页图带 q —— 后端要靠它在 Word 里定出命中页', () => {
+    const { container } = render(
+      <Preview row={{ p: 'D:\\doc\\方案.docx', e: 'docx', t: 'file' }} q="安全 等保"
+        onClose={noop} onOpen={noop} onReveal={noop} onCopy={noop} />,
+    )
+    const img = container.querySelector('img') as HTMLImageElement
+    expect(img.getAttribute('src')).toContain('&q=')
+    expect(decodeURIComponent(img.getAttribute('src')!)).toContain('安全 等保')
+  })
+
+  it('第 390 项：页数一到就停在关键词命中页，而不是第 1 页', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ pages: 180, hit: 8, done: true }),
+    })))
+    const { container } = render(
+      <Preview row={{ p: 'D:\\doc\\方案.docx', e: 'docx', t: 'file' }} q="安全"
+        onClose={noop} onOpen={noop} onReveal={noop} onCopy={noop} />,
+    )
+    await waitFor(() => expect(
+      (container.querySelector('img') as HTMLImageElement).getAttribute('src'),
+    ).toContain('pg=8'), { timeout: 4000 })
+    expect(container.textContent).toContain('/ 180')
+    expect(container.textContent).toContain('命中页')
+  })
+
+  it('第 390 项：换了关键词还没算好（done=false）就接着等，算好了再跳', async () => {
+    let n = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n++
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ pages: 180, hit: n === 2 ? 42 : 0, done: n >= 2 }),
+      }
+    }))
+    const { container } = render(
+      <Preview row={{ p: 'D:\\doc\\方案.docx', e: 'docx', t: 'file' }} q="等保"
+        onClose={noop} onOpen={noop} onReveal={noop} onCopy={noop} />,
+    )
+    await waitFor(() => expect(
+      (container.querySelector('img') as HTMLImageElement).getAttribute('src'),
+    ).toContain('pg=42'), { timeout: 6000 })
+  })
+
+  it('第 390 项：用户自己翻走后不再被拽回，但可以点「命中 8」跳回去', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ pages: 180, hit: 8, done: true }),
+    })))
+    const { container } = render(
+      <Preview row={{ p: 'D:\\doc\\方案.docx', e: 'docx', t: 'file' }} q="安全"
+        onClose={noop} onOpen={noop} onReveal={noop} onCopy={noop} />,
+    )
+    await waitFor(() => expect(container.textContent).toContain('/ 180'), { timeout: 4000 })
+    const next = () => Array.from(container.querySelectorAll('button'))
+      .find((b) => (b.textContent || '').trim() === '›')
+    fireEvent.click(next()!)
+    await waitFor(() => expect(container.textContent).toContain('9 / 180'))
+    const jump = Array.from(container.querySelectorAll('button'))
+      .find((b) => (b.textContent || '').trim() === '命中 8')
+    expect(jump).toBeTruthy()
+    fireEvent.click(jump!)
+    await waitFor(() => expect(container.textContent).toContain('8 / 180'))
+  })
+
   it('exe / 音频 / 文件夹：既不画图也不自动读正文', () => {
     for (const [p, e, t] of [
       ['D:\\a.exe', 'exe', 'file'],

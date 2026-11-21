@@ -13447,7 +13447,7 @@ def _shell_thumb_png(path, size=256):
 
 
 
-def pdf_pages(path):
+def pdf_pages(path, q=''):
     """PDF 总页数（拿不到就 0）。第 325 项：详情栏要显示「12 / 36」。
 
     第 385 项：Word/Excel/PPT 报的是「转出来的那份 PDF」的页数，
@@ -13456,10 +13456,10 @@ def pdf_pages(path):
         _ext = os.path.splitext(str(path or ''))[1].lower()
         if _ext != '.pdf' and doc_render.is_office(path):
             # 第 388 项：页数在转换时就数好记进 meta.json（0.4s），不用等整份导完再开 PDF 数
-            n = doc_render.total_pages(path, app_dir())
+            n = doc_render.total_pages(path, app_dir(), q)
             if n:
                 return n
-            path = doc_render.pdf_for(path, app_dir()) or ''
+            path = doc_render.pdf_page_source(path, app_dir(), 0, q)[0] or ''
             if not path:
                 return 0
 
@@ -13551,8 +13551,9 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
     # 转不出来（没装 Office/WPS、或者转换超时）就记一次失败冷却，前端会回落到纯文本。
     if doc_render.is_office(path):
 
-        # 第 388 项：只要的页在「头一份」范围内（前 8 页），首屏不用等整份导完
-        _pdf = doc_render.pdf_for(path, app_dir(), pg=page)
+        # 第 390 项：缓存里可能只有「命中页 ±1」那一段，必须同时拿到页下标，
+        # 否则从另一个页码的 PDF 里取第 1 页，渲出来是别的页（用户就会觉得跳错页）。
+        _pdf, _idx = doc_render.pdf_page_source(path, app_dir(), page, q)
 
         if not _pdf:
 
@@ -13562,6 +13563,7 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
             return None
 
         path = _pdf
+        page = _idx
 
         ext = '.pdf'
 
@@ -24604,6 +24606,10 @@ def make_server(port=8765):
                 p = (qs.get('p', [''])[0] or '').strip()
 
                 pgs = 0
+                hpg = 0
+                hdn = True
+
+                kw = (qs.get('q', [''])[0] or '').strip()
 
                 if p and _local_only(p) and os.path.exists(p):
 
@@ -24624,9 +24630,16 @@ def make_server(port=8765):
 
                     if allowed:
 
-                        pgs = pdf_pages(p)
+                        pgs = pdf_pages(p, kw)
+                        # 第 390 项：详情栏要直接停在命中页（Word 转换时用 Find 定位好）
+                        hpg, hdn = doc_render.hit_info(p, app_dir(), kw)
+                        if not hdn and kw:
+                            # 手里的那段是旧关键词定位的（或者还是旧版本缓存）：
+                            # 这里踢一脚，让它按当前词重导那一段；前端会继续轮询到 done
+                            doc_render.pdf_page_source(p, app_dir(), 0, kw)
 
-                body = json.dumps({'ok': bool(pgs), 'pages': pgs}, ensure_ascii=False).encode()
+                body = json.dumps({'ok': bool(pgs), 'pages': pgs, 'hit': hpg, 'done': hdn},
+                                  ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -24840,8 +24853,9 @@ def make_server(port=8765):
 
                         elif big:
 
-                            png = (make_thumb(p, 900, 1200, page=pg0, q=hl) if p.lower().endswith('.pdf')
-                                   else make_thumb(p, 900, 1200))
+                            # 第 390 项：Office 也要传页码 + 查询词 —— 缓存里可能只有
+                            # 「命中页 ±1」那一段，靠 q 才能定位/高亮到对的那一页
+                            png = make_thumb(p, 900, 1200, page=pg0, q=hl)
 
                         elif small:
 
@@ -24849,7 +24863,7 @@ def make_server(port=8765):
 
                         else:
 
-                            png = make_thumb(p, page=pg0, q=hl) if p.lower().endswith('.pdf') else make_thumb(p)
+                            png = make_thumb(p, page=pg0, q=hl)
 
                         png = png or b''
 

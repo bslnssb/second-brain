@@ -86,15 +86,17 @@ class TestHeadFirst(unittest.TestCase):
         self.assertEqual(doc_render._read_meta(p, self.dir)['head'], 0)
         self.assertEqual(doc_render.pdf_for(p, self.dir, pg=99), full)
 
-    def test_long_doc_head_queues_full(self):
+    def test_long_doc_head_no_longer_queues_full(self):
+        """第 390 项改了：长文档只留命中页那一段，不再自动补整份（用户要看全文会自己打开文件）。"""
         p = self._doc()
         _full, hp, _mp = doc_render._side_paths(p, self.dir)
         with open(hp, 'wb') as f:
             f.write(b'%PDF-1.4 long')
-        doc_render._finish_head(p, self.dir, hp, 'word', 180, 8)
+        doc_render._finish_head(p, self.dir, hp, 'word', 180, 3, 8, 8, '安全')
         meta = doc_render._read_meta(p, self.dir)
-        self.assertEqual((meta['pages'], meta['head']), (180, 8))
-        self.assertEqual(doc_render.queue_len()[1], 1, '长文档要补一份整份')
+        self.assertEqual((meta['pages'], meta['head']), (180, 3))
+        self.assertEqual((meta['from'], meta['hit'], meta['q']), (8, 8, '安全'))
+        self.assertEqual(doc_render.queue_len()[1], 0, '不再自动导整份')
 
     def test_excel_goes_straight_to_full(self):
         """Excel/PPT 不支持分段导出，第一次就排整份，别白跑一趟头一份。"""

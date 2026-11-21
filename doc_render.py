@@ -21,6 +21,7 @@
 
 import hashlib
 import os
+import re
 import shutil
 import threading
 import time
@@ -105,7 +106,12 @@ def _side_paths(path, base):
 
 
 def _read_meta(path, base):
-    """读 {pages, head} —— pages 是整份页数，head 是头一份里已导出的页数（0=整份）。"""
+    """读 {pages, head, from, hit, q}。
+
+    pages = 整份页数；head = 现有 PDF 里包含几页（0 表示就是整份）；
+    from = 这几页从原始文档的第几页开始（1 基）；hit = 关键词命中的原始页码；
+    q = 算这个 hit 时用的查询词（换了词要重算）。
+    """
     try:
         _full, _head, meta = _side_paths(path, base)
         if not meta or not os.path.exists(meta):
@@ -113,12 +119,14 @@ def _read_meta(path, base):
         import json
         with open(meta, 'r', encoding='utf-8') as f:
             d = json.load(f)
-        return {'pages': int(d.get('pages') or 0), 'head': int(d.get('head') or 0)}
+        return {'pages': int(d.get('pages') or 0), 'head': int(d.get('head') or 0),
+                'from': int(d.get('from') or 1), 'hit': int(d.get('hit') or 0),
+                'q': str(d.get('q') or '')}
     except Exception:                    # noqa: BLE001
         return None
 
 
-def _write_meta(path, base, pages, head):
+def _write_meta(path, base, pages, head, frm=1, hit=0, q=''):
     try:
         _full, _head, meta = _side_paths(path, base)
         if not meta:
@@ -126,7 +134,8 @@ def _write_meta(path, base, pages, head):
         import json
         tmp = meta + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'pages': int(pages or 0), 'head': int(head or 0)}, f)
+            json.dump({'pages': int(pages or 0), 'head': int(head or 0),
+                       'from': int(frm or 1), 'hit': int(hit or 0), 'q': str(q or '')}, f)
         os.replace(tmp, meta)
     except Exception:                    # noqa: BLE001
         pass
@@ -169,6 +178,62 @@ def _co():
         return False
 
 
+def _q_tokens(q):
+    """查询词 → 可用于 Word Find 的词（去掉 ext:/size:/dm:/content: 这些语法）。
+
+    注意兼容「ext: docx」这种冒号后带空格写法：`ext:` 后面的那个值是语法值，
+    不是要搜的字，一并跳掉。
+    """
+    out = []
+    skip_next = False
+    for t in re.split(r'[\s"]+', str(q or '')):
+        t = t.strip()
+        if not t:
+            continue
+        was, skip_next = skip_next, False
+        if t.startswith('-'):
+            continue
+        if re.match(r'(?i)^(ext|type|size|dm|content|内容|c):$', t):
+            skip_next = True
+            continue
+        if was:
+            continue
+        if re.match(r'(?i)^(ext|type|size|dm|content|内容|c):', t):
+            continue
+        if t.endswith(('/', '\\')):
+            continue
+        if t not in out:
+            out.append(t)
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _find_page(doc, q):
+    """在 Word 里找关键词落在第几页（1 基）——不导整份也能定位，实测 0.01s/词。
+
+    只用 `doc.Content.Find`（正文层）；文本框/形状里的字 Word Find 搜不到，
+    搜不到就返回 0，退回「导前几页」的老行为，不至于让首屏空着。
+    """
+    for tok in _q_tokens(q):
+        try:
+            rng = doc.Content
+            f = rng.Find
+            f.ClearFormatting()
+            f.Text = tok
+            f.Forward = True
+            f.Wrap = 1                    # wdFindContinue
+            f.MatchCase = False
+            f.MatchAllWordForms = False
+            if f.Execute():
+                pg = int(rng.Information(3) or 0)   # wdActiveEndPageNumber
+                if pg > 0:
+                    return pg
+        except Exception:                 # noqa: BLE001
+            continue
+    return 0
+
+
 def _convert_word(app, src, out, box):
     app.Visible = False
     try:
@@ -184,13 +249,24 @@ def _convert_word(app, src, out, box):
             total = 0
         box['pages'] = total
         if box.get('mode') == 'head' and total > HEAD_PAGES:
-            # 只导前几页：180 页那份从 6.8s 降到 1.06s，详情栏只看得见第 1 页
+            # 第 390 项：用户要看的是**命中那一页**，不是第 1 页。
+            # 先在 Word 里定位命中页（不导出也能算页码），只导它前后各一页；
+            # 搜不到（文本框/形状里的字）才退回「导前 8 页」。
+            hit = _find_page(doc, box.get('q') or '')
+            frm = max(1, hit - 1) if hit else 1
+            to = min(total, frm + 2) if hit else min(total, HEAD_PAGES)
+            if not hit:
+                frm, to = 1, min(total, HEAD_PAGES)
             doc.ExportAsFixedFormat(out, WD_FORMAT_PDF, False, 0,
-                                    WD_EXPORT_FROM_TO, 1, HEAD_PAGES)
-            box['head_pages'] = HEAD_PAGES
+                                    WD_EXPORT_FROM_TO, frm, to)
+            box['head_pages'] = max(0, to - frm + 1)
+            box['from'] = frm
+            box['hit'] = hit
         else:
             doc.ExportAsFixedFormat(out, WD_FORMAT_PDF)
             box['head_pages'] = total if box.get('mode') == 'head' else 0
+            box['from'] = 1
+            box['hit'] = 0
     finally:
         doc.Close(False)
 
@@ -308,8 +384,9 @@ def _loop():
             _reap_apps()
             time.sleep(0.25)
             continue
-        key, path, out, kind, base, mode = task
-        box = {'mode': mode}
+        key, path, out, kind, base, mode, q = task
+        qn = ' '.join(_q_tokens(q))
+        box = {'mode': mode, 'q': qn}
         try:
             ok = _convert_one(kind, path, out, box)
         except Exception as e:             # noqa: BLE001
@@ -320,10 +397,12 @@ def _loop():
         if ok:
             pages = int(box.get('pages') or 0)
             head_pages = int(box.get('head_pages') or 0)
+            frm = int(box.get('from') or 1)
+            hit = int(box.get('hit') or 0)
             if mode == 'head':
-                _finish_head(path, base, out, kind, pages, head_pages)
+                _finish_head(path, base, out, kind, pages, head_pages, frm, hit, qn)
             else:
-                _write_meta(path, base, pages, 0)
+                _write_meta(path, base, pages, 0, 1, hit, qn)
             _sweep(base)
         else:
             _FAILED[_norm(path)] = (time.time(), box.get('err') or 'unknown')
@@ -334,18 +413,22 @@ def _loop():
                 pass
 
 
-def _finish_head(path, base, out, kind, pages, head_pages):
-    """头一份转完：短文档就是整份（直接复制成整份，不再导第二遍）；长文档补一份整份。"""
+def _finish_head(path, base, out, kind, pages, head_pages, frm=1, hit=0, q=''):
+    """头一份转完。
+
+    - 这段已经覆盖整份（短文档）：直接复制成整份，不再导第二遍；
+    - 长文档：**只留命中页那一段**。用户要看的是命中那一页，想看整篇会自己去打开文件，
+      所以不再自动排「整份」（那是 6~15 秒纯白烧）；真翻到段外再由 pdf_page_source 按需补。
+    """
     full, _head, _meta = _side_paths(path, base)
-    if pages and head_pages >= pages:
+    if pages and frm == 1 and head_pages >= pages:
         try:
             shutil.copyfile(out, full)
         except Exception:                # noqa: BLE001
             pass
-        _write_meta(path, base, pages, 0)
+        _write_meta(path, base, pages, 0, 1, hit, q)
         return
-    _write_meta(path, base, pages, head_pages or HEAD_PAGES)
-    _enqueue(_norm(path) + '|full', path, full, kind, base, 'full')
+    _write_meta(path, base, pages, head_pages or HEAD_PAGES, frm, hit, q)
 
 
 def _ensure_worker():
@@ -358,13 +441,19 @@ def _ensure_worker():
     _WORKER.start()
 
 
-def _enqueue(key, path, out, kind, base, mode):
+def _enqueue(key, path, out, kind, base, mode, q=''):
     """排一个转换任务。同一个 key 只排一次；队列只留最新的 MAX_QUEUE 个。"""
     with _LOCK:
         if key in _INFLIGHT:
+            # 已经在排队、还没开工的，就把查询词换成最新的（前端先按旧 q 排上、
+            # pdfmeta 后带着真查询词到的顺序很常见），别让命中页定位用错词
+            if q:
+                for i, t in enumerate(_TASKS):
+                    if t[0] == key and t[6] != q:
+                        _TASKS[i] = t[:6] + (q,)
             return
         _INFLIGHT.add(key)
-        _TASKS.append((key, path, out, kind, base, mode))
+        _TASKS.append((key, path, out, kind, base, mode, q))
         while len(_TASKS) > MAX_QUEUE:
             old = _TASKS.pop(0)
             _INFLIGHT.discard(old[0])
@@ -404,56 +493,75 @@ def status_for(path, base):
     return 'none'
 
 
-def pdf_for(path, base, pg=0):
-    """Office 文档 → PDF 路径（带缓存）。
+def pdf_page_source(path, base, pg=0, q=''):
+    """要原始文档第 pg 页（0 基）→ (含这一页的 PDF, 在 PDF 里的下标)；没就绪就排队并返回 (None, None)。
 
-    - 整份转好了：直接给整份（任何页码都能渲）
-    - 只有头一份、且要的页（pg，0 基）在头一份范围内：给头一份，整份在后台补
-    - 都没有：排「头一份」任务并立刻返回 None（绝不阻塞请求线程）
-
-    前端看到 None 会隔一两秒再要一次，转好了就命中。
+    第 390 项：现在缓存里可能只有「命中页 ±1」那一段（`from` 起、`head` 页），
+    所以光给路径不够 —— 调用方要知道这一页在 PDF 里是第几个，否则渲出来是别的页。
+    段外才按需补整份（不再在转换结束时自动导整份）。
     """
     if not path or not os.path.exists(path):
-        return None
+        return None, None
     ext = os.path.splitext(path)[1].lower()
     if ext == '.pdf':
-        return path
+        return path, int(pg)
     if ext not in OFFICE_PDF or not OFFICE_PDF[ext]:
-        return None
+        return None, None
 
     full, head, _meta = _side_paths(path, base)
     if not full:
-        return None
+        return None, None
     ok_full, ok_head = _ready(path, base)
-    if ok_full:
-        return full
-
+    qn = ' '.join(_q_tokens(q))
     key = _norm(path)
+    kind = OFFICE_PDF[ext]
+    if ok_full:
+        # 整份在手（任何页都能渲），但 meta 里没有「这个词命中第几页」——老缓存、
+        # 或者上次是别的关键词。这时候还是得跑一趟 Word：只定位、顺带导那三页，
+        # 否则前端拿不到 hit，永远停在第 1 页（真机就是这么踩到的）。
+        meta = _read_meta(path, base)
+        if qn and (meta or {}).get('q', '') != qn:
+            _enqueue(key + '|head', path, head, kind, base, 'head', q)
+        return full, int(pg)
+
     fail = _FAILED.get(key)
     if fail and time.time() - fail[0] < FAIL_COOLDOWN:
-        return None
+        return None, None
 
-    kind = OFFICE_PDF[ext]
-    meta = _read_meta(path, base) or {'pages': 0, 'head': 0}
-    head_pages = meta.get('head') or HEAD_PAGES
+    meta = _read_meta(path, base) or {'pages': 0, 'head': 0, 'from': 1}
+    frm = meta.get('from') or 1
+    cnt = meta.get('head') or 0
     if ok_head:
-        if kind == 'word' and pg < head_pages:
-            _enqueue(key + '|full', path, full, kind, base, 'full')
-            return head
-        # 要的页超出头一份（或不是 word，头一份就等于整份，不会走到这儿）
+        # 缓存里的这一段是按**旧查询词**定位的：词一变就重导这一段（1~3 秒），
+        # 否则永远停在错的那几页。重导期间先把手上有的页照旧给出去（别白屏），
+        # 新段落地后 meta 的 q 就对上了，前端会跳到命中页。
+        if qn != (meta.get('q') or ''):
+            _enqueue(key + '|head', path, head, kind, base, 'head', q)
+        if cnt and frm - 1 <= pg <= frm - 1 + cnt - 1:
+            return head, int(pg) - (frm - 1)
+        # 段外：翻页才补整份。**首页（pg=0）例外**——那多半是前端「还不知道命中页，
+        # 先按第 1 页要图」的那一下；为此把整份导一遍就是纯白烧（180 页 7 秒），
+        # 而 meta 一两秒内就会把 hit 页告诉前端，跳过去就行。
+        if pg <= 0:
+            return None, None
         _enqueue(key + '|full', path, full, kind, base, 'full')
-        return None
+        return None, None
 
-    # 还没有任何产物：word 先导头一份（首屏 1 秒级），其它格式本来就不支持分段
+    # 还没有任何产物：word 先导「命中页那一段」，其它格式本来就不支持分段
     if kind == 'word':
-        _enqueue(key + '|head', path, head, kind, base, 'head')
+        _enqueue(key + '|head', path, head, kind, base, 'head', q)
     else:
         _enqueue(key + '|full', path, full, kind, base, 'full')
-    return None
+    return None, None
 
 
-def total_pages(path, base):
-    """Office 文档的整份页数（拿不到就 0，并顺手把头一份排上）。
+def pdf_for(path, base, pg=0, q=''):
+    """兼容旧调用：只要路径（要渲染就改用 pdf_page_source 拿下标）。"""
+    return pdf_page_source(path, base, pg, q)[0]
+
+
+def total_pages(path, base, q=''):
+    """Office 文档的整份页数（拿不到就 0，并顺手把命中页那一段排上）。
 
     第 388 项：页数在转换时用 ComputeStatistics 记进 meta.json，翻页器不用等整份导完。
     """
@@ -465,15 +573,45 @@ def total_pages(path, base):
     meta = _read_meta(path, base)
     if meta and meta.get('pages'):
         return meta['pages']
-    pdf_for(path, base)          # 没转就排上，前端会重试
+    pdf_page_source(path, base, 0, q)          # 没转就排上，前端会重试
     meta = _read_meta(path, base)
     return int(meta.get('pages') or 0) if meta else 0
 
 
+def hit_info(path, base, q=''):
+    """(关键词命中的原始页码, 是否已按当前查询词算过)。
 
-def wait_for(path, base, timeout=30.0):
+    `done=False` 表示 meta 里的 hit/段是按**别的查询词**（或者还是旧版本缓存）算的，
+    前端据此决定「再等一会儿，转换正在按新词重定位」。
+    """
+    if not path or not os.path.exists(path):
+        return 0, False
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.pdf':
+        return 0, True
+    if ext not in OFFICE_PDF or not OFFICE_PDF[ext]:
+        return 0, True
+    meta = _read_meta(path, base)
+    if not meta:
+        return 0, False
+    if (meta.get('q') or '') != ' '.join(_q_tokens(q)):
+        return 0, False
+    return int(meta.get('hit') or 0), True
+
+
+def hit_page(path, base, q=''):
+    """关键词命中的原始页码（1 基，0=没命中/不知道）。
+
+    第 390 项：详情栏要直接停在命中页。meta 里记着算 hit 时用的查询词，
+    查询词换了就不再拿旧 hit 糊弄（宁可停在第一段，也不跳错页）。
+    """
+    return hit_info(path, base, q)[0]
+
+
+
+def wait_for(path, base, timeout=30.0, q=''):
     """排障 / 自测用：把这一份转完再返回（生产路径不用它，请求线程不许等）。"""
-    out = pdf_for(path, base)
+    out = pdf_for(path, base, 0, q)
     if out:
         return out
     t0 = time.time()
@@ -481,8 +619,8 @@ def wait_for(path, base, timeout=30.0):
         time.sleep(0.2)
         if not os.path.exists(path):
             return None
-        out2 = cache_path(path, base)
-        if out2 and os.path.exists(out2) and os.path.getsize(out2) > 0:
+        out2 = pdf_for(path, base, 0, q)
+        if out2:
             return out2
         if status_for(path, base) == 'failed':
             return None
