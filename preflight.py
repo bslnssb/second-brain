@@ -49,8 +49,11 @@ def check_version():
 
 _Q = r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")"""
 # 允许与英文完全相同的键：西语里 General/Audio 本来就写成一样。
-# 新加键如果确实同形，加到这里并写一行理由 —— 别为了过门禁瞎改词。
-_I18N_SAME_OK = {'kind_audio', 'care_title'}
+# 第 278 项：引擎品牌名与字段名本来就不翻（MyMemory/Youdao/Baidu/iCIBA/DeepSeek/DeepL、
+# API Key、APP ID、sk-…），照抄英文是对的。
+_I18N_SAME_OK = {'kind_audio', 'care_title',
+                 'te_mymemory', 'te_youdao', 'te_baidu', 'te_iciba', 'te_deepseek', 'te_deepl',
+                 'te_deepseek_hint', 'te_field_api_key', 'te_field_appid'}
 
 
 def _i18n_dicts(s):
@@ -294,7 +297,7 @@ def check_side_actions():
     断言两件事：三颗图标都在；**旧的纯文字数组不许回来**（那就是退回原样）。
     """
     app = text(ROOT / 'web/src/App.tsx')
-    i = app.index('<aside className="flex w-[172px]')
+    i = app.index('<aside')  # 别写死 class 前缀：第 192 项给 aside 加了 sb-readable
     side = app[i:app.index('</aside>', i)]
     bad = []
     for ic in ('<IconHelp size={16} />', '<IconGear size={16} />', '<IconInfo size={16} />'):
@@ -389,6 +392,16 @@ def check_appearance():
         bad.append('App 没用 applyPalette / 没渲染壁纸层')
     if "background: 'transparent'" not in app:
         bad.append('壁纸开着时根容器底色没放开（图片透不出来）')
+    # 第 192 项：根容器透明 ≠ 文字区也能透明。不垫底时深色字直接压在图片上，
+    # 用户实测「一旦用了全局壁纸文字就几乎看不清」。
+    css = text(ROOT / 'web/src/index.css')
+    if '.wall-on .sb-readable' not in css or 'var(--sb-scrim, 0.72)' not in css:
+        bad.append('壁纸开启时文字区没垫半透明主题底（字会压在图片上看不清）')
+    # 第 195 项：遮罩不能再写死 0.72 —— 可见度拉满也只透 28%，用户实测「只有不到 20%」。
+    if '--sb-scrim' not in app or 'wall.opacity' not in app:
+        bad.append('壁纸遮罩没跟可见度联动（拉满也看不出图）')
+    if 'wall-on' not in app or app.count('sb-readable') < 4:
+        bad.append('App 没挂 wall-on 或没给顶栏/侧栏/列表/状态栏接 sb-readable')
 
     if "/api/wall/image" not in brain or "/api/wall" not in brain:
         bad.append('后端缺 /api/wall 接口')
@@ -417,8 +430,20 @@ def check_timeline_head():
     app = text(ROOT / 'web/src/App.tsx')
     pan = text(ROOT / 'web/src/ui/panels.tsx')
     bad = []
-    if 'sticky top-0 z-[1] flex items-center gap-2 border-b border-line bg-bg' not in pan:
-        bad.append('时间轴列头没有 sticky + 实底色')
+    # 第 230 项列宽可拖拽：表头仍是 sticky + 实底色，只是布局从 flex 换成 grid（统一网格
+    # 才能保证表头与数据行对齐），并新增拖拽逻辑 + localStorage 持久化。守卫钉「真正该守住的属性」，
+    # 不再钉死 flex 字面串（那种钉法一改布局就假红）。
+    if ('sticky top-0 z-[1] grid items-center gap-x-2 border-b border-line bg-bg' not in pan
+            or 'gridTemplateColumns: gridCols' not in pan):
+        bad.append('时间轴列头没有 sticky + 实底色，或列宽未用统一网格对齐')
+    if 'onColResizeStart' not in pan or 'sb_colw' not in pan:
+        bad.append('列宽拖拽逻辑 / localStorage 持久化缺失')
+    # 搜索结果列表（App.tsx 的 q.trim() 分支）也要可拖拽：与 Timeline 共用同一套逻辑，
+    # 但用独立键 sb_cols，避免两张表列宽互相覆盖。守卫钉真正该守住的属性。
+    if 'useColResize' not in app or 'sb_cols' not in app:
+        bad.append('搜索结果列表列宽拖拽逻辑 / 持久化缺失')
+    if 'gridCols2' not in app or 'style={{ gridTemplateColumns: gridCols2 }}' not in app:
+        bad.append('搜索结果列表列宽未用统一网格对齐')
     if 'flex min-w-0 flex-1 flex-col overflow-hidden' not in app:
         bad.append('列表外层又变成滚动容器了（sticky 会失效）')
     if 'timelineCaption(tlDays, tlTotal)' not in app:
@@ -468,14 +493,24 @@ def check_custom_titlebar():
         bad.append('/api/ping 没带 titlebar')
     if 'data-nodrag' not in tsx:
         bad.append('标题栏按钮区缺 data-nodrag（点击会被当拖动）')
-    # 拖动（第 182 项）：系统 SendMessage 那条路在 pywebview 里实测不动，
-    # 必须是「前端按帧报坐标 + Python SetWindowPos」，且最大化要先还原。
-    for fn in ('def titlebar_rect(', 'def titlebar_move(', 'def titlebar_restore(',
+    # 第 223 项：改名防回退守卫 —— sync 按清单从开发根覆盖仓库，218 项的 Memex
+    # 改名只改了仓库副本、开发根母本没改，一次 sync 就把五份使用说明全部回退
+    #（实测）。手册里出现旧品牌名 = 母本没改，直接红。
+    for f in ('使用说明.md', '使用说明.en.md', '使用说明.es.md',
+              '使用说明.hi.md', '使用说明.pt.md'):
+        s = text(ROOT / f)
+        if '第二大脑' in s or 'Second Brain' in s:
+            bad.append('%s 仍含旧品牌名（改名被 sync 回退）' % f)
+    # 拖动（第 182 项 → 第 217 项重构）：系统 SendMessage 那条路在 pywebview 里
+    # 实测不动；182 的「前端按帧报坐标」又被 216 项证伪 —— WebView2 无边框窗口里
+    # pointer 事件的 screenX 拖动期间冻结（dx 恒 0 → 永不发帧）。现在是
+    # 「前端只报开始/拖动中/松手三个事件，坐标全部由 Python GetCursorPos 读真值」。
+    for fn in ('def titlebar_drag_start(', 'def titlebar_drag_move(',
                'def titlebar_snap('):
         if fn not in app:
             bad.append('缺 %s' % fn.strip('def ('))
-    for pat in ('onPointerDown={onDown}', 'titlebar_move?.(', 'titlebar_snap?.(',
-                'titlebar_restore'):
+    for pat in ('onPointerDown={onDown}', 'titlebar_drag_move?.(', 'titlebar_snap?.(',
+                'titlebar_drag_start'):
         if pat not in tsx:
             bad.append('前端拖动链路缺 %s' % pat)
     if 'setPointerCapture' not in tsx:
@@ -490,6 +525,14 @@ def check_custom_titlebar():
     for c in ('_SWP_NOSIZE = ', '_SWP_NOZORDER = ', '_SWP_NOACTIVATE = ', '_SWP_SHOWWINDOW = '):
         if c not in app:
             bad.append('缺常量 %s' % c.split()[0])
+    # 第 192 项：topmost() 本来只给快搜窗用，show_main 复用它会把主窗口
+    # 永久钉在 HWND_TOPMOST 上且从不取消 —— 用户只能先关掉/缩小才能用别的软件。
+    if 'def topmost(hwnd, tries=12, pin=True)' not in app:
+        bad.append('topmost 没有 pin 开关（主窗口会被永久置顶）')
+    if 'HWND_NOTOPMOST' not in app:
+        bad.append('缺取消置顶的路径')
+    if 'topmost(hwnd, pin=False)' not in app:
+        bad.append('show_main 仍会把主窗口钉在最前')
     rec('PASS' if not bad else 'FAIL', '自绘标题栏（摘 CAPTION / 状态同源 / 按钮不吞点击）',
         '; '.join(bad[:4]) if bad else '只摘 CAPTION、ping 报实际状态、按钮 data-nodrag、顶栏不重复')
 
@@ -618,6 +661,9 @@ def check_license():
 # 从网上下载的图标/插画是这一行代码唯一能拦住的那类侵权。
 KNOWN_ASSETS = {
     'donate.png', 'icon.ico', 'icon_preview.png',
+    # 第 272 项：悬浮球图标 —— 由 logo候选/两版实做/B-青橙/标志.png（本项目自制）
+    # 经 tmp/make_ball_png.py 抠底裁紧缩到 160x160，来源自制，不是抓来的素材。
+    'ball.png',
     'demo-contract.gif', 'demo-invoice.gif', 'demo-note.gif',
     'screenshot-main.png', 'screenshot-main-dark.png', 'screenshot-main-en.png',
     'screenshot-quick.png', 'screenshot-quick-empty.png', 'screenshot-quick-en.png',
@@ -821,7 +867,7 @@ def check_pro_features():
     # 私有模块仍然是纯状态机 / 不反向 import brain
     mod = text(ROOT / 'pro' / 'ocr_batch.py')
     heavy = re.findall(r'^\s*(?:from|import)\s+'
-                       r'(brain|rapidocr_onnxruntime|pymupdf|sqlite3)\b', mod, re.M)
+                       r'(brain|rapidocr|ocr_engine|pdf_engine|sqlite3)\b', mod, re.M)
     if not mod or heavy:
         bad.append('pro/ocr_batch.py 不再是纯状态机（别把 DB / OCR 引擎塞进去）')
     api = text(ROOT / 'pro' / 'pro_api.py')
@@ -979,6 +1025,90 @@ def check_settings_concurrent():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_telemetry_health():
+    """第 277 项：体检与报错的「完整性」不许退回去。
+
+    这一项加的是「功能级失败也要有现场」：HTTP 处理器异常、前端事件异常、
+    异常退出残留、功能计数、面包屑、深度体检。门禁只查接线是否还在 ——
+    任何一处被后人删掉，用户报「翻译坏了」时又会只剩一张截图。
+    """
+    bad = []
+    fm = text(ROOT / 'feature_metrics.py')
+    bc = text(ROOT / 'breadcrumb.py')
+    er = text(ROOT / 'error_report.py')
+    br = text(ROOT / 'brain.py')
+    aw = text(ROOT / 'app_window.py')
+    ec = text(ROOT / 'env_check.py')
+
+    if not fm or 'def snapshot(' not in fm:
+        bad.append('feature_metrics.py 缺失或没有 snapshot()')
+    if not bc or 'def snapshot(' not in bc:
+        bad.append('breadcrumb.py 缺失或没有 snapshot()')
+    for mod, name in ((fm, 'feature_metrics'), (bc, 'breadcrumb')):
+        for line in re.findall(r'^(?:import|from)\s+(\w+)', mod, re.M):
+            if line in ('random',):
+                bad.append('%s 引入了不确定依赖 %s' % (name, line))
+    # 隐私：面包屑只收枚举形态，路径/含空格内容必须丢
+    if 'fullmatch(r\'[A-Za-z0-9_.\\-]{1,24}\'' not in bc.replace('"', "'"):
+        bad.append('breadcrumb 没有枚举白名单（搜索词可能落盘）')
+
+    for fn in ('def capture_api(', 'def save_js(', 'def arm_run_guard(',
+               'def check_prev_run(', 'MAX_PER_SIG', 'def _signature('):
+        if fn not in er:
+            bad.append('error_report.py 缺少 %s' % fn)
+    if 'if conf[\'auto\'] and endpoint():' not in er:
+        bad.append('自动发送的双条件被改了（auto 与 endpoint 必须同时成立）')
+
+    for token in ('error_report.capture_api', '_last_path', '/api/metrics',
+                  "op == 'js'", "op == 'crumb'", 'def report_context(',
+                  'deep=_deep'):
+        if token not in br:
+            bad.append('brain.py 缺少接线：%s' % token)
+
+    for token in ('error_report.arm_run_guard', 'error_report.mark_clean',
+                  "error_report.mark_stage('ready')", 'feature_metrics.flush(True)'):
+        if token not in aw:
+            bad.append('app_window.py 缺少接线：%s' % token)
+    # 装机版实测踩过：调用点都写了，但顶层没 import，全部 NameError 被 try 吞掉，
+    # 运行标记一次都没落盘（异常退出检查等于没装）。
+    if 'import error_report' not in aw.split('\ndef ', 1)[0]:
+        bad.append('app_window.py 顶层没 import error_report（NameError 会被静默吞掉）')
+    if "error_report.mark_clean()" in aw and 'import error_report' not in aw:
+        bad.append('app_window.py 用 error_report 却没 import')
+
+    probes = ('_probe_translate', '_probe_ocr', '_probe_index_health',
+              '_probe_clipboard', '_probe_hotkey', '_probe_update',
+              '_probe_license', '_probe_autostart', '_probe_resources',
+              '_probe_capture', '_probe_libsets', '_probe_reporter')
+    missing = [p for p in probes if ('def %s(' % p) not in ec]
+    if missing:
+        bad.append('env_check 缺探测：%s' % ', '.join(missing))
+    if 'deep=False' not in ec or 'deep=_deep' not in br:
+        bad.append('深度体检参数没接通（勾了也是浅检）')
+
+    ui = ROOT / 'web/src/lib/errhook.ts'
+    if not ui.is_file():
+        bad.append('web/src/lib/errhook.ts 缺失（前端异常没人接）')
+    else:
+        s = text(ui)
+        for token in ('window.addEventListener(\'error\'', 'unhandledrejection',
+                      "errOp('js'", "errOp('crumb'"):
+            if token not in s:
+                bad.append('errhook.ts 缺少 %s' % token)
+    if 'installErrorHooks()' not in text(ROOT / 'web/src/main.tsx'):
+        bad.append('main.tsx 没有装异常钩子')
+    if "reportJs('RenderError'" not in text(ROOT / 'web/src/ui/errorboundary.tsx'):
+        bad.append('ErrorBoundary 没有自动上报')
+    if "t('hc_deep')" not in text(ROOT / 'web/src/ui/panels.tsx'):
+        bad.append('体检面板没有「深度体检」按钮')
+    if not (ROOT / 'tests/test_telemetry.py').is_file():
+        bad.append('tests/test_telemetry.py 缺失')
+
+    rec('PASS' if not bad else 'FAIL', '第 277 项：失败现场与功能可用性体检',
+        '指标/面包屑/HTTP+前端异常/崩溃残留/12 项深度体检接线齐全' if not bad
+        else '；'.join(bad[:6]))
+
+
 def check_unknown_api():
     ok = "err': 'no such api'" in text(ROOT / 'brain.py')
     rec('PASS' if ok else 'FAIL', '未知 /api/ 返回 JSON 404 而非 HTML 首页', '')
@@ -1088,13 +1218,18 @@ def check_bridge():
     aw.App.show_main(a, '瑜伽')
     if not a.main.loaded or '/web/?q=' not in a.main.loaded[0]:
         bad.append('首次导航没带 q')
+    n = len(a.main.loaded)
     aw.App.show_main(a, '周报')
-    if not a.main.js or 'location.href' not in a.main.js[0]:
-        bad.append('换词没走 location.href')
-    n = len(a.main.js)
+    if len(a.main.loaded) - n != 1 or '/web/?q=' not in a.main.loaded[-1]:
+        bad.append('换词没走 load_url')
+    if a.main.js:
+        # 第 267 项：show_main 一律不许再碰 evaluate_js —— 它被 pywebview 的
+        # `_pywebviewready` 门闩套着，门闩一旦被清空就空等 20 秒，托盘面板永远打不开。
+        bad.append('show_main 走了 evaluate_js（20 秒门闩死因）: %s' % str(a.main.js[0])[:40])
+    n = len(a.main.loaded)
     aw.App.show_main(a, panel='settings')
     aw.App.show_main(a, panel='settings')
-    if len(a.main.js) - n != 2:
+    if len(a.main.loaded) - n != 2:
         bad.append('同一 panel 连点没每次导航')
     log.clear()
     aw.App.show_main(make(fail=True), '瑜伽')
@@ -1169,14 +1304,14 @@ def check_tests():
             if name == '后端 unittest':
                 m = re.search(r'Ran (\d+) tests', out)
                 ok = (r.returncode == 0 and any(x.startswith('OK') for x in lines)
-                      and m and int(m.group(1)) >= 329)
-                want = '>= 329 项'
+                      and m and int(m.group(1)) >= 658)
+                want = '>= 658 项'
             else:
                 mf = re.search(r'Test Files\s+(\d+) passed', out)
                 mt = re.search(r'Tests\s+(\d+) passed', out)
                 ok = (r.returncode == 0 and mf and mt and
-                      int(mf.group(1)) >= 7 and int(mt.group(1)) >= 97)
-                want = '>= 7 文件 / >= 97 用例'
+                      int(mf.group(1)) >= 14 and int(mt.group(1)) >= 140)
+                want = '>= 14 文件 / >= 140 用例'
             detail = '' if ok else '%s（要求 %s）' % (
                 (lines[-1] if lines else '?')[:100], want)
             rec('PASS' if ok else 'FAIL', '测试全绿：' + name, detail)
@@ -1241,7 +1376,9 @@ def check_white_screen():
     a = s.find('def after_start(')
     b = s.find('def _start_activate_listener(', a + 1)
     body = s[a:b] if a >= 0 and b > a else ''
-    if '_fit_main_size()' not in body:
+    # 第 206 项：启动那一趟必须显式 initial=True（只有它允许校正 DPI），
+    # 后续 show_main 走默认 False —— 否则用户拖出来的尺寸会被拉回设计值。
+    if '_fit_main_size(' not in body or 'initial=True' not in body:
         bad.append('after_start 没做尺寸校验（各档 DPI 会走偏）')
     if 'if not self.silent:' in body:
         bad.append('after_start 仍按 silent 分叉尺寸逻辑（100% 机器测不到另一条路）')
@@ -1307,8 +1444,14 @@ def check_env_robustness():
     for fn in ('def cursor_monitor_rect(', 'def mini_origin_in(', 'def _place_mini_on('):
         if fn not in s:
             bad.append('%s 丢失（副屏上快搜窗会弹在主屏）' % fn.strip('def ('))
-    if 'if cur and prim and cur != prim:' not in s:
-        bad.append('place_mini 没判断「鼠标在不在主屏」')
+    # 第 202 项：place_mini 改成「鼠标所在屏的工作区 + 鼠标附近」，
+    # 副屏（含负坐标）也由 _monitor_work(hmon) 直接给物理矩形，不再走
+    # 「先判主屏再单独处理副屏」的老分支。断言跟着换成新接线的三个标记。
+    if ('u.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)' not in s
+            or '_monitor_work(hmon)' not in s):
+        bad.append('place_mini 没按鼠标所在屏的工作区定位（副屏会弹错位置）')
+    if 'cursor_monitor_rect() or primary_monitor_rect()' not in s:
+        bad.append('拿不到鼠标所在屏时没有兜底显示器')
 
     # ③ 联接点：os.walk(followlinks=False) 挡不住 junction，会成环扫不完。
     if 'def _is_reparse_dir(' not in b:
@@ -1657,11 +1800,994 @@ def check_no_ingest_host_in_public():
         '; '.join(bad[:4]) if bad else '公开仓库 + 前端源码/产物 0 处端点主机名')
 
 
+def check_quick_switch():
+    """第 194 项：Quick Switch（把目录送进打开/保存对话框）。
+
+    这块靠 Win32 消息工作，浏览器里测不到，所以静态钉住四件事：
+    后端模块在位、接口有白名单、快搜窗有分组与 Ctrl+G、五语言文案齐。"""
+    qs = text(ROOT / 'quick_switch.py')
+    need = ('def open_folders', 'def jump(', 'def jump_target', 'def nav_text',
+            'FILE_DIALOG_CLASS',
+            # 第 229 项：目录导航走「填目录\ + 回车键对」，钉死防回退
+            'def key_enter', "'mode': 'nav'")
+    miss = [n for n in need if n not in qs]
+    rec('PASS' if qs and not miss else 'FAIL', 'Quick Switch 后端模块完整',
+        ('缺 %s' % ' '.join(miss)) if miss else 'open_folders / jump / 折算规则都在')
+
+    b = text(ROOT / 'brain.py')
+    routes = ('/api/open_dirs', '/api/dialog_probe', '/api/dialog_jump', 'not_allowed')
+    miss = [n for n in routes if n not in b]
+    rec('PASS' if not miss else 'FAIL', 'Quick Switch 接口与白名单在位',
+        ('缺 %s' % ' '.join(miss)) if miss else '3 个接口 + not_allowed 分支')
+
+    m = re.search(r"MINI_TPL = r'''(.*?)'''", b, re.S)
+    tpl = m.group(1) if m else ''
+    need = ('function renderHome', 'fetchOpenDirs', 'jumpDir', "k==='g'", '/api/dialog_jump',
+            'if(HAS_DIALOG){ jumpDir(it.p); return; }', 'id="jm"', 'jm_hint', 'ad_hint')
+    miss = [n for n in need if n not in tpl]
+    rec('PASS' if not miss else 'FAIL', '快搜窗推荐 + Ctrl+G + 点结果即跳目录',
+        ('缺 %s' % ' '.join(miss)) if miss else '分组 / 快捷键 / 跳转调用齐')
+
+    n = b.count("'qs_none':")
+    rec('PASS' if n >= 5 else 'FAIL', '快搜窗新文案五语言齐全', 'qs_none 出现 %d 次' % n)
+
+    front = text(ROOT / 'web/src/api.ts') + text(ROOT / 'web/src/App.tsx') + text(ROOT / 'web/src/lib/i18n.ts')
+    need = ('/api/dialog_jump', 'dialogJump', 'ctx_dialog', 'kb9')
+    miss = [n for n in need if n not in front]
+    rec('PASS' if not miss else 'FAIL', '主界面接线与五语言文案',
+        ('缺 %s' % ' '.join(miss)) if miss else '右键菜单 / Ctrl+G / 帮助 / i18n 齐')
+
+
+def check_media_index():
+    """第 235 项：影片/音乐必须进「文件名索引」，两条体积上限都不能把媒体挡在外面。
+
+    踩过的坑：4K 影片 20~60GB，被 `NAMES_SIZE_LIMIT`(2GB) 和 `scan_docs.SIZE_LIMIT`
+    (80MB) 双层挡掉，于是用户加了盘、点了更新，一部片都搜不出来。这两处任何一处
+    回退都会让「搜片名」重新失效，所以钉死调用形态，而不是只钉常量名。"""
+    s = text(ROOT / 'scan_docs.py')
+    need = ('MEDIA_EXTS = {', 'if sz > SIZE_LIMIT and ext not in MEDIA_EXTS:')
+    miss = [n for n in need if n not in s]
+    rec('PASS' if not miss else 'FAIL', '扫描清单：媒体不受 80MB 上限',
+        ('缺 %s' % ' '.join(miss)) if miss else '视频/音频/镜像照收（正文照样不读）')
+
+    b = text(ROOT / 'brain.py')
+    # 第 242 项：文件名索引**取消**了体积上限（Everything 的文件名索引同样不限，
+    # 它的 size 上限只管内容索引）。用户指出 2GB 以上的常见就是压缩包和系统镜像，
+    # 那正是要按名字找得到的东西。所以这里改成钉「上限为 0」+「媒体豁免仍留着」。
+    need = ('NAMES_BIG_EXTS = scan_docs.MEDIA_EXTS',
+            'NAMES_SIZE_LIMIT = 0',
+            'if (NAMES_SIZE_LIMIT and sz and sz > NAMES_SIZE_LIMIT')
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '文件名索引：不设体积上限（压缩包/镜像可搜）',
+        ('缺 %s' % ' '.join(miss)) if miss else
+        '无体积上限，2GB+ 的压缩包/镜像/影片照进 files 表')
+
+    # 前端：侧栏类型必须能翻成 ext: 交给后端，且媒体类型不该再请求正文那一路
+    f = text(ROOT / 'web/src/App.tsx')
+    need = ('const KIND_EXTS: Record<string, string[]> = Object.fromEntries(TYPE_GROUPS)',
+            "kind === 'img' || kind === 'video' || kind === 'audio'",
+            "ext:${kindExts.join(',')}")
+    miss = [n for n in need if n not in f]
+    rec('PASS' if not miss else 'FAIL', '侧栏类型筛选：媒体不搜正文 + ext 交给后端',
+        ('缺 %s' % ' '.join(miss)) if miss else '视频/图片/音频 只列同名文件，正文命中清零')
+
+
+def check_default_exclude():
+    """第 236 项：内置默认排除（AppData / 安装目录资源 / 正文污染）。
+
+    为什么钉这么细：这几条规则的失效方式是「静默的」——
+      · DEFAULT_SKIP_SEGS 没接进 _scope_excludes → 全盘扫描又把 AppData 收回来，
+        用户点一次更新，96,031 条缓存重新出现在搜索里；
+      · _excluded 丢了开始菜单白名单 → 搜「微信」搜不到应用（lnk 在 AppData 里）；
+      · is_install_root 只在全量扫描里判、实时监听没判 → 重建后干净，用两天又长回来；
+      · reconcile_scope 没挂进 update → 改了排除规则也清不掉旧记录（这是本轮的病根）。
+    全是「代码在、但没接上」的类型，所以钉调用形态，不钉常量名。"""
+    s = text(ROOT / 'scan_docs.py')
+    need = ('DEFAULT_SKIP_NAMES = {', 'DEFAULT_SKIP_SEGS = (', 'DEFAULT_KEEP_SEGS = (',
+            'BODY_SKIP_SEGS = (', 'def is_install_root(', 'APP_ONLY_EXTS = {')
+    miss = [n for n in need if n not in s]
+    rec('PASS' if not miss else 'FAIL', '内置排除：规则表齐全',
+        ('缺 %s' % ' '.join(miss)) if miss else '目录名 / 路径段 / 白名单 / 正文段 / 安装根')
+
+    b = text(ROOT / 'brain.py')
+    need = ('out.extend(os.path.normcase(s) for s in scan_docs.DEFAULT_SKIP_SEGS)',
+            '_KEEP_SEGS_NC = tuple(os.path.normcase(s) for s in scan_docs.DEFAULT_KEEP_SEGS)',
+            '_BODY_SKIP_SEGS_NC = tuple(os.path.normcase(s) for s in scan_docs.BODY_SKIP_SEGS)',
+            'NAMES_SKIP_DIRS |= set(scan_docs.DEFAULT_SKIP_NAMES)')
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '内置排除：接进排除词与剪枝表',
+        ('缺 %s' % ' '.join(miss)) if miss else '三条路径（文件名/正文/实时）共用同一份规则')
+
+    # 白名单必须真的「先于」排除判断返回 False，否则开始菜单会被 AppData 那条规则吃掉
+    if '_KEEP_SEGS_NC' in b:
+        seg = b.split('def _excluded(', 1)[1].split('\n\n\n', 1)[0]
+        ok = 'if any(k in lp for k in _KEEP_SEGS_NC)' in seg and 'return False' in seg
+    else:
+        ok = False
+    rec('PASS' if ok else 'FAIL', '内置排除：开始菜单白名单优先',
+        '命中 start menu\\programs 先放行' if ok else '白名单没生效，应用搜索会失效')
+
+    need = ('cur_install = scan_docs.is_install_root(cur)',
+            # 第 242 项：整目录嗅探不再是「剪掉整棵子树」，改成文件层级判断 ——
+            # 只排「程序资产目录」里的素材，同目录里用户的其它文件照收。
+            'scan_docs.is_asset_path(full)',
+            'or _soft_dir_file(full, ext)',
+            'if _soft_dir_file(p, ext):',
+            'if ((scan_docs.is_install_root(os.path.dirname(full))')
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '安装目录只收应用：全量 + 实时两条路径',
+        ('缺 %s' % ' '.join(miss)) if miss else 'Program Files 里 exe/lnk 保留，png/js/dll 不进')
+
+    need = ('_SKIP_NAME_RE = re.compile(', 'if _SKIP_NAME_RE.search(lp):')
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '内置排除：目录名规则也进对账',
+        ('缺 %s' % ' '.join(miss)) if miss else 'steamapps/_internal/webcontent 靠名字也能清掉');
+
+    need = ('def never_index(', 'if never_index(inc):')
+    miss = [n for n in need if n not in s]
+    rec('PASS' if not miss else 'FAIL', '内置排除：include 里写了也不扫',
+        ('缺 %s' % ' '.join(miss)) if miss else 'AppData/ProgramData 硬排除，不给 include 开口子')
+
+    b = text(ROOT / 'brain.py')
+    n = b.count('not scan_docs.never_index(')
+    rec('PASS' if n >= 2 else 'FAIL', '内置排除：两条扫描根都过滤',
+        'names_targets / 监听根 %d 处' % n if n >= 2 else '只挂了 %d 处，实时监听会把 AppData 收回来' % n)
+
+    need = ('def reconcile_scope(', 'reconcile_scope()', 'if scan_docs.is_install_root(pl)',
+            'if scan_docs.is_install_root(k)')
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '范围对账：函数 + 挂在更新流程 + 正文同判',
+        ('缺 %s' % ' '.join(miss)) if miss else '改规则后旧记录能被清掉，不靠重建')
+
+
+def check_hit_field_contract():
+    """第 237 项：结果行的字段契约 —— 前端读 `s`，后端就必须给 `s`。
+
+    2026-11-15 用户截图：侧栏选「视频」后，结果行「大小」列一片空白，而库里 size 全有值。
+    根因是 `/api/files` 有四条产出路径写的是 `'z': size`，React 的 `fmtSize(it.s)` 读的
+    是 `s` —— 恒为 undefined。侧栏选类型会走「纯语法筛选」那条，于是只有这一类结果露馅，
+    实际上主窗口每一行的大小都是空的。
+
+    为什么单测没抓到：`fmtSize` 是纯函数、`hits.ts` 有单测，但没人在两侧验证
+    「接口字典里到底有没有那个键」。这是跨层契约，只有钉字符串 + tests/test_hit_contract.py
+    这种"调真函数断言字段"能挡。"""
+
+    b = text(ROOT / 'brain.py')
+    need = ("'m': mtime, 's': size, 'z': size",   # mini_search 两处
+            "'m': mt, 's': sz, 'z': sz",          # syntax_only_items
+            "'s': sz, 'z': sz}")                  # 空关键词 = 浏览最近
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '结果行：大小字段 s 与 z 双写',
+        ('缺 %s' % ' '.join(miss)) if miss else '四条产出路径都带 s，大小列不再空白')
+
+    f = text(ROOT / 'web/src/lib/hits.ts')
+    f2 = text(ROOT / 'web/src/ui/panels.tsx')
+    ok = ('export function fmtSize' in f and 'fmtSize(it.s)' in f2)
+    rec('PASS' if ok else 'FAIL', '前端：fmtSize 读 s 且函数在位',
+        'hits.ts + panels.tsx' if ok else '大小列会重新变空')
+
+    # 同一个坑的另一半：`/api` 的正文命中里 `b` 才是片段，`s` 会被 meta 的 size 覆盖。
+    # 快搜窗有两套行渲染：紧凑表（默认 tbl）读 `it.b`，卡片读 `r.snip`，
+    # 所以行对象两个字段都得带；只带 snip 的话紧凑表既没有片段、也不画「以下 N 条」分隔。
+    # 老代码照旧字段读 `snip:h.s`，于是卡片里显示的是一串字节数。
+    ok_b = ('snip:h.b' in b and 'b:h.b' in b and 'snip:h.s' not in b
+            and 'snipHtml(it.b)' in b)
+    rec('PASS' if ok_b else 'FAIL', '快搜窗：正文片段读 b 且两种样式都带',
+        'b + snip 双写，紧凑表与卡片都能显示片段' if ok_b
+        else '缺 b/snip 双写，或又把 h.s 当片段了')
+
+    # 文件夹没有「文件大小」：os.stat 给的是目录元数据（4 KB 之类），
+    # 摆进「大小」列就像索引记错了 —— 主列表与详情面板都要挡住。
+    app = text(ROOT / 'web/src/App.tsx')
+    ok_d = "r.t === 'dir' ? '' : fmtSize(r.s)" in app
+    rec('PASS' if ok_d else 'FAIL', '文件夹不显示「大小」',
+        '主列表按 t 判定' if ok_d else '文件夹会显示 4 KB 这类目录元数据')
+
+
+def check_kind_table_sync():
+    """第 237 项：侧栏「文档/图片/视频…」的扩展名表，前后端必须是同一张。
+
+    前端 TYPE_GROUPS 决定 typeLabel 显示和**本地兜底筛选**；后端 `_KIND_EXTS` 决定
+    时间轴与 `ext:` 语法。两边只要有一边缺项，用户选了那一类就「搜不到明明存在的文件」——
+    iPhone 的 .heic 就这么漏在「图片」外面（前端没写、后端有）。这种漏项不会报错，
+    只会让人以为文件不在库里，所以逐项比对。"""
+
+    b = text(ROOT / 'brain.py')
+    a = text(ROOT / 'web/src/App.tsx')
+    if not b or not a:
+        rec('FAIL', '类型表：前后端一致', '读不到 brain.py / App.tsx')
+        return
+
+    def py_table(src):
+        m = re.search(r'_KIND_EXTS\s*=\s*\{(.*?)\n\}', src, re.S)
+        if not m:
+            return {}
+        out = {}
+        for k, body in re.findall(r"'(\w+)':\s*\(([^)]*)\)", m.group(1)):
+            out[k] = {e.lstrip('.') for e in re.findall(r"'\.?([\w-]+)'", body)}
+        return out
+
+    def ts_table(src):
+        m = re.search(r'const TYPE_GROUPS:[^=]*=\s*\[(.*?)\n\]', src, re.S)
+        if not m:
+            return {}
+        out = {}
+        for k, body in re.findall(r"\['(\w+)',\s*\[([^\]]*)\]\]", m.group(1)):
+            out[k] = set(re.findall(r"'([\w-]+)'", body))
+        return out
+
+    py, ts = py_table(b), ts_table(a)
+    if not py or not ts:
+        rec('FAIL', '类型表：前后端一致', '两边有一边解析不出来（格式被改？）')
+        return
+
+    diff = []
+    for k in sorted(set(py) | set(ts)):
+        only_py = py.get(k, set()) - ts.get(k, set())
+        only_ts = ts.get(k, set()) - py.get(k, set())
+        if only_py:
+            diff.append('%s 后端多 %s' % (k, ','.join(sorted(only_py))))
+        if only_ts:
+            diff.append('%s 前端多 %s' % (k, ','.join(sorted(only_ts))))
+    rec('PASS' if not diff else 'FAIL', '类型表：前后端一致',
+        '; '.join(diff) if diff else '%d 类、共 %d 个扩展名，两边逐项对齐'
+        % (len(py), len(set().union(*py.values()))))
+
+
+def check_folder_syntax():
+    """第 238 项：`folder/` 语法必须真的过滤，而不只是解析出来放着。
+
+    帮助面板把它写成一条正式语法（QS() 里那行 `folder/`），解析器 `parse_qsyn`
+    也确实填了 `syn['folder']` —— 但 `syn_ok()` 从来没读过这个键。于是：
+    主窗把它当成「没有关键词」退回「浏览最近 400 条」；快搜窗 q 被剥空后直接
+    `mini_search('')` 回 0 条。两头都是「静默失效」，用户以为文件夹里没东西。
+    所以这里钉住三处：syn_ok 的判定、纯语法 SQL 的条件、两个路由分支里的 folder。"""
+
+    b = text(ROOT / 'brain.py')
+    need = [
+        ("if folder and folder not in str(path or '').lower()", 'syn_ok 按文件夹过滤'),
+        ("wheres.append('instr(lower(path), ?) > 0')", '纯语法 SQL 带文件夹条件'),
+        ("or syn_m['days'] or syn_m['folder']", '快搜窗无关键词时走纯语法分支'),
+    ]
+    miss = [label for s, label in need if s not in b]
+    # `c:xxx` 是「只搜正文」：/api/files 必须让位给 /api，否则名字命中和
+    # 「最近 400 条」会混进正文结果里。
+    if "if syn['content']:" not in b:
+        miss.append('主窗没给 content: 让位（会混进文件名结果）')
+    # /api/files 的两处路由（关键词分支 + 无关键词分支）都要认 folder
+    routes = b.count("or syn['days'] or syn['folder']")
+    if routes < 2:
+        miss.append('主窗路由只有 %d 处认 folder（要 2 处）' % routes)
+    rec('PASS' if not miss else 'FAIL', 'folder/ 语法真的生效',
+        '; '.join(miss) if miss else 'syn_ok / SQL / 三条路由全部接上')
+
+
+def check_no_shadowed_imports():
+    """第 239 项：禁止「函数里再 import 一次模块级已有的名字」。
+
+    2026-11-16 开机启动直接失败，弹窗写的是
+    「窗口启动失败：UnboundLocalError: cannot access local variable 'traceback'」，
+    看着像玄学。真因有两层：
+      ① 第 236 项改排除规则时误删了 `_watch_roots()` 里的 `home = os.path.expanduser('~')`
+         → 启动即 NameError；
+      ② `app_window._start_server()` 里有一句局部 `import traceback`，
+         它把整个函数的 traceback 变成局部名，于是「启动监听失败」那个 except 一执行
+         就抛 UnboundLocalError，**把真正的 NameError 吃掉**，用户只看到一句无用的提示。
+
+    局部 import 本身不是错（`import ctypes` 紧接着用是正常的），错在**跨分支使用**：
+    import 在某个 try/except 里，使用在别的分支 → 那个分支永远拿不到模块级名字。
+    这里用 AST 精确找出「import 所在的 Try 之外还在用同一个名字」的情况。"""
+
+    import ast
+
+    files = ['brain.py', 'app_window.py', 'scan_docs.py', 'quick_switch.py',
+             'tray.py', 'hotkey.py', 'apprank.py', 'preflight.py']
+    hits = []
+
+    class _Anc(ast.NodeVisitor):
+        def __init__(self):
+            self.stack = []
+            self.of = {}
+
+        def generic_visit(self, node):
+            self.of[node] = list(self.stack)
+            self.stack.append(node)
+            super().generic_visit(node)
+            self.stack.pop()
+
+    for rel in files:
+        p = ROOT / rel
+        if not p.exists():
+            continue
+        try:
+            tree = ast.parse(text(p) or '')
+        except SyntaxError as e:
+            hits.append('%s 语法错误：%s' % (rel, e))
+            continue
+        mod = set()
+        for n in tree.body:
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    mod.add((a.asname or a.name).split('.')[0])
+            elif isinstance(n, ast.ImportFrom):
+                for a in n.names:
+                    mod.add(a.asname or a.name)
+        anc = _Anc()
+        anc.visit(tree)
+        for fn in [x for x in ast.walk(tree) if isinstance(x, ast.FunctionDef)]:
+            imp = {}
+            for n in ast.walk(fn):
+                names = []
+                if isinstance(n, ast.Import):
+                    names = [(a.asname or a.name).split('.')[0] for a in n.names]
+                elif isinstance(n, ast.ImportFrom):
+                    names = [a.asname or a.name for a in n.names]
+                for nm in names:
+                    if nm in mod:
+                        imp.setdefault(nm, n)
+            for nm, node in imp.items():
+                owner = next((a for a in anc.of.get(node, []) if isinstance(a, ast.Try)), None)
+                if owner is None:
+                    continue
+                for u in ast.walk(fn):
+                    if (isinstance(u, ast.Name) and u.id == nm
+                            and isinstance(u.ctx, ast.Load)
+                            and owner not in anc.of.get(u, [])):
+                        hits.append('%s 的 %s()：局部 import %s 后在别的分支又用了它'
+                                    % (rel, fn.name, nm))
+                        break
+    rec('PASS' if not hits else 'FAIL', '没有「局部 import 遮蔽模块级名字」的写法',
+        '; '.join(hits[:5]) if hits else '%d 个核心文件 AST 扫描干净' % len(files))
+
+
+def check_native_dialog_thread():
+    """第 241 项：原生「选文件夹 / 选文件」必须调度到 UI 线程弹。
+
+    点「选择文件夹…」有概率主窗整块白屏。真因：pywebview 的 JS API 是**另起线程**
+    执行的（webview/util.py：`Thread(target=_call)`），而 winforms 后端的
+    `create_file_dialog` 是**唯一没有 Invoke 回 UI 线程**的窗口操作
+    （同文件里 set_title / show / hide / destroy_window 全都有 InvokeRequired 判断）。
+    模态框在后台线程上弹、owner 却是 UI 线程的主窗 → 跨线程 disable WebView2 宿主
+    → 渲染层被藏 → 白屏。
+
+    这里钉三件事：
+      ① Api.pick_folder / pick_file 不许直接调 `self._win.create_file_dialog`；
+      ② 必须有 `_ui_dialog` 且里面真的用了 Invoke；
+      ③ MiniApi 必须暴露 pick_folder / pick_file（快搜窗「手动添加文件夹」以前是死路）。
+    """
+
+    import ast
+
+    src = text(ROOT / 'app_window.py') or ''
+    hits = []
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        rec('FAIL', '原生对话框走 UI 线程调度', 'app_window.py 语法错误：%s' % e)
+        return
+
+    classes = {}
+    for n in tree.body:
+        if isinstance(n, ast.ClassDef):
+            classes[n.name] = n
+
+    api = classes.get('Api')
+    mini = classes.get('MiniApi')
+    if api is None or mini is None:
+        rec('FAIL', '原生对话框走 UI 线程调度', 'Api / MiniApi 类不见了')
+        return
+
+    def fn_src(cls, name):
+        for m in cls.body:
+            if isinstance(m, ast.FunctionDef) and m.name == name:
+                return ast.get_source_segment(src, m) or ''
+        return None
+
+    for name in ('pick_folder', 'pick_file'):
+        seg = fn_src(api, name)
+        if seg is None:
+            hits.append('Api.%s 没了' % name)
+            continue
+        if 'create_file_dialog' in seg:
+            hits.append('Api.%s 直接调 create_file_dialog（跨线程弹框 → 白屏）' % name)
+        if '_ui_dialog' not in seg:
+            hits.append('Api.%s 没走 _ui_dialog' % name)
+
+    seg = fn_src(api, '_ui_dialog')
+    if seg is None:
+        hits.append('Api._ui_dialog 没了')
+    else:
+        if 'InvokeRequired' not in seg:
+            hits.append('_ui_dialog 没判断 InvokeRequired')
+        if 'Invoke(' not in seg:
+            hits.append('_ui_dialog 没有 Invoke 回 UI 线程')
+
+    seg = fn_src(api, '_after_native_dialog')
+    if seg is None:
+        hits.append('Api._after_native_dialog 没了（缺白屏兜底自愈）')
+    else:
+        if '_render_children_visible' not in seg:
+            hits.append('_after_native_dialog 没检查渲染层')
+        if 'revive_webview' not in seg:
+            hits.append('_after_native_dialog 没调 revive_webview 自愈')
+
+    mini_methods = {m.name for m in mini.body if isinstance(m, ast.FunctionDef)}
+    for name in ('pick_folder', 'pick_file'):
+        if name not in mini_methods:
+            hits.append('MiniApi 缺 %s（快搜窗选文件夹是死路）' % name)
+
+    if '_dialog_kind(' not in src:
+        hits.append('没用新的 webview.FileDialog 枚举（旧常量已废弃）')
+
+    rec('PASS' if not hits else 'FAIL', '原生对话框走 UI 线程调度',
+        '; '.join(hits[:5]) if hits else
+        'pick_folder/pick_file 走 _ui_dialog(Invoke) + 对话框后自愈 + MiniApi 已暴露')
+
+
+def check_software_dir_sniff():
+    """第 240 项：软件安装目录内容嗅探必须真的接在扫描主路径上。
+
+    钉钉 D:\\DingDing\\main\\current 有 2,176 张 png、腾讯会议 2,635 张 ——
+    全是安装包自带素材，用户搜不到也不需要，却占着索引。
+    `INSTALL_ROOT_SEGS` 只认 Program Files 这类固定路径段，盖不住装在 D:\\ 下的软件。
+
+    这里钉住三处：scan_docs 里的判据常量与函数、brain 扫描循环里的调用、
+    以及「命中后只保留应用入口」这句 —— 少任何一处，软件目录就会照旧全量进库。"""
+
+    sd = text(ROOT / 'scan_docs.py')
+    b = text(ROOT / 'brain.py')
+    # 第 242 项：判据换成了「程序资产目录名 + 父目录有 exe」，不再是子树构成比例。
+    need_sd = ('def looks_like_software_dir', 'SOFTWARE_DIR_SNIFF = True',
+               'SOFTDIR_SRC_EXTS', 'SOFTDIR_DOC_EXTS', 'SOFTDIR_SRC_RATIO',
+               # 新判据
+               'SOFTDIR_ASSET_SEGS', 'def is_asset_path',
+               # 靶场保护（用户明说 D:\phpstudy_pro\WWW 是渗透靶场）
+               'SOFTDIR_ALWAYS_KEEP_SEGS')
+    need_b = ('scan_docs.looks_like_software_dir(cur)',
+              'scan_docs.is_asset_path(full)',
+              # 体积上限取消 + 小图标排除
+              'NAMES_SIZE_LIMIT = 0', 'NAMES_ICON_EXTS', 'NAMES_ICON_MAX_SIZE')
+    miss = ([n for n in need_sd if n not in sd]
+            + [n for n in need_b if n not in b])
+    rec('PASS' if not miss else 'FAIL', '软件资产目录排除：判据 + 扫描接线都在',
+        '; '.join(miss) if miss else '资产段判据 + 靶场保护 + 无体积上限 + 小图标排除齐全')
+
+    # 靶场保护名单里绝不能出现 www / lib / bin 这类通用段名（会误伤用户的靶场与项目）
+    try:
+        import re as _re
+        m = _re.search(r'SOFTDIR_ASSET_SEGS\s*=\s*\{(.*?)\}', sd, _re.S)
+        segs = set(_re.findall(r"'([^']+)'", m.group(1))) if m else set()
+        risky = segs & {'www', 'wwwroot', 'htdocs', 'lib', 'bin', 'assets',
+                        'plugins', 'modules', 'src', 'dist', 'build'}
+        rec('PASS' if not risky else 'FAIL', '程序资产段名表不含通用目录名',
+            ('危险段名：%s' % ' '.join(sorted(risky))) if risky
+            else '%d 个段名，都是安装目录特有' % len(segs))
+    except Exception as e:
+        rec('FAIL', '程序资产段名表不含通用目录名', '解析失败：%r' % (e,))
+
+
+def check_audio_media_rules():
+    """第 243 项：短音频 + 音乐平台目录 + 已知软件目录名单 + 不索引标记。
+
+    用户提的三条诉求（原文大意）：
+      ① 「用户存的 .mp3」和「软件自带的 .mp3」分不出来 → 跳过 20 秒以内的 mp3；
+      ② 看是不是网易云/QQ音乐/酷狗等音乐平台下的目录；
+      ③ 内置一份「世界常用软件 top500」的目录来判断该不该索引。
+
+    调研竞品源码（Recoll recoll.conf / Baloo fileexcludefilters.cpp /
+    GNOME Tracker gsettings / Everything 文档）后的结论：**没有任何索引器靠
+    「猜」来排除软件目录**，全是显式清单 + 通配；竞品里「用户自己标记目录别
+    索引」的通行做法是**在目录里放标记文件**（Recoll .recoll-noindex /
+    Tracker .trackerignore / macOS .metadata_never_index）。所以我们：
+      · 名单分成「具体软件名 / 厂商名 / 用户数据豁免」三档，识别到软件目录后
+        只保留应用入口（exe/lnk…），而不是把目录整棵删掉；
+      · 额外支持 .memex-noindex / .memex-keep 两个标记文件，名单追不上时用户
+        自己一放就生效。
+
+    这里钉四件事：判据表齐全、名单规模、接线三处（扫描/监听/对账）、以及
+    **名单里绝不能出现会误伤用户数据的通用段名**。"""
+    sd = text(ROOT / 'scan_docs.py')
+    b = text(ROOT / 'brain.py')
+    ap = text(ROOT / 'audio_probe.py')
+
+    need_sd = ('MUSIC_APP_DIR_SEGS = {', 'SOFTWARE_DIR_NAMES = {',
+               'SOFTWARE_VENDOR_DIRS = {', 'USER_DATA_DIR_NAMES = {',
+               'USER_DATA_SUFFIXES = {', 'USER_DATA_CONTAINS = {',
+               'def is_media_app_path(', 'def is_known_software_dir(',
+               'def is_user_data_path(', 'def has_noindex_marker(',
+               'def has_keep_marker(', "NOINDEX_MARKER = '.memex-noindex'",
+               "KEEP_MARKER = '.memex-keep'")
+    need_b = ('NAMES_MIN_AUDIO_SECONDS = 20', 'NAMES_MEDIA_APP_EXTS = {',
+              'def _media_noise_file(', 'def _noindex_marked(',
+              'audio_probe.audio_seconds(',
+              # 三条路径都要接
+              'if _media_noise_file(full, ext):',
+              'or _media_noise_file(full, ext)',
+              'if _media_noise_file(p, ext):',
+              'scan_docs.has_noindex_marker(cur)',
+              'scan_docs.is_known_software_dir(cur)')
+    miss = ([n for n in need_sd if n not in sd]
+            + [n for n in need_b if n not in b])
+    rec('PASS' if not miss else 'FAIL', '短音频/音乐平台/软件目录名单：判据 + 三处接线',
+        '; '.join(miss) if miss else
+        '名单三档 + 标记文件 + 扫描/监听/对账全接上')
+
+    # audio_probe 必须是纯标准库：mutagen/ffprobe 都不是 Windows 自带，
+    # 打进 exe 也白占体积；解析不出来要返回 None（调用方保留该文件）。
+    bad = []
+    if not ap:
+        bad.append('audio_probe.py 缺失')
+    else:
+        for dep in ('import mutagen', 'import pydub', 'import librosa',
+                    'import soundfile', 'subprocess'):
+            if dep in ap:
+                bad.append('audio_probe 引入外部依赖：%s' % dep)
+        for need in ('def audio_seconds(', "'.mp3'", "'.wav'", "'.flac'", "'.m4a'"):
+            if need not in ap:
+                bad.append('audio_probe 缺 %s' % need)
+    rec('PASS' if not bad else 'FAIL', '音频时长探测：纯标准库 + 四种格式',
+        '; '.join(bad) if bad else 'mp3/wav/flac/m4a，无第三方依赖')
+
+    # 名单规模：用户要的是「世界常用软件 top500」，不能只有几十条。
+    try:
+        import re as _re
+        m = _re.search(r'SOFTWARE_DIR_NAMES\s*=\s*\{(.*?)\n\}', sd, _re.S)
+        n_sw = len(_re.findall(r"'[^']+'", m.group(1))) if m else 0
+        m2 = _re.search(r'MUSIC_APP_DIR_SEGS\s*=\s*\{(.*?)\n\}', sd, _re.S)
+        n_mu = len(_re.findall(r"'[^']+'", m2.group(1))) if m2 else 0
+        m3 = _re.search(r'USER_DATA_DIR_NAMES\s*=\s*\{(.*?)\n\}', sd, _re.S)
+        n_ud = len(_re.findall(r"'[^']+'", m3.group(1))) if m3 else 0
+        bad = []
+        if n_sw < 500:
+            bad.append('软件名单只有 %d 条（要 ≥500）' % n_sw)
+        if n_mu < 20:
+            bad.append('音乐平台名单只有 %d 条（要 ≥20）' % n_mu)
+        if n_ud < 60:
+            bad.append('用户数据保护名单只有 %d 条（要 ≥60）' % n_ud)
+        rec('PASS' if not bad else 'FAIL', '内置名单规模达标',
+            '; '.join(bad) if bad else
+            '软件 %d 条 / 音乐平台 %d 条 / 保护 %d 条' % (n_sw, n_mu, n_ud))
+    except Exception as e:
+        rec('FAIL', '内置名单规模达标', '解析失败：%r' % (e,))
+
+    # 名单里绝不能出现会误伤用户数据的通用段名。
+    try:
+        import re as _re
+        m = _re.search(r'SOFTWARE_DIR_NAMES\s*=\s*\{(.*?)\n\}', sd, _re.S)
+        segs = set(_re.findall(r"'([^']+)'", m.group(1))) if m else set()
+        risky = segs & {'www', 'wwwroot', 'htdocs', 'lib', 'bin', 'assets',
+                        'plugins', 'modules', 'src', 'dist', 'build',
+                        'music', 'videos', 'pictures', 'documents', 'desktop',
+                        'downloads', 'projects', 'drafts', 'my documents'}
+        rec('PASS' if not risky else 'FAIL', '软件名单不含通用目录名（防误伤）',
+            ('危险段名：%s' % ' '.join(sorted(risky))) if risky
+            else '%d 条都是具体软件名' % len(segs))
+    except Exception as e:
+        rec('FAIL', '软件名单不含通用目录名（防误伤）', '解析失败：%r' % (e,))
+
+
+def check_type_mini_dismiss():
+    """第 244 项：文件夹里打字唤出的快搜窗不许置顶、点空白处要收起。
+
+    用户两条截图反馈：① 快搜窗「跳到最高」，别的窗口移过去还被它挡住；
+    ② 停止搜索点了文件夹空白处，小窗赖着不走、一直占地方，希望「再打字再出来」。
+
+    两个真因：show_mini() 无条件 topmost()（HWND_TOPMOST）、on_mini_blur() 给
+    **所有** dock 模式做了失焦不收起（第 205 项本意是文件对话框吸附）。
+    修法是按来源分流，所以这里钉「调用形态」而不是只钉常量名 —— 旧写法
+    `if not topmost(self.hwnd_mini):` 一旦复活，置顶就回来了。"""
+    s = text(ROOT / 'app_window.py')
+    need = ("def show_mini(self, near_wnd=0, dock=False, tray=False, origin='')",
+            "pin = (origin != 'type')",
+            'topmost(self.hwnd_mini, pin=pin)',
+            "self.show_mini(near_wnd=hwnd, dock=True, origin='type')",
+            'def _type_mini_should_hide(',
+            'App._type_mini_should_hide(',
+            "if getattr(self, '_mini_origin', '') == 'type':",
+            "self._type_guard = 0.0 if ok else time.time() + 5.0",
+            "'blur → 打字唤出，点空白处收起'")
+    miss = [n for n in need if n not in s]
+    rec('PASS' if not miss else 'FAIL', '打字唤出快搜窗：不置顶 + 点空白处收起',
+        '; '.join(miss) if miss else '按来源分流，type 不置顶且失焦即收，dialog 保持吸附')
+
+    bad = []
+    if 'if not topmost(self.hwnd_mini):' in s:
+        bad.append('旧的无条件 topmost() 又回来了（会重新置顶）')
+    if 'if self._dock:' not in s or "blur → dock 模式，保持吸附不收起" not in s:
+        bad.append('第 205 项对话框吸附失焦不收起被挤掉了')
+    if not (ROOT / 'tests' / 'test_type_popup_dismiss.py').is_file():
+        bad.append('回归测试 test_type_popup_dismiss.py 缺失')
+    rec('PASS' if not bad else 'FAIL', '打字唤出：旧置顶写法已除 + 对话框吸附不回归',
+        '; '.join(bad) if bad else '17 条回归测试 + 0.15s 轮询兜底')
+
+
+def check_typing_search():
+    """第 197 项：文件对话框自动弹出快搜窗 + 文件夹里直接打字就搜。
+
+    这两件事全靠 Win32 钩子和跨进程窗口，浏览器和单测都摸不到真实手感，
+    所以这里静态钉住「四端接线」：钩子模块、目录归属、宿主线程、页面入口。
+    少任何一环的典型症状是「按了键没反应」或者「搜的还是上一个文件夹」。
+    """
+    tw = text(ROOT / 'typewatch.py')
+    need = ('def should_capture', 'WH_KEYBOARD_LL', 'def replay', 'TAG', 'FOLDER_CLASSES',
+            'focus_ratio', 'has_caret', 'is_dialog')
+    miss = [n for n in need if n not in tw]
+    rec('PASS' if tw and not miss else 'FAIL', '打字钩子模块完整',
+        ('缺 %s' % ' '.join(miss)) if miss else '判定 / 注入标记 / 注入器都在')
+
+    qs = text(ROOT / 'quick_switch.py')
+    need = ('def window_folder', 'def folder_for', 'def dialog_dir', 'def is_foreground_dialog',
+            '_alive', 'def is_window',
+            # 第 200 项：业务对话框（下载器）也是 #32770，必须靠 Shell 视图区分
+            'def _has_shell_view', 'def is_file_dialog', 'SHELL_VIEW_CLASSES')
+    miss = [n for n in need if n not in qs]
+    rec('PASS' if not miss else 'FAIL', '目录归属（前台窗口 → 文件夹）',
+        ('缺 %s' % ' '.join(miss)) if miss else '资源管理器 / 对话框 / 前台判定都在')
+
+    aw = text(ROOT / 'app_window.py')
+    need = ('def _start_auto_watch', 'def _auto_loop', 'def place_mini_near',
+            'typewatch.start', 'near_wnd', 'is_foreground_dialog',
+            'MINI_W_SMALL', 'def _dock_move',
+            # 第 199 项：宽度/高度上限按触发窗口算，别再写死 460
+            'def _mini_params', 'wcss', 'maxh',
+            # 第 200 项：打字钩子要知道「这个 #32770 是不是真文件对话框」
+            'is_dialog=quick_switch.is_file_dialog',
+            # 第 229 项六轮：前台对话框 ≠ 当前锚点 → 换锚重贴（拖新对话框必须跟）
+            're-dock: anchor', "and (not self._dock",
+            # 第 229 项七轮：rescale 在锁外 + 自节流（锁内跨线程调用会冻死跟随）
+            'self._rescale_lock', 'dock rescale begin', 'rescale_needed',
+            '= 0x1, 0x4, 0x10, 0x4000')
+    miss = [n for n in need if n not in aw]
+    rec('PASS' if not miss else 'FAIL', '宿主：自动弹窗 + 贴窗定位 + 打字接管',
+        ('缺 %s' % ' '.join(miss)) if miss else '轮询 / 定位 / 钩子接线齐')
+
+    b = text(ROOT / 'brain.py')
+    need = ('def _scope_items', '_SCOPE_CACHE', "qs.get('scope'", 'auto_popup', 'type_search',
+            # 第 229 项三/四/五轮：纯语法筛选（无关键词）必须能列出文件；
+            # 五轮起 ext/size/days 直接翻 SQL WHERE，别再靠池子后筛
+            'def syntax_only_items', 'EXT_ALIASES',
+            "elif syn['ext'] or syn['size'] != (None, None) or syn['days']",
+            "if not q and (syn_m['ext'] or syn_m['size'] != (None, None)",
+            'lower(ext) IN (%s)',
+            # 第 229 项四轮：全角冒号 + 空关键词浏览最近（文件/文档）
+            "for _pfx in ('ext', 'type', 'size', 'dm', 'content', 'c', '内容')",
+            "SELECT path, '' FROM meta")
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '限定文件夹搜索 + 两个开关',
+        ('缺 %s' % ' '.join(miss)) if miss else '目录内命中置顶，再用全局补满')
+
+    m = re.search(r"MINI_TPL = r'''(.*?)'''", b, re.S)
+    tpl = m.group(1) if m else ''
+    need = ('id="sc"', '__autoShow', '__autoQuery', '__onDialog', 'clearScope',
+            '.small .row', "classList.toggle('small'",
+            # 第 199 项：行数上限跟窗口大小走；第 234 项：目录与最近文件合成一块、按路径去重
+            'function rowCap', 'window.__onDirs', "dh_recent", 'if(seen[k2])continue;')
+    miss = [n for n in need if n not in tpl]
+    if tpl.count("'&scope='+encodeURIComponent(SCOPE)") < 2:
+        miss.append('scope 没同时接上浅搜和深搜')
+    rec('PASS' if not miss else 'FAIL', '快搜窗：限定提示条 + 自动弹出入口',
+        ('缺 %s' % ' '.join(miss)) if miss else '浅搜/深搜都带 scope，提示条可清除')
+
+    n = b.count("'scope_clear':")
+    front = text(ROOT / 'web/src/ui/panels.tsx') + text(ROOT / 'web/src/lib/i18n.ts')
+    ok_front = 'auto_popup' in front and 'type_search' in front
+    rec('PASS' if n >= 5 and ok_front else 'FAIL', '两个开关的界面与五语言文案',
+        'scope_clear %d 处 / 设置项 %s' % (n, '在' if ok_front else '缺'))
+
+
+def check_popup_style():
+    """第 245 项：弹窗样式定稿 —— 只剩方案1（rich 卡片），方案2（tbl 紧凑表）下线。
+
+    以前这里钉的是「两种样式都在位」，正好和用户定稿相反。现在改成**反向守卫**：
+    界面不能出现方案2 选项、五语言不能残留 qs_style_2、后端/宿主/内联 JS 都不能
+    再把 'tbl' 传进页面（老 settings.json 也要归一）。这是跨层契约：任何一层单独看
+    都「能跑」，合起来才会让下线样式从旧配置里复活。
+    """
+    b = text(ROOT / 'brain.py')
+    w = text(ROOT / 'app_window.py')
+    i18 = text(ROOT / 'web/src/lib/i18n.ts')
+    front = text(ROOT / 'web/src/ui/panels.tsx') + text(ROOT / 'web/src/api.ts')
+    bad = []
+    for token in ("STYLE==='tbl'", "STYLE=(o.style==='tbl')", '.tbl #pane',
+                  "d.setdefault('qs_style', 'tbl')", "patch['qs_style'] = 'rich' if"):
+        if token in b:
+            bad.append('brain.py 残留 ' + token)
+    for token in ("d['qs_style'] = 'rich'", "patch['qs_style'] = 'rich'",
+                  "EMPTY.classList.toggle('hide', !!rows.length)"):
+        if token not in b:
+            bad.append('brain.py 缺 ' + token)
+    if "return 'rich'" not in w:
+        bad.append('宿主 _qs_style 未固定 rich')
+    if 'qs_style_2' in i18 or 'qs_style_2' in front:
+        bad.append('界面/五语言残留 qs_style_2')
+    if '<option value="tbl">' in front or "'tbl'" in front:
+        bad.append('设置页仍能选方案2')
+    if 'qs_style_1' not in front:
+        bad.append('方案1 的固定展示没了')
+    rec('PASS' if not bad else 'FAIL', '弹窗样式只剩方案1（方案2 全链路下线）',
+        '; '.join(bad) if bad else '设置页无切换 / 后端归一 rich / JS 无 tbl 分支 / i18n 无方案2')
+
+    # 空状态跟列表抢版面的那次 bug：用户截到的是「一块大白板 + 两行结果」。
+    # 第 234 项合并后仍要钉住两条：有行就不显示空状态；内容没变别重建 DOM。
+    need = ("EMPTY.classList.toggle('hide', !!rows.length)",
+            "if(sig===HOME_SIG && LIST.className===homeCls)")
+    miss = [n for n in need if n not in b]
+    if not miss:
+        # 第 275 项：紧凑空状态与条数都是设置项（qs_home_compact 默认关、qs_home_count 默认 4）。
+        # 钉住：样式挂在 #list.compact 上、行数按设置夹紧 1..20、模板里有这两个变量、
+        # _subs 会按 settings 放值、POST 白名单能存、设置页有这两个控件。
+        for tok in ('#list.compact .row{height:32px',
+                    'var HOME_COMPACT=__HOME_COMPACT__',
+                    'var HOME_COUNT=__HOME_COUNT__',
+                    'var HOME_SHOW=__HOME_SHOW__',
+                    'window.__setHomeShow=function',
+                    ".replace('__HOME_SHOW__'",
+                    "d.setdefault('qs_home_show', True)",
+                    "patch['qs_home_show'] = bool(req['qs_home_show'])",
+                    'cap=Math.min(10, want)',
+                    'window.__setHomeCount=function',
+                    ".replace('__HOME_COUNT__'",
+                    "d.setdefault('qs_home_compact', False)",
+                    "patch['qs_home_compact'] = bool(req['qs_home_compact'])",
+                    "patch['qs_home_count'] = max(1, min(10"):
+            if tok not in b:
+                miss.append(tok)
+        if 'qs_home_compact' not in front:
+            miss.append('前端设置页无 qs_home_compact')
+        if 'qs_home_count' not in front:
+            miss.append('前端设置页无 qs_home_count')
+        if 'qs_home_show' not in front:
+            miss.append('前端设置页无 qs_home_show')
+    rec('PASS' if not miss else 'FAIL', '空状态不与列表行同时显示',
+        ('缺 %s' % ' '.join(miss)) if miss else '有行就收空状态 + 内容没变不重建 + 紧凑/条数都是设置项（默认关、默认 4 条）')
+
+    need = ('MINI_W_DLG = 440', 'def _qs_style', "'style': App._qs_style()", 'dock rect')
+    miss = [n for n in need if n not in w]
+    rec('PASS' if not miss else 'FAIL', '宿主：固定宽度 + 样式参数 + 尺寸留痕',
+        ('缺 %s' % ' '.join(miss)) if miss else '420/440 封顶 + qs_style + dock rect 日志')
+
+
+def check_dock_and_palette():
+    """第 202 项：把「窗口真的被收窄 / 会跟随锚点 / 重复配色已被折叠」钉进门禁。
+
+    QA 报告点出的系统性盲区：旧门禁只验证「源码里写了 420」和「有日志语句」，
+    不验证窗口最终尺寸。这里至少静态钉住 min_size 不能再锁死 760，
+    以及唯一尺寸入口 / 读回校验 / 锚点跟随这些关键接线。
+    """
+    w = text(ROOT / 'app_window.py')
+    need = ('min_size=(MINI_W_MIN, 88)', 'def _follow_anchor', 'def _dock_xy',
+            'self._follow_anchor()', "SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE",
+            "self._mini_mode", 'place_mini: cursor=',
+            # 第 229 项：227①③ 曾被 cp 覆盖回退、63 次重打的 exe 里根本没有
+            # （CArchive 解剖实锤）—— 门禁钉死防再丢
+            'SetWinEventHook', 'def _install_anchor_hook', 'def _rescale_dock',
+            'win_w_css * 0.5',
+            # 第 229 项二轮：防抖三件套（锁 / 异步摆位 / MOVESIZE 追逐）
+            'self._follow_lock', 'SWP_ASYNCWINDOWPOS',
+            'EVENT_SYSTEM_MOVESIZESTART', 'def _chase_thread')
+    miss = [n for n in need if n not in w]
+    rec('PASS' if not miss else 'FAIL', '贴角小窗：解锁下限 + 吸附 + 唯一尺寸入口',
+        ('缺 %s' % ' '.join(miss)) if miss else 'min_size 解锁 / 读回定位 / 锚点跟随齐')
+
+    ts = text(ROOT / 'web/src/lib/palette.ts')
+    appr = text(ROOT / 'web/src/ui/appearance.tsx')
+    n = ts.count('legacy: true,')
+    ok = n >= 6 and 'legacy?: boolean' in ts and '!p.legacy' in appr
+    rec('PASS' if ok else 'FAIL', '重复配色在设置里已折叠',
+        'legacy 标记 %d 个（id 保留，门禁/i18n/旧配置不受影响）' % n)
+
+
+def check_web_search():
+    """第 203 项：网络搜索。钉住「URL 只由后端按本机配置拼」这条安全边界。"""
+    b = text(ROOT / 'brain.py')
+    need = ('DEFAULT_WEB_SEARCH', 'def _normalize_web_search', 'def web_search_items',
+            'def web_search_url', "'{query}' not in url", "pr.scheme not in ('http', 'https')",
+            "/api/web_search'", "/api/web_search_open'", 'webbrowser.open(u)',
+            "'__WEB_SEARCH__'", 'function matchWeb(', 'function renderWeb(',
+            'function openWeb(')
+    miss = [n for n in need if n not in b]
+    rec('PASS' if not miss else 'FAIL', '网络搜索：后端校验 + 模板接线',
+        ('缺 %s' % ' '.join(miss)) if miss else 'URL 白名单 / 两条接口 / 快搜窗前缀齐')
+
+    front = (text(ROOT / 'web/src/ui/panels.tsx') + text(ROOT / 'web/src/api.ts')
+             + text(ROOT / 'web/src/lib/i18n.ts'))
+    need = ('WebSearchSection', 'web_search_hint', 'web_search_url', 'web_search?:')
+    miss = [n for n in need if n not in front]
+    rec('PASS' if not miss else 'FAIL', '网络搜索：设置面板与五语言文案',
+        ('缺 %s' % ' '.join(miss)) if miss else '引擎表可增删改 / 8 键 × 5 语言齐')
+
+
+def check_tour_gifs():
+    """第 204 项：教程动图必须是**真的会动的 GIF**，且两套教程都引用了它。"""
+    import struct
+    base = ROOT / 'web' / 'public' / 'assets'
+    bad, sizes = [], []
+    for i in range(1, 5):
+        f = base / ('tour-%d.gif' % i)
+        if not f.is_file():
+            bad.append('缺 %s' % f.name)
+            continue
+        b = f.read_bytes()
+        if b[:6] not in (b'GIF89a', b'GIF87a'):
+            bad.append('%s 不是 GIF' % f.name)
+            continue
+        w, h = struct.unpack('<HH', b[6:10])
+        sizes.append('%dx%d' % (w, h))
+        # 图形控制扩展数量 > 8 才叫动图；NETSCAPE2.0 扩展 = 无限循环
+        if b.count(b'\x21\xf9\x04') < 8:
+            bad.append('%s 帧数不足' % f.name)
+        if b'NETSCAPE2.0' not in b[:4096]:
+            bad.append('%s 没有无限循环' % f.name)
+    rec('PASS' if not bad else 'FAIL', '教程 4 张动态 GIF 在位',
+        '; '.join(bad) if bad else '4 张 %s / 多帧 / loop=0' % ','.join(sizes))
+
+    ob = text(ROOT / 'web/src/ui/onboarding.tsx')
+    b = text(ROOT / 'brain.py')
+    i18n = text(ROOT / 'web/src/lib/i18n.ts')
+    need = ('./assets/tour-', 'ob_tour_next', 'ob_tour_start', '0{tour + 1} / 04',
+            '<img src={')
+    miss = [n for n in need if n not in ob]
+    if '/web/assets/tour-1.gif' not in b:
+        miss.append('旧模板未引用 GIF')
+    # 静态 MIME 漏 .gif 会被全局 nosniff 挡住，动图看起来像没打包
+    if "'.gif': 'image/gif'" not in b:
+        miss.append('静态资源 MIME 缺 .gif（nosniff 会拒绝渲染）')
+    for k in ('ob_tour_t1', 'ob_tour_d4', 'ob_tour_skip'):
+        if i18n.count(k + ':') != 5:
+            miss.append('%s 不足五语言' % k)
+    rec('PASS' if not miss else 'FAIL', '两套教程都接上了分页动图',
+        ('缺 %s' % ' '.join(miss)) if miss else 'React 4 页 / 旧模板 2 卡 / 11 键 × 5 语言齐')
+
+
+def check_sticky_dock():
+    """第 205 项：吸附小窗的点别处/拖动不消失、零间隙、高频跟随。"""
+    w = text(ROOT / 'app_window.py')
+    need = ("blur → dock 模式，保持吸附不收起", 'gap = 0',
+            'time.sleep(0.15)', 'def _drop_dock', 'self._drop_dock()')
+    miss = [n for n in need if n not in w]
+    rec('PASS' if not miss else 'FAIL', '贴角小窗：失焦不消失 + 零间隙 + 高频跟随',
+        ('缺 %s' % ' '.join(miss)) if miss else '失焦免隐藏 / gap=0 / 0.15s 跟随 / 锚点销毁收起')
+
+
+def check_window_size_saved():
+    """第 206 项：用户拖出来的窗口尺寸不能再被丢弃 / 拉回。"""
+    s = text(ROOT / 'app_window.py')
+    need = ('700 <= w <= sw + 40', "min(w, 1600), min(h, 1300)",
+            'def _fit_main_size(self, initial=False)',
+            '_fit_main_size(initial=True)', '保留用户尺寸',
+            "min(max(980, sw * 0.40), 1150)")
+    miss = [n for n in need if n not in s]
+    rec('PASS' if not miss else 'FAIL', '主窗口：记住用户尺寸 + 默认窄高',
+        ('缺 %s' % ' '.join(miss)) if miss else 'saved 下限 700 / 非首次不拉回 / 新默认 980~1150')
+
+
+def check_shell_app_entries():
+    """第 246 项：Microsoft Store / MSIX 应用必须能被搜到、能被启动。
+
+    用户反馈「watttokite 这一类微软商店应用搜不到」。真因不是排除规则：
+    商店应用的显示名在 Windows 壳命名空间（Get-StartApps 返回 AUMID，
+    磁盘上既没有同名 .lnk，WindowsApps 目录又对普通进程 EACCES）。
+    这里钉的是「壳命名空间这一路必须完整接线」，少一层就会静默失效：
+    采集 → 写进 files_new → 对账豁免 → HTTP /open → 原生桥启动 → 打进包。
+    """
+    mod = ROOT / 'app_entries.py'
+    bad = []
+    if not mod.is_file():
+        bad.append('缺 app_entries.py')
+    else:
+        s = text(mod)
+        for tok in ('Get-StartApps', 'def is_virtual_appid', 'def collect_start_apps',
+                    'def app_rows', 'def launch', 'def is_shell_app_path',
+                    'SHELL_PREFIX', 'CREATE_NO_WINDOW', 'explorer.exe'):
+            if tok not in s:
+                bad.append('app_entries.py 缺 ' + tok)
+    b = text(ROOT / 'brain.py')
+    for tok in ('import app_entries', 'app_entries.app_rows(py_keys)',
+                'if app_entries.is_shell_app_path(p):', 'app_entries.launch(p)',
+                'os.path.exists(p) or app_entries.is_shell_app_path(p)',
+                'if _shell and descr:',
+                '_shell or apprank.is_app_file(name)',
+                "INSERT OR REPLACE INTO files_new"):
+        if tok not in b:
+            bad.append('brain.py 缺 ' + tok)
+    # 对账豁免必须排在文件系统规则之前，否则重建完立刻被清掉
+    if 'if app_entries.is_shell_app_path(p):' in b and 'if _soft_dir_file(p, ext):' in b:
+        if b.index('if app_entries.is_shell_app_path(p):') > b.index('if _soft_dir_file(p, ext):'):
+            bad.append('对账豁免位置排在文件系统规则之后')
+    w = text(ROOT / 'app_window.py')
+    if w.count('app_entries.launch(p)') != 2 or 'import app_entries' not in w:
+        bad.append('原生桥两处启动未改 / 未导入')
+    if 'os.startfile(p)' in w:
+        bad.append('原生桥仍直接 os.startfile（虚拟路径会被 realpath/exists 判死）')
+    spec = text(ROOT.parent / '上传的干净版' / 'second-brain-app.spec')
+    if "'app_entries'" not in spec:
+        bad.append('spec hiddenimports 缺 app_entries')
+    pub = text(ROOT.parent / '上传的干净版' / 'tools/public_files.txt')
+    if 'sync  app_entries.py' not in pub or 'sync  tests/test_app_entries.py' not in pub:
+        bad.append('public_files.txt 未列新模块/新测试')
+    rec('PASS' if not bad else 'FAIL', '商店应用入口：壳命名空间全链路接线',
+        '; '.join(bad) if bad else '采集/入库/对账豁免/HTTP+原生桥启动/打包清单齐')
+
+
+def check_competitor_improvements():
+    """第 247 项：竞品源码深挖后补的三块，全链路钉住（防只改一半的假绿）。
+
+    A 失败清单可见 / B 监听两条边角 / C 排除规则自检。任何一层单独看都能跑，
+    少接一层用户就看不见或没效果，所以这里一次钉后端 helper + 路由 +
+    _watch_apply 接线 + 前端组件 + 五语言文案。
+    """
+    b = text(ROOT / 'brain.py')
+    f = text(ROOT / 'web/src/ui/maintenance.tsx')
+    i18 = text(ROOT / 'web/src/lib/i18n.ts')
+    bad = []
+    for tok in ('BENIGN_DOC_REASONS', 'def _index_failures', 'def _exclude_test',
+                'def _watch_same_as_indexed', 'def _watch_is_office_temp',
+                "elif self.path.startswith('/api/index_failures'):",
+                "elif self.path.startswith('/api/exclude_test'):",
+                '_watch_is_office_temp(os.path.basename(full))',
+                '_watch_same_as_indexed(',
+                'SELECT path, size, mtime FROM files WHERE path IN ('):
+        if tok not in b:
+            bad.append('brain.py 缺 ' + tok)
+    for tok in ("'/api/index_failures'", '/api/exclude_test?p=',
+                'maint_failures_none', 'maint_exclude_kept'):
+        if tok not in f:
+            bad.append('maintenance.tsx 缺 ' + tok)
+    for k in ('maint_failures', 'maint_exclude_test', 'maint_exclude_hint'):
+        if i18.count(k + ':') != 5:
+            bad.append('i18n %s 不足五语言' % k)
+    rec('PASS' if not bad else 'FAIL', '竞品细节：失败清单/监听防抖/排除自检',
+        '; '.join(bad) if bad else '两个 API + 监听两条过滤 + 五语言齐')
+
+
+def check_shell_app_icon():
+    """第 248 项：商店应用不能显示空白纸图标，四层接线一起钉。
+
+    第 246 项把「搜得到/名字对/能启动」验完了，却没人问「图标长什么样」；
+    用户截图才发现 e='' → sys_icon('') 给了张空白纸。这里做反向守卫：
+    快搜窗不能退回「只给 exe/lnk 传 p」，虚拟分支必须排在通用回落之前。
+    """
+    b = text(ROOT / 'brain.py')
+    a = text(ROOT / 'web/src/App.tsx')
+    bad = []
+    for tok in ('def shell_app_icon(path, size=48):',
+                'BCC18B79-BA16-442F-80C4-8A59C30C463B',
+                'SHCreateItemFromParsingName',
+                'png = shell_app_icon(p)',
+                'app_entries.is_shell_app_path(p)',
+                "String(it.p).indexOf('shell:AppsFolder')===0",
+                "indexOf('shell:AppsFolder')===0)) q +=",
+                "fb='<svg class=\"fic\"",
+                "'max-age=60' if (p and (ext in ('.exe', '.lnk') or app_entries.is_shell_app_path(p)))",
+                '_rgba_to_png(bytes(buf), size)'):
+        if tok not in b:
+            bad.append('brain.py 缺 ' + tok)
+    for tok in ('const isShellApp =', 'if (isShellApp) return <IconApp size={15} />'):
+        if tok not in a:
+            bad.append('App.tsx 缺 ' + tok)
+    if "if(!dir && (it.e==='.exe'||it.e==='.lnk') && it.p) q +=" in b:
+        bad.append('快搜窗退回只给 exe/lnk 传 p（虚拟应用会显示空白纸）')
+    i_shell = b.find('png = shell_app_icon(p)')
+    i_fallback = b.find("png = sys_icon('' if isdir else ext, isdir)")
+    if not (0 <= i_shell < i_fallback):
+        bad.append('虚拟图标分支被挪到通用回落之后')
+    seg = b[b.find('if p and not isdir and app_entries.is_shell_app_path(p):'):]
+    seg = seg[:seg.find("if p and not isdir and ext in ('.exe', '.lnk'):")]
+    if 'SELECT 1 FROM files WHERE path=? LIMIT 1' not in seg:
+        bad.append('虚拟图标分支丢了索引存在性校验')
+    pub = text(ROOT.parent / '上传的干净版' / 'tools/public_files.txt')
+    if 'sync  tests/test_shell_app_icon.py' not in pub:
+        bad.append('public_files.txt 未列新测试')
+    rec('PASS' if not bad else 'FAIL', '商店应用图标：不再是空白纸',
+        '; '.join(bad) if bad else 'Shell 取图 + 路由/快搜窗/主窗口/缓存头/反向守卫齐')
+
+
 def main():
     print('== 打包前自检 ==')
     check_version()
     check_icon()
     check_err_ingest()
+    check_telemetry_health()
     check_no_ingest_host_in_public()
     check_i18n()
     check_env_i18n()
@@ -1694,6 +2820,27 @@ def main():
     check_unknown_api()
     check_bridge()
     check_sync()
+    check_quick_switch()
+    check_media_index()
+    check_typing_search()
+    check_default_exclude()
+    check_hit_field_contract()
+    check_kind_table_sync()
+    check_folder_syntax()
+    check_no_shadowed_imports()
+    check_native_dialog_thread()
+    check_software_dir_sniff()
+    check_audio_media_rules()
+    check_type_mini_dismiss()
+    check_popup_style()
+    check_shell_app_entries()
+    check_competitor_improvements()
+    check_shell_app_icon()
+    check_dock_and_palette()
+    check_web_search()
+    check_tour_gifs()
+    check_sticky_dock()
+    check_window_size_saved()
     if '--live' in sys.argv:
         i = sys.argv.index('--live')
         port = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 else 8765

@@ -72,6 +72,18 @@ class TestTitlebarWin32(unittest.TestCase):
         import app_window as aw
         return aw, aw.Api.__new__(aw.Api)
 
+    def setUp(self):
+        import app_window as aw
+        # 第 216 项：这些测试会触发 titlebar_move/restore 的 _log_always，
+        # mock 的 0x1234/(120,240) 一写进真实 debug.log，就会冒充真实拖动现场
+        #（排查拖动问题时曾被它们骗了半小时）—— 统一静音，测完还原。
+        self._log_saved = aw._log_always
+        aw._log_always = lambda m: None
+
+    def tearDown(self):
+        import app_window as aw
+        aw._log_always = self._log_saved
+
     def test_move_passes_coords_and_flags(self):
         aw, obj = self._api()
         seen = {}
@@ -80,6 +92,11 @@ class TestTitlebarWin32(unittest.TestCase):
             def SetWindowPos(self, h, after, x, y, cx, cy, flags):
                 seen['x'], seen['y'], seen['flags'] = x, y, flags
                 return 1
+
+            def IsZoomed(self, h):
+                # 第 216 项：titlebar_move 会先查最大化（最大化时 SetWindowPos
+                # 被系统忽略）；夹具按「非最大化」走正常路径
+                return 0
 
         import ctypes
         with mock.patch.object(aw, 'find_hwnd', return_value=0x1234), \

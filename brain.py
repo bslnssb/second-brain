@@ -2,7 +2,7 @@
 
 # -*- coding: utf-8 -*-
 
-"""brain.py — 本地第二大脑（轻量版）：全文索引 + 搜索，全部本地完成
+"""brain.py — 本地Memex（轻量版）：全文索引 + 搜索，全部本地完成
 
 
 
@@ -44,6 +44,8 @@ import json
 
 import os
 
+import queue
+
 import shutil
 
 import re
@@ -51,6 +53,8 @@ import re
 import apprank
 
 import license_core
+
+import quick_switch
 
 try:
     from pro import pro_api
@@ -62,6 +66,20 @@ except ModuleNotFoundError as e:
     pro_api = None
 
 import scan_docs
+
+# 第 382 项：打开/定位这类「本机特有动作」不再直接写 os.startfile / explorer，
+# 统一走平台层（Windows 行为不变，mac/linux 由 plat/shell.py 分派）。
+import plat.shell as plat_shell
+
+# 第 243 项：音频时长探测（纯标准库，不依赖 mutagen/ffmpeg）。
+import audio_probe
+
+# 第 246 项：商店/MSIX 应用的显示名在虚拟 shell:AppsFolder 里，磁盘遍历永远看不到。
+import app_entries
+
+# 第 297 项：系统程序（设置 / cmd / 记事本…）既不在 C:\Windows\System32（系统目录默认排除），
+# 也不在开始菜单的 AppID 清单里（设置是 MSIX、cmd 只是个命令），所以查询时单独补一份。
+import sys_apps
 
 import sqlite3
 
@@ -79,6 +97,8 @@ import urllib.parse
 
 import urllib.request
 
+import netproxy          # 第 299 项：全程序唯一的代理出口
+
 import zipfile
 
 from html.parser import HTMLParser
@@ -87,7 +107,7 @@ from pathlib import Path
 
 
 
-APP_VERSION = 'v0.9.55'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
+APP_VERSION = 'v0.9.56'          # 0.x = 预览 / 开发版；到达 1.0 即视为正式版
 
 BUILD_DATE = '2026-11-09'
 
@@ -140,6 +160,55 @@ DONATE_SHA256 = '956fec5ba8786652cae62cbe828450771301320c8c3e40f5e4aad4ed544be38
 # 换私钥 = 所有已发出的授权码一起失效，换之前想清楚。
 
 LICENSE_PUBKEY_HEX = 'b4f5b91a3530e1b670fee5c92f50ca0b1ea43209ded00c265f9958979e3ed2ad'
+
+# 更新包签名用的 Ed25519 公钥（第 286 项）。私钥只在作者本机
+# `开发测试版/keys/upd_ed25519.key`，**不进公开仓库、不进 exe**；
+# 发布时用 tmp/sign_update.py 把 sha256+sig 写进 version.json，
+# 客户端下载 zip 后先验签再解压 —— 堵住「镜像/version.json 被投毒 → 任意代码执行」。
+# 换私钥 = 所有旧 version.json 上的签名作废，必须同时发一版新客户端。
+UPD_PUBKEY_HEX = '487cd5daf1859553ff28f44ee192a1c2e853b925e7a321a1b8999e8b60c9b9a3'
+
+
+def upd_msg(version, name, sha256):
+    """签名/验签用的固定格式串。版本号、文件名、哈希任一被改都会验不过。"""
+    return ('memex-update-v1|%s|%s|%s' % (version, name, sha256)).encode('utf-8')
+
+
+def upd_sig_ok(version, name, sha256, sig_hex):
+    """校验 version.json 里的签名。任何格式问题都返回 False，不抛异常。"""
+    try:
+        sig = bytes.fromhex(str(sig_hex or '').strip())
+    except ValueError:
+        return False
+    if len(sig) != 64 or not sha256:
+        return False
+    try:
+        pub = bytes.fromhex(UPD_PUBKEY_HEX)
+    except ValueError:
+        return False
+    return license_core.verify(pub, upd_msg(version, name, sha256), sig)
+
+
+def upd_check_file(info, asset, zpath):
+    """下载完成后、解压前的那道门（第 286 项）。返回 (ok, k, err)。
+
+    抽成独立函数是为了能单测：真的去跑 download_update 需要网络 + 90MB 文件。
+    """
+    asset = asset or {}
+    sha_want = str(asset.get('sha256') or '').strip().lower()
+    sig = str(asset.get('sig') or '').strip()
+    try:
+        sha_got = file_sha256(zpath, limit=10 ** 12)
+    except Exception:
+        sha_got = ''
+    if sha_want and sha_got != sha_want:
+        return False, 'upd_badsig', 'sha256 不一致（下载到的包不是发布的那一份）'
+    if bool((info or {}).get('need_sig')):
+        if not (sha_want and sig and upd_sig_ok((info or {}).get('latest'),
+                                               str(asset.get('name') or ''),
+                                               sha_want, sig)):
+            return False, 'upd_badsig', 'version.json 缺签名或验签失败，已拒绝安装'
+    return True, '', ''
 
 
 
@@ -226,6 +295,7 @@ def _license_blank(reason='none'):
 
             'name': '', 'ident': '', 'exp': '', 'issued': '', 'features': [],
 
+            'plan': 'free',
             'days_left': None, 'code_masked': '', 'clock_warn': False,
             'activated': ''}
 
@@ -275,7 +345,7 @@ def license_state(recheck=False):
 
                 for k in ('valid', 'reason', 'edition', 'kind', 'name', 'ident',
 
-                          'exp', 'issued', 'features'):
+                          'exp', 'issued', 'features', 'plan'):
 
                     st[k] = res[k]
 
@@ -315,6 +385,24 @@ def license_state(recheck=False):
 
         st = _license_blank('io')
 
+    # 第 277 项：授权校验结果。过期/机器码不符/时钟回拨都记一笔 ——
+    # 这类问题用户只会说「会员突然没了」，没有别的线索。
+    try:
+
+        if metrics is not None:
+
+            _sub = str(st.get('reason') or ('valid' if st.get('valid') else 'free'))[:20]
+
+            metrics.add('license', 'ok' if st.get('valid') else 'skip', sub=_sub)
+
+            if st.get('clock_warn'):
+
+                metrics.count('license', 'clock_warn')
+
+    except Exception:
+
+        pass
+
     _LIC['loaded'] = True
 
     _LIC['state'] = st
@@ -326,13 +414,28 @@ def license_state(recheck=False):
 
 def license_feature(name):
 
-    """Pro 功能开关。已接入：export（导出 Excel）、ocr_batch（批量 OCR 队列）。
+    """Pro 功能开关（第 293 项定调）。
 
-    只在**新增**的 API 上调用；已有 28 个免费 API 一律不上锁（第 136 项定论）。"""
+    真正挂在这儿的只有 **export**（`/api/export` 那一支）。
+    `ocr_batch`（批量 OCR 队列）**故意不门控**：它是「补齐索引」的兜底，
+    扫描件搜不到时免费用户必须能自救，锁了等于自毁口碑。
+    索引 / 监听 / 搜索 / 预览 / 入库 OCR 一律不在这里出现，将来也别加。
+
+    commercial（商用许可）不看签发时的 f 列表，直接由 plan 推导
+    （pro / team 码自动带），避免签发漏字段导致「买了商用却显示免费」。
+    """
 
     st = license_state()
 
-    return bool(st['valid']) and name in (st.get('features') or [])
+    if not bool(st['valid']):
+
+        return False
+
+    if name == 'commercial':
+
+        return str(st.get('plan') or 'free') in ('pro', 'team')
+
+    return name in (st.get('features') or [])
 
 
 
@@ -387,7 +490,7 @@ def _license_online(code):
 
                      'User-Agent': 'SecondBrain-License/1'})
 
-        with urllib.request.urlopen(req, timeout=4) as f:
+        with netproxy.urlopen(req, timeout=4) as f:
 
             d = json.loads(f.read().decode('utf-8') or '{}')
 
@@ -495,7 +598,8 @@ def _http_get(url, timeout=8, limit=16 * 1024 * 1024):
 
     req = urllib.request.Request(url, headers=_UA)
 
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    # 第 299 项：走用户的代理设置（系统/自定义/直连），不再让 urllib 自己猜
+    with netproxy.urlopen(req, timeout=timeout) as r:
 
         data = r.read(limit + 1)
 
@@ -555,28 +659,39 @@ def check_update(timeout=8):
 
     """
 
-    # 先试镜像里的 version.json（国内可达）；全都失败再回 GitHub API
+    # 先试镜像里的 version.json（国内可达）；全都失败再回 GitHub API。
+    # 三个源**并发**取，谁先回来用谁：串行时 jsDelivr 偶尔慢到 6s，用户点「检查更新」
+    # 要等十几秒，体感像卡死（实测 12.6s）。
+    _urls = [s % REPO_SLUG for s in _VER_SOURCES]
+    _res = {}
 
-    for _src in _VER_SOURCES:
-
-        _u = _src % REPO_SLUG
-
+    def _one(_u):
         try:
-
-            _info = json.loads(_http_get(_u, timeout=min(timeout, 6), limit=256 * 1024)
-
-                               .decode('utf-8', 'replace'))
-
+            _res[_u] = json.loads(_http_get(_u, timeout=min(timeout, 5),
+                                            limit=256 * 1024).decode('utf-8', 'replace'))
         except Exception:
+            pass
 
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=len(_urls), thread_name_prefix='updchk') as ex:
+            _futs = [ex.submit(_one, u) for u in _urls]
+            for _f in as_completed(_futs, timeout=min(timeout, 5) + 1):
+                try:
+                    _f.result()
+                except Exception:
+                    pass
+    except Exception:
+        for _u in _urls:          # 并发不可用就退回串行，功能不能因此断
+            _one(_u)
+
+    for _u in _urls:              # 按原顺序取第一个能用的（顺序即可信度）
+        _info = _res.get(_u)
+        if not _info:
             continue
-
         _r = _ver_from_json(_info)
-
         if _r:
-
             _r['src'] = _u
-
             return _r
 
     url = 'https://api.github.com/repos/%s/releases/latest' % REPO_SLUG
@@ -637,9 +752,13 @@ def check_update(timeout=8):
 
             out['asset'] = {'name': name, 'url': a.get('browser_download_url'),
 
-                            'size': a.get('size') or 0}
+                            'size': a.get('size') or 0, 'sha256': '', 'sig': ''}
 
             break
+
+    # 这条分支直接走 api.github.com（TLS 直达官方），不经过镜像，所以不要求签名；
+    # version.json 分支则是镜像/CDN，见 _ver_from_json 的 need_sig。
+    out['need_sig'] = False
 
     return out
 
@@ -749,7 +868,11 @@ def _ver_from_json(info):
 
            'manual_page': str(info.get('manual_page') or '')[:300],
 
-           'asset_urls': []}
+           'asset_urls': [],
+
+           # version.json 走的是镜像/CDN，**必须带签名**（第 286 项）：
+           # 少一个字段就等于把「投毒 → 覆盖程序」的口子留着。
+           'need_sig': True}
 
     if latest[0] == 6:
 
@@ -771,7 +894,11 @@ def _ver_from_json(info):
 
         if not out['asset']:
 
-            out['asset'] = {'name': name, 'url': u, 'size': a.get('size') or 0}
+            out['asset'] = {'name': name, 'url': u, 'size': a.get('size') or 0,
+
+                            'sha256': str(a.get('sha256') or '').strip().lower(),
+
+                            'sig': str(a.get('sig') or '').strip().lower()}
 
         out['asset_urls'].append(u)
 
@@ -793,7 +920,7 @@ _UPD_HOSTS = ('github.com', 'objects.githubusercontent.com',
 
 # 171MB 的下载要几十秒到几分钟——前端必须有真实进度可看，而不是干等 fetch。
 
-_UPD = {'state': 'idle', 'pct': 0, 'err': '', 'k': '', 'bat': ''}
+_UPD = {'state': 'idle', 'pct': 0, 'err': '', 'k': '', 'bat': '', 'signed': None}
 
 
 
@@ -1017,9 +1144,9 @@ def download_update(info=None):
 
             try:
 
-                with urllib.request.urlopen(urllib.request.Request(_u, headers=_UA),
+                with netproxy.urlopen(urllib.request.Request(_u, headers=_UA),
 
-                                            timeout=30) as r, open(zpath, 'wb') as f:
+                                     timeout=30) as r, open(zpath, 'wb') as f:
 
                     clen = int(r.headers.get('Content-Length') or 0)
 
@@ -1058,6 +1185,36 @@ def download_update(info=None):
         if _last is not None:
 
             raise _last
+
+        # ---- 先验签，再解压（第 286 项）------------------------------------
+
+        # 镜像 / version.json 被换掉时，这里拦下「覆盖程序」的最后一步。
+
+        # version.json 没声明任何 asset 时，走的是 GitHub 官方兜底（TLS 直达），
+
+        # 这种情况不强制签名，否则「还不会签名」的旧发布直接升不上来。
+
+        _info_sig = dict(info or {})
+
+        if not _info_sig.get('asset_urls'):
+
+            _info_sig['need_sig'] = False
+
+        _ok, _k, _err = upd_check_file(_info_sig, asset, zpath)
+
+        if not _ok:
+
+            try:
+
+                zpath.unlink()
+
+            except Exception:
+
+                pass
+
+            return {'ok': False, 'k': _k, 'err': _err}
+
+        _UPD['signed'] = bool(str(asset.get('sig') or '').strip())
 
         _UPD.update(state='unpack', pct=100)
 
@@ -1285,6 +1442,41 @@ def boot_lang():
 
 
 
+def sys_locale_info():
+    """Windows 区域格式（只读）：locale 名 + 短日期样式 + 短时间样式。
+
+    第 308 项：Listary 被骂了一年多的「日期格式不跟系统」。
+    这里直接问 Windows 要**格式串**，前端按串渲染，而不是自己猜 (1/2/2026)。
+    失败一律给空串 —— 前端有 Intl / ISO 兜底，不该因为读不到格式把界面弄坏。
+    """
+    out = {'locale': '', 'date': '', 'time': ''}
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.GetUserDefaultLocaleName.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
+        k.GetUserDefaultLocaleName.restype = ctypes.c_int
+        b = ctypes.create_unicode_buffer(128)
+        if k.GetUserDefaultLocaleName(b, 128):
+            out['locale'] = b.value
+        k.GetLocaleInfoEx.argtypes = [ctypes.c_wchar_p, ctypes.c_uint,
+                                      ctypes.c_wchar_p, ctypes.c_int]
+        k.GetLocaleInfoEx.restype = ctypes.c_int
+        loc = out['locale'] or None
+
+        def _info(kind):
+            buf = ctypes.create_unicode_buffer(64)
+            if k.GetLocaleInfoEx(loc, kind, buf, 64):
+                return buf.value
+            return ''
+
+        # LOCALE_SSHORTDATE=0x1F / LOCALE_STIMEFORMAT=0x1003 / LOCALE_SSHORTTIME=0x79
+        out['date'] = _info(0x1F)
+        out['time'] = _info(0x79) or _info(0x1003)
+    except Exception:
+        pass
+    return out
+
+
 def app_dir():
 
     """放数据的地方（数据库/settings/scope）——默认是程序所在目录。
@@ -1383,6 +1575,26 @@ import libsets
 
 import error_report
 
+
+def _errlog_lang():
+    """错误报告预览用哪种语言：跟界面语言（第 281 项：以前整块写死中文）。"""
+    try:
+        import translator as _tl
+        return _tl.ui_lang() or 'zh-CN'
+    except Exception:
+        return 'zh-CN'
+
+
+try:
+    import feature_metrics as metrics
+except Exception:                                     # pragma: no cover
+    metrics = None
+
+try:
+    import breadcrumb as bc
+except Exception:                                     # pragma: no cover
+    bc = None
+
 import settings_backup
 
 
@@ -1412,6 +1624,12 @@ def _apply_lib_paths(d, lib_id):
         _con = None
 
     DB = libsets.db_path(app_dir(), lib)
+
+    try:
+        import clipboard_mgr
+        clipboard_mgr.set_db_path(DB)
+    except Exception:
+        pass
 
     SCOPE_FILE = libsets.scope_path(app_dir(), lib)
 
@@ -1780,7 +1998,19 @@ def pdf_page_url(path, n):
         return None
 
 
-MAX_BODY = 2 * 1024 * 1024  # 单文档正文上限 2MB
+# 第 326 项：正文上限 2MB → 512KB。
+# 实测 9,668 篇正文合计 700MB，其中 337 篇 >200KB 就占了 565MB，
+# 而且大头是「渗透测试工具/爆破字典」里几百个 6MB 的密码字典 txt ——
+# 这些不是文档，全文进库只让库涨到 2.2GB、搜索一点没变快。
+# 512KB 约等于 250 页纯文字，够判断「这文件里有没有我要的东西」；
+# 再往前的部分用文件名/目录照样能找，点开详情也是直接读原文件。
+MAX_BODY = 512 * 1024       # 单文档正文上限 512KB
+
+# 第 326 项：「数据文件」不是文档。超过 8MB 的 txt/csv/log 基本都是密码字典、
+# 爆破字典、聊天/日志导出 —— 整篇读进来只会把正文库撑到几百 MB。
+TEXT_DUMP_EXTS = frozenset(('.txt', '.log', '.csv', '.tsv', '.json', '.xml', '.ini', '.yaml', '.yml'))
+
+TEXT_DUMP_MAX = 8 * 1024 * 1024
 
 OCR_PAGES = 6               # OCR 最多识别前 N 页：建搜索特征用不着整本，页数越多单篇越慢
 
@@ -1846,6 +2076,12 @@ _JOB = {'who': '', 'since': 0.0}
 
 _JOB_STALE = 1800.0     # 标记超过 30 分钟、四个状态又都空闲 → 认为线程偷偷死了，允许重新认领
 
+# 第 366 项：整理索引库的进度对象（定义在这里，是因为 _job_busy 也要读它）
+COMPACT = {'state': 'idle', 'phase': '', 'done': 0, 'total': 0, 'k': '', 'a': {},
+           'msg': '', 'err': '', 'before': 0.0, 'after': 0.0, 'secs': 0.0,
+           'at': 0.0, 'auto': False}
+_COMPACT_LOCK = threading.Lock()
+
 
 
 
@@ -1854,7 +2090,10 @@ def _job_busy():
 
     return (PROG.get('state') in ('busy', 'running') or NAMES.get('state') == 'busy'
 
-            or DISCOVER.get('state') == 'busy' or SELFTEST.get('state') == 'busy')
+            or DISCOVER.get('state') == 'busy' or SELFTEST.get('state') == 'busy'
+
+            # 第 366 项：整理索引库也算「有任务在跑」，别让扫描/更新挤进来抢锁
+            or COMPACT.get('state') == 'busy')
 
 
 
@@ -2208,6 +2447,9 @@ def discover_scan(targets=None, home=None):
 
         roots = [str(t) for t in targets] if targets is not None else scan_docs.drive_targets()
 
+        # 第 294 项：不可达的网络根这一轮跳过（带超时探测），否则整轮卡在智能扫描
+        roots = [r for r in roots if _path_alive(r)]
+
         _prog(state='busy', phase='discover', done=0, total=len(roots), ok=0, fail=0,
 
               msg='智能扫描中（只记文件名，不读内容）', k='m_discovering', err='')
@@ -2269,6 +2511,20 @@ def discover_scan(targets=None, home=None):
         DISCOVER = {'state': 'ready', 'groups': lst, 'err': '', 'novel_dirs': novel_dirs,
 
                     'docs_total': docs_total}
+
+        # 第 277 项：扫描完成记一笔。真的失败（读不了盘/权限）才记 fail，
+        # 「范围外/重复跳过」不算失败，否则成功率永远难看。
+        try:
+
+            if metrics is not None:
+
+                metrics.add('index', 'ok', sub='discover')
+
+                metrics.note('index', '文档 %d 组 %d' % (docs_total, len(lst)))
+
+        except Exception:
+
+            pass
 
         _prog(state='done', phase='', msg=f'智能扫描完成：{docs_total} 个文档',
 
@@ -2782,6 +3038,12 @@ NAMES_SKIP_DIRS = {d for d in scan_docs.SKIP_DIRS
 
                    if d not in ('program files', 'program files (x86)')}
 
+# 第 236 项：内置默认排除的目录名（steamapps / appcache / gpucache / node_modules /
+# .venv / .next …）一起剪掉。这些名字本身就足以判定「里面没有用户会搜的文件」，
+# 不再要求用户手工往 scope.json 里一条条加。
+
+NAMES_SKIP_DIRS |= set(scan_docs.DEFAULT_SKIP_NAMES)
+
 # 只索引用户真正会搜/会打开的文件类型，剔除游戏引擎原始资源（.dds/.uasset/.tga/.wem…）
 
 # 与 scan_docs.ALL_FILES 保持一致，保证「文件名索引」和「正文索引」范围不打架。
@@ -2789,8 +3051,61 @@ NAMES_SKIP_DIRS = {d for d in scan_docs.SKIP_DIRS
 NAMES_EXTS = scan_docs.ALL_FILES
 
 # 名字索引只存路径，视频/压缩包存进来很便宜也很有用，给一个宽松上限挡住极少数超大文件。
+#
+# 第 242 项：**取消 2GB 上限，改成不设上限**（NAMES_SIZE_LIMIT = 0 表示不限）。
+# 依据是 Everything 的做法：它的**文件名索引没有体积上限**，size 上限只作用于
+# **内容索引**（voidtools.com/support/everything/options 的 "Maximum size"：
+# "Exclude files with a size larger than specified"，那一项在 Content 分页）。
+# 用户也指出：2GB 以上的常见就是压缩包和系统镜像，那正是「按名字找得到」的东西 ——
+# 按体积排掉等于把最有价值的文件名索引堵死。
+#
+# 为什么原来有这条：怕虚拟磁盘/镜像把索引撑大。但名字索引一行只存 path/name/size/mtime，
+# 一条记录几百字节；就算多收 10 万条，也只是几十 MB 的 sqlite，与搜索速度无关。
+# 真要防的是「同名的几十 TB 稀疏文件」，那在 NTFS 上是异常，交给别处管。
+#
+# 正文那条上限仍然保留（scan_docs.SIZE_LIMIT = 80MB）：那是**要真读内容**的清单，
+# 读一个 40GB 的 ISO 和读一个 5MB 的 txt 成本天差地别，限制是对的
+# （Everything 的内容索引同样有 max_size）。
+NAMES_SIZE_LIMIT = 0   # 0 = 不限（与 Everything 的文件名索引一致）
 
-NAMES_SIZE_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
+# 第 235 项：媒体文件不受上面那条上限约束。这条上限的初衷是挡住虚拟磁盘/镜像，
+# 但 4K 影片动辄 20~60GB —— 用户搜片名时最想找的恰恰是它们，结果一条都进不来。
+# 名字索引只存一行 path/name/size，多收几千条成本可以忽略。
+#
+# 第 242 项：NAMES_BIG_EXTS 保留但**不再用于放行**（上限已取消），改成给
+# 「小体积图标类」判断用 —— 见 NAMES_ICON_EXTS。
+NAMES_BIG_EXTS = scan_docs.MEDIA_EXTS
+
+# 第 242 项：小体积图标不入索引（用户要求）。
+# 理由：.ico 绝大多数是**应用自己的运行图标** —— 实测库里 201 条 .ico，
+# 33 条在 Steam 游戏目录、18 条在 PotPlayer 扩展、12 条在 Subtitle Edit、
+# 6 条在 VMware，全是程序资产；用户要找图标资源时，大的那些（>64KB）才可能是真素材。
+# 阈值取 64KB：够小的图标（几 KB 的 favicon/应用图标）排掉，超过的保留。
+NAMES_ICON_EXTS = {'.ico'}
+NAMES_ICON_MAX_SIZE = 64 * 1024
+
+# 第 243 项：**短音频不入索引**（用户提的「跳过 20 秒以内的 mp3」）。
+#
+# 出发点：文件层面分不出「用户存的 .mp3」和「软件自带的 .mp3」（第 242 项实测：
+# 钉钉/腾讯会议/靶场的程序物占比差不到 3 个百分点，判据不成立）。但**时长**能分：
+# 软件自带的绝大多数是提示音、铃声、切片音效（1~15 秒），用户存的是完整曲目
+# （1~5 分钟）。所以用时长做粗筛。
+#
+# 阈值 20 秒：用户原话「歌曲通常都是一两分钟」，20 秒以下的完整歌曲基本不存在，
+# 而音效/铃声/录音片段都在 20 秒以内。取 20 而不是 10，是为了不误伤短音效之外
+# 的边缘情况（比如 15 秒的口播/语音备忘在 20 秒以下会被排掉 —— 这是已知取舍，
+# 阈值改成 0 就完全不过滤）。
+#
+# 只对**能可靠解析时长**的格式生效（mp3/wav/flac/m4a，见 audio_probe.py）；
+# 解析不出来（损坏文件、未知格式）一律保留 —— 宁可漏排不可错排。
+NAMES_MIN_AUDIO_SECONDS = 20
+
+# 音乐平台目录下的音频不入索引（网易云/QQ音乐/酷狗/酷我/Spotify/Apple Music…）。
+# 只排**音频**，不排整个目录 —— 用户在音乐平台目录里也可能存着自己的歌单文件。
+NAMES_MEDIA_APP_EXTS = {
+    '.mp3', '.flac', '.m4a', '.aac', '.ogg', '.wma', '.ape', '.wav',
+    '.aiff', '.dsf', '.dff', '.m4b', '.opus',
+}
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
@@ -2863,26 +3178,200 @@ def _scope_excludes(scope_path=None):
 
             out.append(os.path.normcase(s))
 
+    # 第 236 项：内置默认排除（AppData / ProgramData / 回收站 / 旧系统目录 / WinSxS…）。
+    # 和用户的 exclude_dirs 共用同一套「子串」语义，所以它们对文件名索引、正文索引、
+    # 实时监听三条路径同时生效，不会出现「正文排了、文件名还在」的半挡状态。
+
+    out.extend(os.path.normcase(s) for s in scan_docs.DEFAULT_SKIP_SEGS)
+
     return out
 
 
 
 
 
+# 第 236 项：默认排除的「白名单反向词」。开始菜单物理上位于 AppData / ProgramData
+# 里面，而这两棵树已被内置规则整棵排掉 —— 但「搜应用名出应用」全靠这里的 .lnk，
+# 所以命中白名单的一律放行（见 _excluded）。
+
+_KEEP_SEGS_NC = tuple(os.path.normcase(s) for s in scan_docs.DEFAULT_KEEP_SEGS)
+
+# 第 236 项：目录名规则（steamapps / node_modules / gpucache / _internal …）预编译成一条正则。
+# 必须按「路径段」精确匹配，不能用子串 —— 子串会让 `D:\我的cache资料` 一起消失；
+# 也不能每条路径都 split 一遍 —— 30 万条时那点开销会变成十几秒。
+# os.walk 里靠 dirs[:] 剪枝，而「对账」要判的是已经在库里的历史记录，只能走这条正则。
+
+_SKIP_NAME_RE = re.compile(
+    r'[\\/](?:' + '|'.join(re.escape(n) for n in sorted(scan_docs.DEFAULT_SKIP_NAMES))
+    + r')(?=[\\/]|$)')
+
+# 第 236 项：只对正文生效的排除段（文件名索引不受影响，仍搜得到）
+
+_BODY_SKIP_SEGS_NC = tuple(os.path.normcase(s) for s in scan_docs.BODY_SKIP_SEGS)
+
+
 def _excluded(path, exckw):
 
     """路径是否命中排除词。exckw 由 _scope_excludes() 预先算好，循环里别再读文件。"""
+
+    lp = os.path.normcase(str(path))
+
+    if any(k in lp for k in _KEEP_SEGS_NC):
+
+        return False
+
+    # 目录名规则：没这条的话，对账只能清掉「绝对路径段」命中的，
+    # 而 steamapps / _internal / webcontent 这些靠名字判定的会一直留在库里。
+
+    if _SKIP_NAME_RE.search(lp):
+
+        return True
 
     if not exckw:
 
         return False
 
-    lp = os.path.normcase(str(path))
-
     return any(k in lp for k in exckw)
 
 
 
+
+
+def _soft_dir_file(path, ext):
+    """这个文件是不是「软件资产目录里的资源文件」（该排掉）。
+
+    第 240 项：与全量扫描用同一套判据，否则「重建时干净了、用两天又被实时
+    监听塞回来」。软件目录里的应用入口（exe/lnk…）照常保留 —— 搜「钉钉」
+    还得能搜到 DingTalk.exe。
+
+    第 242 项：判据换成「路径里有程序资产目录名 + 该段父目录里有 exe」
+    （scan_docs.is_asset_path）。整目录的 looks_like_software_dir 只作为补充：
+    目录本身是安装目录时，它下面的非应用入口文件一律排掉。
+
+    第 243 项：再加一条「已知软件目录名单」（scan_docs.is_known_software_dir）。
+    这条覆盖的是**非标准安装位置**（D:\\DingDing、D:\\tenxunhuiyi 这种），
+    竞品（Everything / Recoll / Baloo / Tracker）都没有「自动猜软件目录」，
+    全靠显式清单 —— 我们这份清单就是那份显式清单，且带用户数据豁免。
+    """
+
+    if not scan_docs.SOFTWARE_DIR_SNIFF:
+
+        return False
+
+    if (ext or '').lower() in scan_docs.APP_ONLY_EXTS:
+
+        return False
+
+    # 第 243 项：已知软件目录（具体软件名直接认定；厂商名还要目录里有 exe）。
+    try:
+
+        d0 = os.path.dirname(str(path))
+
+        if d0 and scan_docs.is_known_software_dir(d0):
+
+            return True
+
+    except Exception:
+
+        pass
+
+    try:
+
+        if scan_docs.is_asset_path(path):
+
+            return True
+
+    except Exception:
+
+        pass
+
+    d = os.path.dirname(str(path))
+
+    if not d:
+
+        return False
+
+    try:
+
+        return scan_docs.looks_like_software_dir(d)
+
+    except Exception:
+
+        return False
+
+
+def _media_noise_file(path, ext):
+    """这个音频文件是不是「软件/平台自带的音乐」（该排掉）。
+
+    第 243 项，两条规则（用户提的）：
+
+      ① 时长 < NAMES_MIN_AUDIO_SECONDS 秒 → 提示音/铃声/切片，排掉。
+         用户存的歌是一两分钟，软件自带的音效多在 15 秒以内。
+      ② 路径在音乐平台目录（网易云 / QQ音乐 / 酷狗 / 酷我 / Spotify /
+         Apple Music…）下 → 曲库缓存，排掉。
+
+    只对音频生效。时长解析不出来（损坏文件 / 未知格式）一律**保留** ——
+    宁可漏排不可错排。
+    """
+
+    e = (ext or '').lower()
+
+    if e not in NAMES_MEDIA_APP_EXTS:
+
+        return False
+
+    try:
+
+        if scan_docs.is_media_app_path(path):
+
+            return True
+
+    except Exception:
+
+        pass
+
+    lim = NAMES_MIN_AUDIO_SECONDS
+
+    if lim and e in audio_probe.PROBE_EXTS:
+
+        try:
+
+            sec = audio_probe.audio_seconds(path)
+
+        except Exception:
+
+            sec = None
+
+        if sec is not None and sec < lim:
+
+            return True
+
+    return False
+
+
+def _noindex_marked(path):
+    """这个文件/目录是不是落在「不索引标记」下（.memex-noindex）。
+
+    竞品同源设计：Recoll 的 .recoll-noindex、GNOME Tracker 的 .trackerignore、
+    macOS 的 .metadata_never_index —— 在目录里放一个标记文件，整棵子树跳过。
+    这是「内置软件名单」追不上新软件时的正解：用户自己一放就生效。
+    """
+
+    try:
+
+        p = str(path)
+
+        if scan_docs.has_noindex_marker(p):
+
+            return True
+
+        d = os.path.dirname(p)
+
+        return bool(d) and scan_docs.has_noindex_marker(d)
+
+    except Exception:
+
+        return False
 
 
 def launcher_dirs():
@@ -2961,7 +3450,10 @@ def names_targets():
 
         d = str(d).strip()
 
-        if d:
+        # 第 236 项：AppData / ProgramData 这类树即使被写进 include 也不扫。
+        # 用户当初把 AppData 勾进来多半是「全选」顺手加的，代价是 96,031 条缓存记录。
+
+        if d and not scan_docs.never_index(d):
 
             push(d)
 
@@ -3012,6 +3504,9 @@ def build_files_index(targets=None):
         roots = ([_real_case(t) for t in targets] if targets is not None
 
                  else [_real_case(t) for t in names_targets()])
+
+        # 第 294 项：同 docs —— 断线的 NAS 不能拖住文件名索引
+        roots = [r for r in roots if _path_alive(r)]
 
         _prog(state='busy', phase='names', done=0, total=len(roots) + 1, ok=0, fail=0,
 
@@ -3099,6 +3594,16 @@ def build_files_index(targets=None):
 
                     continue
 
+                # 第 243 项：目录里有 .memex-noindex 标记 → 整棵子树不进索引。
+                # 竞品同源机制（Recoll .recoll-noindex / Tracker .trackerignore /
+                # macOS .metadata_never_index）：用户自己放一个标记文件就生效，
+                # 比等我们更新内置软件名单快，也不存在误伤。
+                if scan_docs.has_noindex_marker(cur):
+
+                    dirs[:] = []
+
+                    continue
+
                 # 自己的程序目录不建目录索引：用户点「文件夹」不该看到 _internal / webview / yaml
 
                 try:
@@ -3129,6 +3634,45 @@ def build_files_index(targets=None):
 
                     dbatch.append((cur, base.lower(), os.path.dirname(cur), py, ini, dmt))
 
+                # 第 236 项：安装目录里只收「能启动的东西」。整盘扫描故意不跳过
+                # Program Files（否则搜不到 chrome.exe / Weixin.exe），但把里面
+                # 几千张 png、几千个 js 一起收进来就是纯噪声。每个目录算一次。
+
+                cur_install = scan_docs.is_install_root(cur)
+
+                # 第 240 项：软件安装目录内容嗅探。钉钉/腾讯会议/PotPlayer 这些
+                # 装在 D:\ 下面的程序，几千张 png、几千个 js 是安装包自带素材，
+                # 用户搜不到也不需要。命中后只保留应用入口（exe/lnk…），
+                # 程序本身照样搜得到（「搜钉钉」要能搜到 DingTalk.exe）。
+                #
+                # 第 242 项：判据整个换了（按子树文件构成比例实测不可行，
+                # 详见 scan_docs 里的注释）。现在是「**路径里有程序资产目录名
+                # 且它的父目录里有 exe**」——在**文件层级**判断，不再整目录剪枝。
+                # 这样剪掉的是具体的资源目录（剪映 Resources、有道云笔记 build、
+                # GPT-SoVITS 的 venv runtime），而目录里用户的其它文件照收。
+                cur_soft = False
+
+                if scan_docs.SOFTWARE_DIR_SNIFF and any(f.lower().endswith('.exe')
+
+                                                        for f in files):
+
+                    cur_soft = scan_docs.looks_like_software_dir(cur)
+
+                # 第 243 项：已知软件目录名单（chrome / pycharm / vlc / 钉钉 /
+                # 腾讯会议…）。这些软件常常装在 D:\ 下面而不是 Program Files，
+                # 靠 install_root 判不到；名单命中后这棵子树只保留应用入口
+                # （exe/lnk…），几千张 png/几百个 js 不再进索引。
+                # 用户数据目录（网盘同步、聊天文件、靶场…）优先豁免。
+                if scan_docs.SOFTWARE_DIR_SNIFF and not cur_soft:
+
+                    try:
+
+                        cur_soft = scan_docs.is_known_software_dir(cur)
+
+                    except Exception:
+
+                        cur_soft = False
+
                 for f in files:
 
                     ext = os.path.splitext(f)[1].lower()
@@ -3136,6 +3680,24 @@ def build_files_index(targets=None):
                     # 只收用户会搜的文件类型，游戏引擎原始资源（.dds/.uasset/.tga…）直接跳过
 
                     if ext not in NAMES_EXTS:
+
+                        continue
+
+                    if cur_install and ext not in scan_docs.APP_ONLY_EXTS:
+
+                        continue
+
+                    full = os.path.join(cur, f)
+
+                    # 第 242 项：这个文件是不是躺在「程序资产目录」里？
+                    # 是的话只保留应用入口（exe/lnk…），素材不入索引。
+                    if (cur_soft or scan_docs.is_asset_path(full)) and \
+                            ext not in scan_docs.APP_ONLY_EXTS:
+
+                        continue
+
+                    # 第 243 项：短音频（<20 秒）与音乐平台目录下的音乐不入索引。
+                    if _media_noise_file(full, ext):
 
                         continue
 
@@ -3159,9 +3721,19 @@ def build_files_index(targets=None):
 
                         sz, mt = None, None
 
-                    # 极少数超大文件（>2GB，多是镜像/虚拟盘）不入索引，避免索引虚胖
+                    # 第 242 项：名字索引**不再按体积排除**（Everything 的文件名索引同样
+                    # 没有 size 上限，它的上限只管内容索引）。压缩包、系统镜像这些
+                    # 2GB 以上的文件恰恰是最需要「按名字找得到」的。
+                    # 上限为 0 表示不限，这个判断要保留成可关的开关。
+                    if (NAMES_SIZE_LIMIT and sz and sz > NAMES_SIZE_LIMIT
+                            and ext not in NAMES_BIG_EXTS):
 
-                    if sz and sz > NAMES_SIZE_LIMIT:
+                        continue
+
+                    # 第 242 项：小体积图标不入索引。
+                    # .ico 大多是应用自己的运行图标（Steam 游戏、VMware、PotPlayer
+                    # 扩展……），几百条下来只有噪音；真正有用的图标资源通常 >64KB。
+                    if ext in NAMES_ICON_EXTS and sz and sz <= NAMES_ICON_MAX_SIZE:
 
                         continue
 
@@ -3214,6 +3786,22 @@ def build_files_index(targets=None):
                             '(path,name,parent,py,ini,mtime) VALUES(?,?,?,?,?,?)', dbatch)
 
             con.commit()
+
+        # 第 246 项：商店/MSIX 应用的显示名只存在于 Windows 壳命名空间
+        # （Get-StartApps / shell:AppsFolder），os.walk 再放宽排除规则也扫不到。
+        # 单独补一批虚拟应用入口，path 记成 shell:AppsFolder\<AUMID>。
+        # 采集失败只影响「商店应用搜不搜得到」，绝不能让整轮重建挂掉。
+        try:
+            app_batch = app_entries.app_rows(py_keys)
+            if app_batch:
+                con.executemany('INSERT OR REPLACE INTO files_new'
+                                '(path,name,dir,ext,size,mtime,descr,py,ini) '
+                                'VALUES(?,?,?,?,?,?,?,?,?)', app_batch)
+                con.commit()
+                n += len(app_batch)
+                _log_file('shell app entries: %d' % len(app_batch))
+        except Exception:
+            pass
 
         _prog(done=len(roots), msg='整理文件名索引…', k='m_names_finish')
 
@@ -3282,6 +3870,18 @@ def build_files_index(targets=None):
         db_upkeep()          # 换表 + 灌 60 万行会把 WAL 撑到几百 MB，收尾时誊回去
 
         db_reclaim()         # 换表会删掉整张 files，旧页留着库就虚胖了
+
+        try:
+
+            if metrics is not None:
+
+                metrics.add('index', 'ok', sub='names')
+
+                metrics.note('index', '文件名索引 %d 个（跳过 %s）' % (n, skipped))
+
+        except Exception:
+
+            pass
 
         _prog(state='done', phase='', msg=f'文件名索引完成：{n} 个文件',
 
@@ -3359,6 +3959,12 @@ def _watch_roots():
 
             d = str(d or '').strip()
 
+            # 第 294 项：网络位置不做实时监听 —— SMB 上的 ReadDirectoryChangesW
+            # 经常丢事件，断线时还会把监听线程阻塞住。网络位置靠手动更新。
+            if is_net_path(d):
+
+                return
+
             if not d or not os.path.isdir(d):
 
                 return
@@ -3385,8 +3991,15 @@ def _watch_roots():
 
     for d in (_scope_conf().get('include_dirs') or []):
 
-        push(d)
+        # 第 236 项：与 names_targets 同一条规则 —— 内置硬排除的树不当监听根
 
+        if str(d).strip() and not scan_docs.never_index(d):
+
+            push(d)
+
+    # 第 239 项：这行在改 236 的排除规则时被误删，`_watch_roots()` 直接 NameError，
+    # 启动就挂（表现是「窗口启动失败 + UnboundLocalError: traceback」，真因被遮住）。
+    # 单独抽个函数保住它，别再让一次文本替换把启动路径上的变量吃掉。
     home = os.path.expanduser('~')
 
     for sub in ('Desktop', 'Downloads', 'Documents', '桌面', '下载', '文档'):
@@ -3489,12 +4102,136 @@ def _watch_flusher():
 
             _WATCH['wrote'] += _watch_apply(batch)
 
+        except sqlite3.Error as e:
+
+            # 第 327 项：长任务（VACUUM / 瘦身 / 整盘重扫）会把写锁攥住几十秒，
+            # 以前这一批就直接丢（debug.log 里成片的「实时索引写入失败：database is locked」），
+            # 用户刚保存的文件在实时索引里就没有了。现在塞回队列，下一轮接着写。
+            if 'locked' in str(e).lower() or 'busy' in str(e).lower():
+
+                with _WATCH['lock']:
+
+                    for k, v in batch:
+
+                        _WATCH['q'].setdefault(k, v)
+
+                time.sleep(0.5)
+
+            else:
+
+                print('[!] 实时索引写入失败：', e, flush=True)
+
         except Exception as e:
 
             print('[!] 实时索引写入失败：', e, flush=True)
 
 
 
+
+
+# ---------------------------------------------------------------- 第 247 项
+# 竞品源码调研后补的三块（详见交接文档第 247 项）：
+#   A. Recoll fsindexer.cpp:680 的「失败文件签名 + 不重试」我们其实已有等价物
+#      （meta.reason + _needs() 的 size/mtime 短路），但 DocFetcher 的 ErrorTable
+#      把失败清单摆到用户面前，我们没有 —— 数据在库里躺着眼看不见。
+#   B. DocFetcher FolderWatcher.java:378「只读访问也会报 MODIFIED」的 mtime 二次确认，
+#      以及同文件 339 行的 Office `~$` 临时文件过滤，正文路径有、监听路径没有。
+#   C. DocFetcher RegexTestPanel.java:132「输入一个路径立刻回显会不会被排除」，
+#      我们的排除词是子串语义，用户改完只能靠「重建索引看结果」来验证。
+
+
+def _watch_same_as_indexed(st, prev):
+    """DocFetcher/Baloo 同款 mtime 二次确认：库里已有且大小/时间没变 → 伪变更。
+
+    ReadDirectoryChangesW 连只读打开都会发 MODIFIED；不拦的话每次打开文档
+    都会重写 files 行、顺手把正文重索引队列塞一遍。"""
+    if not prev:
+        return False
+    sz, mt = prev
+    if sz is None or mt is None:
+        return False
+    try:
+        return abs(st.st_size - sz) < 1 and abs(st.st_mtime - mt) < 2
+    except (TypeError, ValueError):
+        return False
+
+
+def _watch_is_office_temp(name):
+    """Office 打开文档时生成的 ~$xxx.docx 锁文件，不是用户内容。"""
+    return str(name or '').startswith('~$')
+
+
+# 这三类不是「解析失败」：无文本（图片/二进制本来就没正文）、空文件、临时文件。
+# 不滤掉的话失败清单会被几万条正常记录淹没（实测 meta 里 41,217 条「无文本」），
+# 真正超时/加密/旧格式的坏文件反而被 LIMIT 挤出去 —— 清单就失去意义了。
+BENIGN_DOC_REASONS = ('无文本', '空文件', '临时文件')
+
+
+def _index_failures(limit=200, con=None):
+    """把 meta.reason 里的失败记录整理给用户看（DocFetcher ErrorTable 同款）。
+
+    will_retry 对应 Recoll fsindexer.cpp:680 的 `+` 签名语义：文件本身变了
+    才会在下一轮重新解析；没变就一直跳过，避免坏 PDF 每轮都超时拖住队列。
+    """
+    limit = max(1, min(int(limit or 200), 500))
+    sql = ("SELECT path, reason, size, mtime, indexed_at FROM meta "
+           "WHERE reason IS NOT NULL AND reason<>'' "
+           "AND reason NOT IN (?,?,?) "
+           "ORDER BY indexed_at DESC LIMIT ?")
+    try:
+        if con is None:
+            with con_lock:
+                rows = conn().execute(sql, BENIGN_DOC_REASONS + (limit,)).fetchall()
+        else:
+            rows = con.execute(sql, BENIGN_DOC_REASONS + (limit,)).fetchall()
+    except sqlite3.Error:
+        rows = []
+    out = []
+    for p, why, sz, mt, at in rows:
+        will_retry = False
+        try:
+            st = os.stat(p)
+            will_retry = not (sz is not None and mt is not None
+                              and abs(st.st_size - sz) < 1
+                              and abs(st.st_mtime - mt) < 2)
+        except OSError:
+            will_retry = False
+        out.append({'p': p, 'why': why or '', 'at': at or 0,
+                    'will_retry': will_retry})
+    return {'items': out, 'total': len(out)}
+
+
+def _exclude_test(path):
+    """给一个路径，立刻回显「会不会被排除 + 命中哪条规则」（DocFetcher 同款）。
+
+    不只是布尔值：用户排除词 / 内置段 / 目录名规则 / 白名单放行分开列，
+    否则「我明明加了排除词怎么还在」这种问题只能靠重建索引猜。
+    """
+    p = str(path or '').strip().strip('"')
+    if not p:
+        return {'ok': False, 'err': 'empty'}
+    low = os.path.normcase(p)
+    hits = []
+    for k in (os.path.normcase(str(s).strip())
+              for s in (_scope_conf().get('exclude_dirs') or [])
+              if str(s).strip()):
+        if k in low:
+            hits.append({'kind': 'scope', 'rule': k})
+    for k in (os.path.normcase(s) for s in scan_docs.DEFAULT_SKIP_SEGS):
+        if k in low and not any(h['rule'] == k for h in hits):
+            hits.append({'kind': 'builtin', 'rule': k})
+    m = _SKIP_NAME_RE.search(low)
+    if m:
+        rule = m.group(0).strip('\\/')
+        if rule and not any(h['rule'] == rule for h in hits):
+            hits.append({'kind': 'dirname', 'rule': rule})
+    for seg in re.split(r'[\\/]+', low):
+        if seg in NAMES_SKIP_DIRS and not any(h['rule'] == seg for h in hits):
+            hits.append({'kind': 'dirname', 'rule': seg})
+    keep = [k for k in _KEEP_SEGS_NC if k in low]
+    return {'ok': True, 'p': p,
+            'excluded': bool(_excluded(p, _scope_excludes())),
+            'hits': hits[:8], 'kept': bool(keep), 'keep_segs': keep[:4]}
 
 
 def _watch_apply(batch):
@@ -3508,6 +4245,21 @@ def _watch_apply(batch):
     占着锁会卡住搜索。busy_timeout 兜住和后台任务的短暂争用。"""
 
     exckw = _scope_excludes()
+
+    # 第 247 项：MODIFIED 事件先查库里旧 size/mtime，一次 IN 查询，
+    # 别在循环里每条路径开一次连接（Baloo PendingFileQueue 的去重思路）。
+    mods = [f for f, a in batch if a == 3]
+    old = {}
+    if mods:
+        try:
+            c = sqlite3.connect(DB, check_same_thread=False)
+            c.execute('PRAGMA busy_timeout=1000')
+            old = {os.path.normcase(r[0]): (r[1], r[2]) for r in c.execute(
+                'SELECT path, size, mtime FROM files WHERE path IN ('
+                + ','.join('?' * len(mods)) + ')', mods)}
+            c.close()
+        except Exception:
+            old = {}
 
     add_f, add_d, gone = [], [], []
 
@@ -3529,6 +4281,16 @@ def _watch_apply(batch):
 
             continue
 
+        # 第 247 项：Office 的 ~$ 锁文件（正文路径早有同款，监听路径补齐）。
+        if _watch_is_office_temp(os.path.basename(full)):
+            gone.append(full)
+            continue
+
+        # 第 247 项：只读打开也会报 MODIFIED —— 库里 size/mtime 没变就别重写。
+        if action == 3 and _watch_same_as_indexed(
+                st, old.get(os.path.normcase(full))):
+            continue
+
         if os.path.isdir(full):
 
             base = os.path.basename(full)
@@ -3545,9 +4307,33 @@ def _watch_apply(batch):
 
         ext = os.path.splitext(full)[1].lower()
 
-        if ext not in NAMES_EXTS or st.st_size > NAMES_SIZE_LIMIT:
+        # 第 242 项：体积上限默认关闭（0 = 不限，Everything 的文件名索引同样不限）；
+        # 小体积图标按新规则排除。实时监听必须与全量扫描用同一套判据，
+        # 否则「重建时干净了、用两天又被监听塞回来」。
+        over_size = bool(NAMES_SIZE_LIMIT and st.st_size > NAMES_SIZE_LIMIT
+                         and ext not in NAMES_BIG_EXTS)
+        small_icon = (ext in NAMES_ICON_EXTS
+                      and st.st_size <= NAMES_ICON_MAX_SIZE)
+
+        if ext not in NAMES_EXTS or over_size or small_icon:
 
             gone.append(full)                # 不该入库的类型，顺手清掉同名旧记录
+
+            continue
+
+        # 第 236 项：安装目录下只留应用类，资源文件不进库（与全量扫描同一套判据，
+        # 否则「重建后干净了、用两天又被实时监听塞回来」）
+
+        if ((scan_docs.is_install_root(os.path.dirname(full))
+
+                 and ext not in scan_docs.APP_ONLY_EXTS)
+
+                or _soft_dir_file(full, ext)
+
+                or _media_noise_file(full, ext)
+
+                or _noindex_marked(full)):
+            gone.append(full)
 
             continue
 
@@ -3679,6 +4465,12 @@ def _bodyq_offer(add_f, gone):
 
                 continue
 
+            # 第 236 项：与全量正文索引同一套排除，否则「重建时干净了、用两天又长回来」
+
+            if scan_docs.is_install_root(k) or any(s in k for s in _BODY_SKIP_SEGS_NC):
+
+                continue
+
             if k in _BODYQ_DEL:            # 删了又建回来：撤掉删除，按变更处理
 
                 _BODYQ_DEL.discard(k)
@@ -3801,13 +4593,11 @@ def _body_apply(items, dels):
 
                 _doc_del(con, rids, p)             # 同步清 bigram 旁表（见 _doc_del）
 
-                cur = con.execute('INSERT INTO docs VALUES(?,?,?)',
+                cur_rid = doc_insert(con, p, Path(p).suffix.lower(), text)
 
-                                  (p, Path(p).suffix.lower(), text))
+                rids[os.path.normcase(p)] = cur_rid
 
-                rids[os.path.normcase(p)] = cur.lastrowid
-
-                _bigram_add(con, cur.lastrowid, text)
+                _bigram_add(con, cur_rid, text)
 
                 con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
 
@@ -4105,9 +4895,11 @@ def _get_ocr():
 
             pass
 
-        from rapidocr_onnxruntime import RapidOCR
+        # 第 380 项：引擎升到 RapidOCR 3.x（PP-OCRv6 small，离线内置），
+        # 旧 API 契约由 ocr_engine 适配，调用方不用动
+        from ocr_engine import RapidOCRCompat
 
-        _ocr = RapidOCR()
+        _ocr = RapidOCRCompat()
 
     return _ocr
 
@@ -4130,7 +4922,7 @@ def ocr_pdf(path: Path, budget=OCR_BUDGET, pages=OCR_PAGES, on_page=None):
 
     try:
 
-        import pymupdf
+        import pdf_engine as pymupdf
 
         doc = pymupdf.open(str(path))
 
@@ -5016,9 +5808,24 @@ def _ole_text(path: Path, ext: str):
 
 def extract_text(path: Path):
 
-    """对外统一入口：先按格式提取，再净化一次（见 _clean_text）。"""
+    """对外统一入口：先按格式提取，再净化一次（见 _clean_text）。
+
+    第 326 项：纯数据文件（密码字典 / 日志 / 导出表）超过 8MB 直接不读正文 ——
+    它们不是文档，全文进库只会把库撑大，文件名照样可搜。
+    """
+
+    try:
+
+        if path.suffix.lower() in TEXT_DUMP_EXTS and path.stat().st_size > TEXT_DUMP_MAX:
+
+            return None
+
+    except OSError:
+
+        pass
 
     return _clean_text(_extract_text_impl(path))
+
 
 
 
@@ -5058,7 +5865,7 @@ def _extract_text_impl(path: Path):
 
             raw = f.read(MAX_BODY * 3)
 
-        return _decode_text(raw)
+        return _decode_text(raw)[:MAX_BODY]   # 第 326 项：以前没截，txt 会原样存 6MB
 
     if ext == '.pdf':
 
@@ -5366,6 +6173,280 @@ def _extract_subprocess(path: Path, timeout: float):
 
 
 
+def doc_mode(con):
+    """这份库是「老结构」还是「压缩结构」。
+
+    v1：docs 带 content 表（docs_content 存明文正文），snippet() 可用；
+    v2：docs contentless + doc_rec 存 zstd 正文（体积评估 #2/#3）。
+    两种都必须在运行期支持 —— 用户库只有迁移过才变 v2。
+    """
+    try:
+        hit = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='doc_rec' LIMIT 1").fetchone()
+        if not hit:
+            return 'v1'
+        # 迁移中可能两张表并存：docs_content 还在就仍按老结构读
+        old = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='docs_content' LIMIT 1").fetchone()
+        return 'v1' if old else 'v2'
+    except Exception:
+        return 'v1'
+
+
+_ZSTD = threading.local()
+
+
+def _zc():
+    """每线程一套 zstd 上下文（第 378 项，闪退根因）。
+
+    以前这里是模块级 dict 缓存 **共享** 的 ZstdCompressor / ZstdDecompressor。
+    python-zstandard 的对象不是线程安全的：同一个对象不能被多个线程同时
+    compress / decompress —— 内部会复用同一块 C 侧缓冲和上下文，并发进同一个对象
+    等于边读边写，出来的是「Data corruption detected / Unknown frame descriptor」，
+    再往后就是 backend_c.cp312-win_amd64.pyd 里 0xc0000005 直接把进程干掉。
+
+    而我们有 HTTP 工作线程（搜索、片段、详情预览）、索引线程、bigram 回填线程、
+    对账线程同时在跑，全都会走 _z_pack / _z_unpack —— 2026-11-21 18:09 实测
+    连续两次开窗即闪退（偏移 0x5b222 / 0x50aa0 两次还不一样，典型堆被写坏）。
+
+    隔离进程里复现过（tmp\\_zstd_race.py）：
+      共享 8 线程 → 6/8 线程报 Data corruption；
+      每线程一套 → 0 报错。
+    所以改成 threading.local：每个线程第一次用时自建，互不共享。
+    """
+    c = getattr(_ZSTD, 'c', None)
+    if c is None:
+        import zstandard
+        c = zstandard.ZstdCompressor(level=3)
+        _ZSTD.c = c
+        _ZSTD.d = zstandard.ZstdDecompressor()
+    return c
+
+
+def _zd():
+    d = getattr(_ZSTD, 'd', None)
+    if d is None:
+        _zc()
+        d = _ZSTD.d
+    return d
+
+
+def _z_pack(text):
+    return _zc().compress(str(text or '').encode('utf-8', 'replace'))
+
+
+def _z_unpack(blob, n=None):
+    if not blob:
+        return ''
+    try:
+        if n is not None and len(blob) == n:      # 迁移期可能还是明文
+            return blob.decode('utf-8', 'replace') if isinstance(blob, bytes) else str(blob)
+        return _zd().decompress(bytes(blob)).decode('utf-8', 'replace')
+    except Exception:
+        # 不是 zstd（老明文 / 坏块）：当文本用，宁可搜不到也不要炸搜索
+        try:
+            return bytes(blob).decode('utf-8', 'replace')
+        except Exception:
+            return ''
+
+
+def doc_body_get(con, rid, path=None):
+    """按 rowid（或退回按路径）取回正文明文。v1 直接读 docs，v2 解压 doc_rec。"""
+    if doc_mode(con) == 'v1':
+        try:
+            sql = ('SELECT body FROM docs WHERE rowid=?' if rid is not None
+                   else 'SELECT body FROM docs WHERE path=? LIMIT 1')
+            row = con.execute(sql, (rid if rid is not None else path,)).fetchone()
+            return str((row or [''])[0] or '')
+        except Exception:
+            return ''
+    try:
+        sql = ('SELECT z, n FROM doc_rec WHERE id=?' if rid is not None
+               else 'SELECT z, n FROM doc_rec WHERE path=? LIMIT 1')
+        row = con.execute(sql, (rid if rid is not None else path,)).fetchone()
+        return _z_unpack(*(row or (None, None)))
+    except Exception:
+        return ''
+
+
+def doc_insert(con, path, ext, text):
+    """写一篇正文，返回 rowid。v1 走 FTS 自带的行，v2 先定 id 再灌两张表。"""
+    if doc_mode(con) == 'v1':
+        cur = con.execute('INSERT INTO docs VALUES(?,?,?)', (path, ext, text))
+        return cur.lastrowid
+    blob = _z_pack(text)
+    n = len(text or '')
+    # 先拿 id：doc_rec 的 AUTOINCREMENT 是唯一 id 源，docs.rowid 必须与它一致
+    rid = con.execute(
+        'INSERT INTO doc_rec(path, ext, z, n) VALUES(?,?,?,?)',
+        (path, ext, blob, n)).lastrowid
+    con.execute('INSERT INTO docs(rowid, path, ext, body) VALUES(?,?,?,?)',
+                (rid, path, ext, text))
+    return rid
+
+
+def doc_del(con, rid):
+    """删一行正文（两张表 + bigram 一起清）。"""
+    con.execute('DELETE FROM docs WHERE rowid=?', (rid,))
+    con.execute('DELETE FROM bigram WHERE rid=?', (rid,))
+    if doc_mode(con) == 'v2':
+        con.execute('DELETE FROM doc_rec WHERE id=?', (rid,))
+
+
+def doc_all_rows(con, limit=None, after=0):
+    """(rid, path) 列表，替代老代码里的 SELECT rowid, path FROM docs。"""
+    if doc_mode(con) == 'v2':
+        sql = 'SELECT id, path FROM doc_rec WHERE id > ? ORDER BY id'
+        args = [after]
+        if limit:
+            sql += ' LIMIT ?'
+            args.append(int(limit))
+        return con.execute(sql, args).fetchall()
+    sql = 'SELECT rowid, path FROM docs'
+    if after:
+        sql += ' WHERE rowid > ? ORDER BY rowid'
+        args = [after]
+        if limit:
+            sql += ' LIMIT ?'
+            args.append(int(limit))
+        return con.execute(sql, args).fetchall()
+    if limit:
+        sql += ' LIMIT ?'
+        args.append(int(limit))
+    return con.execute(sql, args).fetchall()
+
+
+def doc_replace_body(con, rid, text, n=None, path=None, ext=None):
+    """原地改正文（截断超长正文用）。v2 的 FTS 是 contentless，只能删了重灌同行号。"""
+    if doc_mode(con) == 'v1':
+        con.execute('UPDATE docs SET body=? WHERE rowid=?', (text, rid))
+        return rid
+    if path is None or ext is None:
+        row = con.execute('SELECT path, ext FROM doc_rec WHERE id=?', (rid,)).fetchone() or (None, None)
+        path, ext = row
+    con.execute('DELETE FROM docs WHERE rowid=?', (rid,))
+    con.execute('DELETE FROM bigram WHERE rid=?', (rid,))
+    con.execute('UPDATE doc_rec SET z=?, n=? WHERE id=?', (_z_pack(text), len(text), rid))
+    con.execute('INSERT INTO docs(rowid, path, ext, body) VALUES(?,?,?,?)',
+                (rid, path, ext, text))
+    _bigram_add(con, rid, text)
+    return rid
+
+
+def compact_legacy_db(con, log=None, prog=None):
+    """把老结构库就地迁到压缩结构（体积评估 #2/#3）。
+
+    只在「库里还有 docs_content」时动手；迁移前用 SQLite 备份 API 存一份
+    brain.db.pre-compact-<时间戳>（WAL 下照抄文件不安全），迁完再 VACUUM。
+    返回 True 表示这次真的迁了，False 表示无事可做 / 失败（失败保持老结构）。
+
+    第 366 项：`prog(**kw)` 用来往界面上报进度（phase/done/total），
+    手动「整理索引库」和后台空闲迁移共用同一条进度线，用户不会以为程序卡死。
+    """
+    log = log or (lambda *a: None)
+    prog = prog or (lambda **kw: None)
+    if doc_mode(con) != 'v1':
+        return False
+    try:
+        n = con.execute('SELECT COUNT(*) FROM docs_content').fetchone()[0]
+    except sqlite3.Error:
+        return False
+    if not n:
+        return False
+
+    # 1) 备份（backup API 会带上 WAL 里还没合并的页）
+    prog(phase='backup', done=0, total=0, k='maint_compact_backup',
+         a={'mb': '%.0f' % (os.path.getsize(DB) / 1048576.0)})
+    try:
+        import sqlite3 as _sq
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        bak = Path(str(DB) + '.pre-compact-' + ts)
+        src = con
+        dst = _sq.connect(str(bak))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+        log('已备份老库到 %s' % bak)
+    except Exception as e:
+        log('备份失败，放弃迁移: %r' % (e,))
+        return False
+
+    t0 = time.time()
+    zc, zd = _zc(), _zd()
+    try:
+        # 2) 正文压进 doc_rec（id 与 docs.rowid 对齐）
+        con.execute('CREATE TABLE IF NOT EXISTS doc_rec(id INTEGER PRIMARY KEY, '
+                    'path TEXT, ext TEXT, z BLOB, n INTEGER)')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_doc_rec_path ON doc_rec(path)')
+        k = 0
+        for rid, p, e, body in con.execute(
+                'SELECT id, c0, c1, c2 FROM docs_content ORDER BY id'):
+            body = body or ''
+            con.execute('INSERT OR REPLACE INTO doc_rec(id, path, ext, z, n) '
+                        'VALUES (?,?,?,?,?)',
+                        (rid, p or '', e or '', zc.compress(body.encode('utf-8', 'replace')),
+                         len(body)))
+            k += 1
+            if k % 2000 == 0:
+                con.commit()
+                _ACTIVITY['t'] = time.time()      # 别让别的维护任务以为闲置了
+                prog(phase='compress', done=k, total=n, k='maint_compact_compress')
+        con.commit()
+        log('正文压缩完成 %d 篇 %.1fs' % (k, time.time() - t0))
+        prog(phase='compress', done=k, total=k, k='maint_compact_compress')
+
+        # 3) 重建 contentless + detail=full 的 docs（位置信息保留，短语/英文照常可搜）
+        prog(phase='rebuild', done=0, total=k, k='maint_compact_rebuild')
+        con.execute('DROP TABLE IF EXISTS docs_x')
+        con.execute("""CREATE VIRTUAL TABLE docs_x USING fts5(
+                       path UNINDEXED, ext UNINDEXED, body, tokenize='trigram',
+                       detail=full, content='', contentless_delete=1)""")
+        con.commit()
+        for i, (rid, blob) in enumerate(con.execute(
+                'SELECT id, z FROM doc_rec ORDER BY id').fetchall()):
+            con.execute('INSERT INTO docs_x(rowid, path, ext, body) VALUES (?,?,?,?)',
+                        (rid, '', '', zd.decompress(blob).decode('utf-8', 'replace')))
+            if i % 2000 == 0:
+                con.commit()
+                _ACTIVITY['t'] = time.time()
+                prog(phase='rebuild', done=i, total=k, k='maint_compact_rebuild')
+        con.commit()
+        log('全文索引重建完成 %.1fs' % (time.time() - t0))
+
+        # 4) 换表（docs_content 一删，doc_mode 立刻翻成 v2）
+        con.execute('DROP TABLE docs')
+        for t in ('docs_data', 'docs_idx', 'docs_docsize', 'docs_config', 'docs_content'):
+            con.execute('DROP TABLE IF EXISTS %s' % t)
+        con.execute('ALTER TABLE docs_x RENAME TO docs')
+        con.commit()
+
+        # 5) 回收空间
+        prog(phase='vacuum', done=0, total=0, k='maint_compact_vacuum')
+        con.execute('VACUUM')
+        _kv_set(con, 'compact_v2', '1')
+        con.commit()
+        log('迁移完成，全库 %.1fs' % (time.time() - t0))
+        return True
+    except Exception as e:
+        log('迁移中断（保持老结构可用）: %r' % (e,))
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        # 换表的瞬间出错最坏：docs 已删、docs_x 还在 —— 这里补一次改名，别让库变砖
+        try:
+            has_docs = con.execute("SELECT 1 FROM sqlite_master WHERE name='docs' LIMIT 1").fetchone()
+            has_new = con.execute("SELECT 1 FROM sqlite_master WHERE name='docs_x' LIMIT 1").fetchone()
+            if (not has_docs) and has_new:
+                con.execute('ALTER TABLE docs_x RENAME TO docs')
+                con.commit()
+                log('已把 docs_x 改名回 docs（老结构继续用）')
+        except Exception:
+            pass
+        return False
+
+
 def _doc_rids(con):
 
     """path → rowid 映射。
@@ -5379,6 +6460,10 @@ def _doc_rids(con):
     重索引上千篇文件就白扔二十多分钟。先花一次（约 1.5 秒）把映射取到内存，
 
     之后全按 rowid 操作。只读 path 列，不用把正文也读出来。"""
+
+    if doc_mode(con) == 'v2':
+        # v2：路径在 doc_rec 里，docs 是 contentless（连 path 列都不存）
+        return {p: r for r, p in con.execute('SELECT id, path FROM doc_rec')}
 
     return {p: r for r, p in con.execute('SELECT rowid, path FROM docs')}
 
@@ -5406,7 +6491,22 @@ def _doc_del(con, rids, path):
 
         con.execute('DELETE FROM bigram WHERE rid=?', (rid,))
 
+        if doc_mode(con) == 'v2':
+            con.execute('DELETE FROM doc_rec WHERE id=?', (rid,))
+
     else:
+
+        if doc_mode(con) == 'v2':
+            rs = [r[0] for r in con.execute(
+                'SELECT id FROM doc_rec WHERE lower(path)=lower(?)', (path,))]
+            if not rs:
+                return
+            con.execute('DELETE FROM bigram WHERE rid IN (%s)'
+                        % ','.join('?' * len(rs)), rs)
+            con.execute('DELETE FROM doc_rec WHERE lower(path)=lower(?)', (path,))
+            con.execute('DELETE FROM docs WHERE rowid IN (%s)'
+                        % ','.join('?' * len(rs)), rs)
+            return
 
         rs = [r[0] for r in con.execute('SELECT rowid FROM docs WHERE lower(path)=lower(?)',
 
@@ -5514,6 +6614,22 @@ def _kv_set(con, key, val):
 
     con.execute('INSERT OR REPLACE INTO kv(key, val) VALUES(?,?)', (key, str(val)))
 
+    # 第 327 项：踩过的坑，必须写在这儿 ——
+    # Python sqlite3 默认 isolation_level=''，一条 DML 就会隐式 BEGIN；忘 commit 的话
+    # 这条连接（尤其是全局共享的 _con）会一直攥着写锁。表现是「读都正常，所有写库全是
+    # database is locked」：实时监听丢事件、bigram 回填失败、gone reconcile 删不掉。
+    # 实测 2026-11-19：`_kv_set(con, _SLIM_KV, '1')` 少了 commit，整个程序写库瘫了。
+    # 所以凡是走共享连接的一律就地提交；回填线程传的是自己的连接，不受影响。
+    try:
+
+        if _con is not None and con is _con:
+
+            con.commit()
+
+    except Exception:
+
+        pass
+
 
 
 
@@ -5568,7 +6684,8 @@ def _bigram_backfill():
 
         last = int(_kv_get(con, 'bigram_until', '0') or 0)
 
-        total = con.execute('SELECT COUNT(*) FROM docs').fetchone()[0]
+        total = con.execute('SELECT COUNT(*) FROM %s'
+                            % ('doc_rec' if doc_mode(con) == 'v2' else 'docs')).fetchone()[0]
 
         if not total:
 
@@ -5588,9 +6705,12 @@ def _bigram_backfill():
 
                 continue
 
-            rows = con.execute('SELECT rowid, body FROM docs WHERE rowid > ? '
-
-                               'ORDER BY rowid LIMIT 200', (last,)).fetchall()
+            if doc_mode(con) == 'v2':
+                rows = [(r, doc_body_get(con, r)) for (r,) in con.execute(
+                    'SELECT id FROM doc_rec WHERE id > ? ORDER BY id LIMIT 200', (last,))]
+            else:
+                rows = con.execute('SELECT rowid, body FROM docs WHERE rowid > ? '
+                                   'ORDER BY rowid LIMIT 200', (last,)).fetchall()
 
             if not rows:
 
@@ -5632,7 +6752,18 @@ def init_db():
 
     con.execute('PRAGMA busy_timeout=5000')  # 写冲突时等 5 秒，而不是立刻抛 locked
 
+    # 第 326 项：WAL 下 synchronous=FULL 每一笔都 fsync（索引器写 6.8 万条时这笔开销很实在）。
+    # NORMAL 在 WAL 里仍然不会写坏库，最坏情况只丢「最后一笔已提交事务」——
+    # 对「可重建的搜索索引」这个代价可以接受，换来的是写入快一档。
+    con.execute('PRAGMA synchronous=NORMAL')
+
     con.execute('PRAGMA wal_autocheckpoint=2000')  # 长事务下 1000 页（4MB）太密
+
+    # 体积评估 #1：autocheckpoint 只「合并」已提交的帧，**不会缩小 WAL 文件本身**；
+    # 不设 journal_size_limit 的话，文件会一直停在历史最高水位（实测 60.9 MB）。
+    # 8 MB 和上面的 2000 页（≈8 MB）对齐：收完就截到 8 MB 以内，文档承诺的
+    # 「超过 8 MB 自动收」才算真的成立。
+    con.execute('PRAGMA journal_size_limit=8388608')
 
     # reverse_rows 用 lower(path)=lower(?) 查 meta，BINARY 主键失效只能全扫（21ms）；
 
@@ -5660,7 +6791,21 @@ def init_db():
 
     con.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
 
-                   path UNINDEXED, ext UNINDEXED, body, tokenize='trigram')""")
+                   path UNINDEXED, ext UNINDEXED, body, tokenize='trigram',
+
+                   content='', contentless_delete=1)""")
+
+    # 体积评估 #3：正文只在这里存一份，zstd 压缩（原文 245 MB → 实测 77 MB）。
+    # docs 变成 contentless 之后不再有正文副本，路径/扩展名也一并从这里取。
+    # id 必须和 docs.rowid 严格一致 —— 全文命中后按 id 解压出正文做片段。
+    # **老库不建这张表**：有 docs_content 就说明还没迁移，继续走老路径（见 doc_mode）。
+    _legacy = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='docs_content' LIMIT 1").fetchone()
+    if not _legacy:
+        con.execute("""CREATE TABLE IF NOT EXISTS doc_rec(
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       path TEXT, ext TEXT, z BLOB, n INTEGER)""")
+        con.execute('CREATE INDEX IF NOT EXISTS idx_doc_rec_path ON doc_rec(path)')
 
     # 2 字中文查询的旁表倒排（见 _cjk_grams）：每篇正文的 CJK 二元组 → docs.rowid。
 
@@ -5798,6 +6943,19 @@ def init_db():
 
         pass
 
+    # 第 236 项：bigram 的主键是 (gram, rid)，按 rid 删除只能全表扫。
+    # 49 万行时无所谓，490 万行时「删 1 万篇正文」变成 490 亿行扫描 ——
+    # 实测一次对账跑 12 分钟没结束，prune 在大库上等于不可用。
+    # 补一条 rid 索引：正文查询用 PK(gram, rid) 前缀，删除走 rid，两条路都 O(log n)。
+
+    try:
+
+        con.execute('CREATE INDEX IF NOT EXISTS idx_bigram_rid ON bigram(rid)')
+
+    except sqlite3.Error:
+
+        pass
+
     for _ix, _col in (('idx_files_mtime', 'mtime'),):
 
         try:
@@ -5843,6 +7001,12 @@ def init_db():
             except sqlite3.Error:
 
                 pass                    # 列已存在，或者这张表还没建
+
+    try:
+        import clipboard_mgr
+        clipboard_mgr.init_db(con)
+    except Exception:
+        pass
 
     # 建表和补表都是写操作，走默认事务；统一落地一次，免得「表建了、数据没提交」
 
@@ -5914,6 +7078,11 @@ _REPORT = {'mt': None, 't': 0.0, 'body': None}
 
 # /api/env 的结果缓存（环境自检要查注册表、枚举显示器、quick_check 数据库，跑一次不便宜）
 _ENV_CACHE = {}
+
+# 第 281 项：全库校验从体检里拆出来。整库 quick_check 在 2.4GB 库上 28–39s（冷启 2 分钟），
+# 塞进体检按钮就是「按下去半分钟没反应」。这里做成后台单飞任务：立刻返回，状态可查。
+_VERIFY_RUN = {'running': False, 'started': 0.0, 'res': {}}
+_VERIFY_LOCK = threading.Lock()
 
 
 
@@ -6001,7 +7170,16 @@ def scope_report(con):
 
             'rules': {'ext': len(NAMES_EXTS), 'skip': len(NAMES_SKIP_DIRS),
 
-                      'size_limit': NAMES_SIZE_LIMIT}}
+                      'size_limit': NAMES_SIZE_LIMIT,
+
+                      # 第 243 项：短音频阈值 + 音乐平台目录数 + 已知软件目录数。
+                      # 前端要显示「索引规则」说明，让用户知道哪些东西被排掉了、
+                      # 以及为什么 —— 这比事后解释「为什么搜不到」省事得多。
+                      'audio_min_seconds': NAMES_MIN_AUDIO_SECONDS,
+
+                      'music_apps': len(scan_docs.MUSIC_APP_DIR_SEGS),
+
+                      'software_dirs': len(scan_docs.SOFTWARE_DIR_NAMES)}}
 
     _REPORT.update({'mt': mt, 't': now, 'body': body})
 
@@ -6053,7 +7231,7 @@ def _fail_reason(path: Path):
 
         try:
 
-            import pymupdf
+            import pdf_engine as pymupdf
 
         except Exception:
 
@@ -6061,7 +7239,7 @@ def _fail_reason(path: Path):
 
         if pymupdf is None:
 
-            # core 版没打包 pymupdf。退回 pypdf：它同样能分辨「加密」和「损坏」，
+            # pymupdf/pdf_engine 都拿不到时退回 pypdf：它同样能分辨「加密」和「损坏」，
 
             # 只是不能像 pymupdf 那样先试空密码。少了这一步，加密件会被记成
 
@@ -6167,9 +7345,9 @@ def index(scope_path):
 
     try:
 
+        _pth_tbl = 'doc_rec' if doc_mode(con) == 'v2' else 'docs'
         fixed = con.execute('DELETE FROM meta WHERE reason IS NULL AND path NOT IN '
-
-                            '(SELECT path FROM docs)').rowcount
+                            '(SELECT path FROM %s)' % _pth_tbl).rowcount
 
         if fixed:
 
@@ -6206,6 +7384,13 @@ def index(scope_path):
         pl = os.path.normcase(os.path.normpath(pl))
 
         if not any(pl.startswith(d) for d in include) or any(x in pl for x in exclude):
+
+            return False
+
+        # 第 236 项：程序安装目录 / 前端资源包里的 readme、license、界面文案不做正文。
+        # 这些文件仍能被「文件名」搜到，只是不进正文池（Recoll noContentSuffixes 同款思路）。
+
+        if scan_docs.is_install_root(pl) or any(s in pl for s in _BODY_SKIP_SEGS_NC):
 
             return False
 
@@ -6367,13 +7552,11 @@ def index(scope_path):
 
             _doc_del(con, rids, p)      # 变更重建时先清旧行（按 rowid，别用慢的 path 扫描）
 
-            cur = con.execute('INSERT INTO docs VALUES(?,?,?)',
+            new_rid = doc_insert(con, p, Path(p).suffix.lower(), text)
 
-                              (p, Path(p).suffix.lower(), text))
+            rids[os.path.normcase(p)] = new_rid
 
-            rids[os.path.normcase(p)] = cur.lastrowid
-
-            _bigram_add(con, cur.lastrowid, text)   # 2 字中文查询的旁表倒排，成对维护
+            _bigram_add(con, new_rid, text)   # 2 字中文查询的旁表倒排，成对维护
 
             con.execute('INSERT OR REPLACE INTO meta(path, indexed_at, size, mtime, reason) '
 
@@ -6448,6 +7631,30 @@ def index(scope_path):
         pass
 
     total = _count_docs(con)
+
+    # 第 277 项：正文索引结果。n_fail 才算失败；n_skip（范围外/重复）单独计数，
+    # 否则「跳过 5 万」会把失败率算成 90%，看数据的人会以为索引坏了。
+    try:
+
+        if metrics is not None:
+
+            metrics.add('index', 'empty' if n_fail else 'ok', sub='content')
+
+            if n_skip:
+
+                metrics.count('index', 'skipped')
+
+            if n_fail:
+
+                metrics.count('index', 'failed')
+
+            metrics.note('index', '正文索引：新 %d / 空失败 %d / 跳过 %d / 库内 %d'
+
+                         % (n_new, n_fail, n_skip, total))
+
+    except Exception:
+
+        pass
 
     _prog(state='done', phase='', done=n_done, total=todo, ok=n_new, fail=n_fail,
 
@@ -6567,6 +7774,19 @@ def _search_sql(q, ext=None, pf=None, con=None):
 
     bigram 倒排（_cjk_grams，rowid IN 直取）；其余短词（1 字、AI/C 这类）降级 LIKE。"""
 
+    if con is not None and doc_mode(con) == 'v2':
+        # v2 的正文不在 FTS 里（contentless + doc_rec 压缩），真正的检索在
+        # _search_v2() 里做。这里只保留等价的「路由描述」，供测试与调用方判断走哪条路。
+        toks0 = _fts_tokens(q)
+        if not _need_like(q):
+            return ('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY rank LIMIT ?',
+                    [_fts_query(q)])
+        if (toks0 and all(len(t) == 2 and _is_cjk_word(t) for t in toks0)
+                and _bigram_ready(con)):
+            return ('SELECT r.path FROM doc_rec r WHERE r.id IN '
+                    '(SELECT rid FROM bigram WHERE gram=?) LIMIT ?', [toks0[0]])
+        return ('SELECT path FROM doc_rec /* LIKE */ WHERE 1=1 LIMIT ?', [])
+
     extra, args = '', []
 
     clause, eargs = _ext_clause(ext)
@@ -6631,6 +7851,111 @@ def _search_sql(q, ext=None, pf=None, con=None):
 
     return sql, [toks[0] if toks else '', *[f'%{_like_esc(t)}%' for t in toks], *args]
 
+
+
+def _v2_snip(con, rid, toks, width=45):
+    """v2 的片段：FTS 只给 rowid，正文要自己解压，再按第一个命中词取窗口。"""
+    body = doc_body_get(con, rid)
+    if not body:
+        return ''
+    low = body.lower()
+    pos = -1
+    for t in toks:
+        p = low.find(str(t).lower())
+        if p >= 0 and (pos < 0 or p < pos):
+            pos = p
+    if pos < 0:
+        frag = re.sub(r'\s+', ' ', body[:width * 2]).strip()
+        return _mark_text(frag + ('…' if len(body) > width * 2 else ''), toks)
+    start = max(0, pos - width)
+    end = min(len(body), pos + width + 40)
+    frag = re.sub(r'\s+', ' ', body[start:end]).strip()
+    if start > 0:
+        frag = '…' + frag
+    if end < len(body):
+        frag += '…'
+    return _mark_text(frag, toks)
+
+
+def _v2_ok(path, toks, ext=None, pf=None):
+    """v2 的过滤都在 Python 侧：FTS 里既没有 path 也没有 ext。"""
+    low = str(path or '').lower()
+    e = str(ext or '').strip().lower().lstrip('.')
+    if e:
+        parts = [x.strip().lstrip('.') for x in e.split(',') if x.strip()]
+        if parts and not any(low.endswith('.' + x) for x in parts):
+            return False
+    if pf and str(pf).lower() not in low:
+        return False
+    body_toks = [t for t in toks]
+    return bool(body_toks)
+
+
+def _v2_scan_rows(con, toks, limit):
+    """短词（1 字 / AI / C 这类）在 v2 下只能解压后扫：9.6k 篇 ≈ 0.5s，够用。"""
+    out = []
+    for rid, path in con.execute('SELECT id, path FROM doc_rec ORDER BY id'):
+        body = doc_body_get(con, rid)
+        low = body.lower()
+        if all(str(t).lower() in low for t in toks):
+            out.append((rid, path))
+            if len(out) >= limit * 2:
+                break
+    return out
+
+
+def _search_v2(con, q, limit, ext=None, path_filter=None):
+    """v2 检索：MATCH 只拿 rowid，正文、片段、过滤全部回到 Python 做。"""
+    toks = [t.strip('"\u201c\u201d\u2018\u2019') for t in _fts_tokens(q)]
+    toks = [t for t in toks if t]
+    if not toks:
+        return []
+    want = max(int(limit or 20), 1)
+
+    def build(cands):
+        hits = []
+        for rid, path in cands:
+            if not _v2_ok(path, toks, ext, path_filter):
+                continue
+            body = doc_body_get(con, rid)
+            low = body.lower()
+            # trigram 索引只保证「三元组出现」，不保证词真的完整出现 —— 必须回扫确认
+            if not all(str(t).lower() in low for t in toks):
+                continue
+            hits.append((path, _v2_snip(con, rid, toks)))
+            if len(hits) >= want:
+                break
+        return hits
+
+    if not _need_like(q):
+        try:
+            rids = [r for (r,) in con.execute(
+                'SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY rank LIMIT ?',
+                (_fts_query(q), want * 6))]
+        except sqlite3.Error:
+            rids = []
+        if rids:
+            paths = dict(con.execute(
+                'SELECT id, path FROM doc_rec WHERE id IN (%s)'
+                % ','.join('?' * len(rids)), rids).fetchall() or [])
+            cands = [(r, paths[r]) for r in rids if r in paths]
+            hits = build(cands)
+            if hits:
+                return hits
+
+    if (all(len(t) == 2 and _is_cjk_word(t) for t in toks) and _bigram_ready(con)):
+        # 每个 2 字词一张 gram 表，多词取交集（不能写成 gram=? AND gram=?，同一行不可能两值）
+        sets = [set(r for (r,) in con.execute('SELECT rid FROM bigram WHERE gram=?', (t,)))
+                for t in toks]
+        rids = sorted(set.intersection(*sets))[:want * 6]
+        if rids:
+            rows = con.execute('SELECT id, path FROM doc_rec WHERE id IN (%s)'
+                               % ','.join('?' * len(rids)), rids).fetchall()
+            hits = build(rows)
+            if hits:
+                return hits
+
+    return build(_v2_scan_rows(con, toks, want))
 
 
 def _mark_text(text, toks):
@@ -6835,7 +8160,8 @@ MINI_LOCK = threading.Lock()
 
 MINI_TTL = 180.0
 
-MINI_CACHE_MAX = 400
+MINI_CACHE_MAX = 120               # 第 326 项：400 → 120。每条缓存是「结果列表 + 每项字典」，
+                                   # 400 条能攒出几十 MB；用户真正回看的只有最近几十个词。
 
 LAST_Q = ''                       # 快搜窗最后在搜的词，托盘「打开详细搜索」带着它开主窗口
 
@@ -6921,7 +8247,7 @@ def record_open(con, path, isdir=False):
 
 def _recent_map(con):
 
-    """path(小写) -> 最近得分。整表读进内存：几十到几百行，比逐行查库便宜得多。"""
+    """path(小写) -> 最近得分，范围 (0, 1]。整表读进内存：几十到几百行，比逐行查库便宜得多。"""
 
     try:
 
@@ -6933,13 +8259,29 @@ def _recent_map(con):
 
         return {}
 
+    n = max(1, len(rows))
+
     out = {}
 
     for i, (path, hits, _last) in enumerate(rows):
 
-        # 最近的第 0 名权重最高；开过的次数再叠一点，免得只开过一次的旧文件挤掉常驻文件。
+        # 得分必须封顶 1.0：调用方按 0.30 * 分 加成，注释承诺「最多 0.30」。
 
-        out[os.path.normcase(path)] = (hits or 1) - i * 0.05
+        # 老写法 hits - i*0.05 在 recent 表涨到几百行后，尾部行会变成大负数
+
+        # （3 - 412*0.05 = -17.6），于是「开过但不算最近」的应用被压到最后
+
+        # —— 2026-11-15 搜 ayu 时 AyuGram.lnk 掉到第 7 位就是这么来的。
+
+        # fresh：第 0 名 1.0，最后一名趋近 0（绝不取负）。
+
+        fresh = 1.0 - (i / float(n))
+
+        # freq：开 1 次 = 0.2，5 次以上封顶 1.0。
+
+        freq = min(1.0, (hits or 1) / 5.0)
+
+        out[os.path.normcase(path)] = 0.5 * fresh + 0.5 * freq
 
     return out
 
@@ -7007,7 +8349,9 @@ _KIND_EXTS = {
 
     'audio': ('.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg', '.wma', '.ape'),
 
-    'video': ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m4v'),
+    # 第 237 项：原来这里带 '.ts'，于是时间轴筛「视频」会把 TypeScript 源码当成影片。
+    # MPEG-TS 影视少见、.ts 代码文件常见，两害取其轻：不放 .ts。
+    'video': ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'),
 
 }
 
@@ -7026,6 +8370,363 @@ def _kind_exts(kind):
         return None
 
     return _KIND_EXTS.get(k)
+
+
+
+
+# 第 324 项：左栏「文档」拆子分类（PDF / Word / Excel / PowerPoint / Markdown / 文本）。
+# 为什么只拆 doc：图片、视频、压缩包对用户来说看一眼缩略图就分得清，文档不打开
+# 根本不知道是 PDF 还是 Word —— 竞品 gety 也是这么分的。子类型表必须和前端
+# SUBTYPES 同源（前端只传子类型名，扩展名映射留在后端一处维护）。
+DOC_SUBTYPES = (
+    ('pdf', ('.pdf',)),
+    ('word', ('.doc', '.docx', '.wps')),
+    ('excel', ('.xls', '.xlsx', '.csv', '.et')),
+    ('ppt', ('.ppt', '.pptx', '.dps')),
+    ('md', ('.md', '.markdown')),
+    ('txt', ('.txt', '.rtf')),
+)
+
+
+
+
+def _ext_kind_map():
+    """扩展名 → 大类（'doc'/'img'…）。同一扩展名只归一类，先到先得。"""
+
+    m = {}
+
+    for _k, _exts in _KIND_EXTS.items():
+
+        for _e in _exts:
+
+            m.setdefault(_e, _k)
+
+    return m
+
+
+
+
+def _ext_sub_map():
+    """扩展名 → 文档子类型（'pdf'/'word'/'excel'/'ppt'/'md'/'txt'）。"""
+
+    m = {}
+
+    for _k, _exts in DOC_SUBTYPES:
+
+        for _e in _exts:
+
+            m.setdefault(_e, _k)
+
+    return m
+
+
+
+
+_FROOTS = [None, None]      # [roots 签名, [(原样根, normcase 根)]]
+_FBUCKET_MEMO = {}          # normcase(dir) -> (显示名, 路径)；换了索引范围就整表清空
+
+
+def _roots_norm(roots):
+    """索引范围根目录只算一次（调用方给的是 (原样, normcase) 二元组，也兼容纯路径）。
+
+    第 328 项：`_folder_bucket` 每条目录都要跟自己比一遍 roots，而它原来在循环里
+    对每个根**每次**都重算 `normpath` + 两次 `normcase`（上千个目录 × 几个根 = 秒级 CPU）。
+    """
+    pairs = []
+    for item in (roots or []):
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            pairs.append((str(item[0]), str(item[1])))
+        else:
+            op = os.path.normpath(str(item))
+            pairs.append((op, os.path.normcase(op)))
+    sig = tuple(pairs)
+    if _FROOTS[0] == sig and _FROOTS[1] is not None:
+        return _FROOTS[1]
+    _FROOTS[0], _FROOTS[1] = sig, pairs
+    _FBUCKET_MEMO.clear()
+    return pairs
+
+
+def _folder_bucket(d, roots):
+    """把一个目录归到「左栏文件夹」里的那一桶，返回 (显示名, 路径)。
+
+    口径：索引范围（include_dirs）之下的**第一层子目录** —— 用户心里的文件夹是
+    「钢铁小项目」「2025年度报告」这种，不是 D:\\ 或整个用户目录（那些条数上千、
+    点进去还是同一片汪洋）。范围之外（比如挂载盘、OneDrive）退化成盘符 + 第一层。
+    """
+    d = str(d or '')
+
+    if not d:
+
+        return ('', '')
+
+    p = os.path.normpath(d)
+
+    nc_key = os.path.normcase(p)
+
+    try:
+
+        hit = _FBUCKET_MEMO.get(nc_key)
+
+    except Exception:
+
+        hit = None
+
+    if hit is not None:
+
+        return hit
+
+    best = None                       # (normcase 根, 原始根)
+
+    for op, norm in _roots_norm(roots):
+
+        if nc_key == norm or nc_key.startswith(norm + os.sep):
+
+            if best is None or len(norm) > len(best[0]):
+
+                best = (norm, op)
+
+    if best:
+
+        op = best[1]
+
+        rel = p[len(op):].lstrip(os.sep) if len(p) >= len(op) else ''
+
+        seg = rel.split(os.sep)[0] if rel else ''
+
+        if seg:
+
+            out = (seg, os.path.join(op, seg))
+
+        else:
+
+            out = (os.path.basename(op) or op, op)
+
+        _fbucket_memo_put(nc_key, out)
+
+        return out
+
+    parts = [x for x in p.split(os.sep) if x]
+
+    if len(parts) >= 2:
+
+        out = (parts[1], os.sep.join(parts[:2]) + os.sep)
+
+    else:
+
+        out = (p, p)
+
+    _fbucket_memo_put(nc_key, out)
+
+    return out
+
+
+def _fbucket_memo_put(key, val):
+    """目录归桶结果缓存；满了就整表清掉（不留内存黑洞）。"""
+    try:
+
+        if len(_FBUCKET_MEMO) > 50000:
+
+            _FBUCKET_MEMO.clear()
+
+        _FBUCKET_MEMO[key] = val
+
+    except Exception:
+
+        pass
+
+
+
+
+# 第 326 项：facets 结果缓存（键 = 关键词元组 + 扩展名元组）
+_FACETS_CACHE = {}
+
+_FACETS_TTL = 30.0
+
+
+def facets(con, syn=None, folder_limit=6, max_folders=400):
+
+    """左栏计数：当前关键词下每个大类 / 文档子类型 / 顶层文件夹各有多少条。
+
+    只数**文件名命中**。正文命中要全表扫且有 3 秒预算，让计数跟着它一起等，
+    只会把「边打字边看结果」这件事拖垮 —— 宁可计数偏小，也不让搜索变慢。
+    """
+    syn = syn or {}
+
+    toks = [t.lower() for t in _fts_tokens(syn.get('q') or '')]
+
+    where, args = [], []
+
+    if toks:
+
+        where.append('(' + ' AND '.join('instr(lower(name),?)>0' for _ in toks) + ')')
+
+        args += toks
+
+    want = []
+
+    if syn.get('ext'):
+
+        want = ['.' + e.strip().lstrip('.').lower() for e in syn['ext'].split(',') if e.strip()]
+
+        if want:
+
+            where.append('ext IN (' + ','.join('?' * len(want)) + ')')
+
+            args += want
+
+    w = (' WHERE ' + ' AND '.join(where)) if where else ''
+
+    out = {'ok': True, 'total': 0, 'kinds': [], 'subs': [], 'folders': []}
+
+    # 第 326 项：30 秒缓存。空关键词那一路是一次 6.8 万行全表扫 + 8762 组 GROUP BY，
+    # 冷缓存实测 2.2 秒（表页散在 2.2GB 文件里，每次都是随机读）。
+    # 用户每打一个字都会请求一次 facets，没有缓存就是「字打完了数字才跟上」。
+    ck = (tuple(toks), tuple(want))
+
+    now = time.time()
+
+    hit = _FACETS_CACHE.get(ck)
+
+    if hit and now - hit[0] < _FACETS_TTL:
+
+        return hit[1]
+
+    try:
+
+        # 一次扫描同时出「扩展名条数」和「目录条数」——
+        # 以前分两条 SQL 各扫一遍全表，纯属扫两次同一份数据。
+        rows = con.execute('SELECT lower(ext), dir, COUNT(*) FROM files' + w + ' GROUP BY 1, 2',
+
+                           args).fetchall()
+
+    except sqlite3.Error:
+
+        return {'ok': False, 'total': 0, 'kinds': [], 'subs': [], 'folders': []}
+
+    ext_n, dir_n = {}, {}
+
+    for e, d, n in rows:
+
+        n = int(n or 0)
+
+        e = str(e or '').lower()
+
+        ext_n[e] = ext_n.get(e, 0) + n
+
+        dir_n[d] = dir_n.get(d, 0) + n
+
+    rows = list(ext_n.items())
+
+    drows = list(dir_n.items())
+
+    em, sm = _ext_kind_map(), _ext_sub_map()
+
+    kc, sc = {}, {}
+
+    total = 0
+
+    for e, n in rows:
+
+        e = str(e or '').lower()
+
+        n = int(n or 0)
+
+        total += n
+
+        k = em.get(e)
+
+        if k:
+
+            kc[k] = kc.get(k, 0) + n
+
+        if k == 'doc':
+
+            s = sm.get(e)
+
+            if s:
+
+                sc[s] = sc.get(s, 0) + n
+
+    try:
+
+        roots = _scope_dirs()
+
+    except Exception:
+
+        roots = []
+
+    fc, fname, fpath = {}, {}, {}
+
+    for d, n in drows:
+
+        name, path = _folder_bucket(d, roots)
+
+        if not path:
+
+            continue
+
+        key = os.path.normcase(path)
+
+        fc[key] = fc.get(key, 0) + int(n or 0)
+
+        fname[key] = name
+
+        fpath[key] = path
+
+    top = sorted(fc.items(), key=lambda kv: -kv[1])[:max(folder_limit, 1)]
+
+    # 第 327 项：文件夹也要有计数。以前 kinds 只数 files 表，左栏「文件夹」那一行
+    # 永远没有数字（用户看到就是 0），而「全部」其实也不含文件夹 ——
+    # 点「全部」和点「文件夹」看到的东西对不上，数字更对不上。
+    dn = 0
+
+    if not want:
+
+        try:
+
+            if toks:
+
+                dsql = ('SELECT COUNT(*) FROM dirs WHERE '
+
+                        + ' AND '.join('instr(lower(name),?)>0' for _ in toks))
+
+                dn = int(con.execute(dsql, toks).fetchone()[0] or 0)
+
+            else:
+
+                dn = int(con.execute('SELECT COUNT(*) FROM dirs').fetchone()[0] or 0)
+
+        except sqlite3.Error:
+
+            dn = 0
+
+    total += dn
+
+    if dn:
+
+        kc['dir'] = dn
+
+    out['total'] = total
+
+    out['kinds'] = [{'k': k, 'n': kc[k]} for k in ('dir', 'doc', 'img', 'video', 'audio', 'zip', 'app')
+
+                    if kc.get(k)]
+
+    out['subs'] = [{'k': k, 'n': sc[k]} for k, _ in DOC_SUBTYPES if sc.get(k)]
+
+    out['folders'] = [{'name': fname[k], 'p': fpath[k], 'n': n} for k, n in top]
+
+    # 第 326 项：存缓存（超过 24 组就清旧的，别让缓存自己长成内存问题）。
+    _FACETS_CACHE[ck] = (now, out)
+
+    if len(_FACETS_CACHE) > 24:
+
+        for k in sorted(_FACETS_CACHE, key=lambda k: _FACETS_CACHE[k][0])[:8]:
+
+            _FACETS_CACHE.pop(k, None)
+
+    return out
 
 
 
@@ -7055,9 +8756,18 @@ def backfill_dir_mtime(con, limit=0, batch=2000):
 
         args.append(int(limit))
 
-    rows = con.execute(sql, args).fetchall()
+    # 第 321 项：os.stat 一律在锁外做。
+    # 以前调用点在 `with con_lock:` 里，一圈 4000 个目录挨个 stat，碰上网络盘 /
+    # 云盘 / 已拔掉的移动硬盘，一个 stat 就能卡几秒 —— 锁被攥住几分钟，整个
+    # HTTP 面排队等锁（11-19 11:2x 实测：/api/files、/api、/api/stats 全 DB_LOCK_BUSY）。
+    # 现在只把「读一页路径」「写回一批」各包一小段锁。
+    with db_lock('backfill_dir:read', 10.0):
+
+        rows = con.execute(sql, args).fetchall()
 
     n = 0
+
+    pend = []
 
     for (path,) in rows:
 
@@ -7069,17 +8779,33 @@ def backfill_dir_mtime(con, limit=0, batch=2000):
 
             continue
 
-        con.execute('UPDATE dirs SET mtime=? WHERE path=?', (mt, path))
+        pend.append((mt, path))
 
-        n += 1
+        if len(pend) >= 50:
 
-        if n % batch == 0:
+            with db_lock('backfill_dir:write', 10.0):
+
+                con.executemany('UPDATE dirs SET mtime=? WHERE path=?', pend)
+
+                con.commit()
+
+            n += len(pend)
+
+            pend = []
+
+            if n % batch == 0:
+
+                _prog(k='m_dir_mtime', a={'n': n})
+
+    if pend:
+
+        with db_lock('backfill_dir:write', 10.0):
+
+            con.executemany('UPDATE dirs SET mtime=? WHERE path=?', pend)
 
             con.commit()
 
-            _prog(k='m_dir_mtime', a={'n': n})
-
-    con.commit()
+        n += len(pend)
 
     return n
 
@@ -7765,13 +9491,30 @@ def _py_rank(level, name, q):
 
 
 
+# 第 379 项：详情面板「真版面预览」要原始文件字节。
+# 索引里存的是抽出来的纯文本（doc_rec 的 zstd blob），docx/xlsx 的版式、表格、
+# 分页早就在抽取那一步丢了 —— 前端要画版面只能回头读原文件。
+# 只放行这三种「zip+xml」格式：老式 .doc/.xls 前端也能解析，但它们没有版式可画，
+# 放进来只是多一条读盘通道，没必要。
+_RAW_OK_EXT = ('docx', 'xlsx', 'pptx')
+
+_RAW_MIME = {
+    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+}
+
+# 48MB：正常合同/报表远小于这个数，再大前端渲染也顶不住，直接不给。
+_RAW_MAX = 48 * 1024 * 1024
+
+
 _PEEK_CACHE = {}
 
 
 
 
 
-def peek_body(con, path, q='', span=360):
+def peek_body(con, path, q='', span=360, page=0, chunk=900):
 
     """详情面板用：给某一份文档取一段正文。
 
@@ -7783,9 +9526,12 @@ def peek_body(con, path, q='', span=360):
 
     时调用，并且按 path 缓存 5 分钟——正常搜索根本不碰这条路径。
 
+    第 332 项：`page` > 0 表示「按块分期看正文」（Word/Excel/PPT 这类没有分页图的文档，
+    详情灯箱里 ← → 要能一页页往下读，读到底才换下一份文件）。块大小 `chunk` 字，
+    返回里带上 `page` / `pages`，前端据此显示「3 / 12」并决定箭头是翻页还是换文件。
     """
 
-    key = (path, (q or '').strip().lower())
+    key = (path, (q or '').strip().lower(), int(page or 0), int(chunk or 0))
 
     hit = _PEEK_CACHE.get(key)
 
@@ -7799,7 +9545,8 @@ def peek_body(con, path, q='', span=360):
 
     try:
 
-        row = con.execute('SELECT body FROM docs WHERE path=? LIMIT 1', (path,)).fetchone()
+        body0 = doc_body_get(con, None, path)
+        row = (body0,) if body0 else None
 
     except sqlite3.Error:
 
@@ -7810,6 +9557,40 @@ def peek_body(con, path, q='', span=360):
         return {'ok': False, 'why': 'no_body'}
 
     body = str(row[0])
+
+    body_len = len(body)
+
+    if page and page > 0:
+
+        csize = max(200, int(chunk or 900))
+
+        pages = max(1, (body_len + csize - 1) // csize)
+
+        pno = min(max(1, int(page)), pages)
+
+        seg = body[(pno - 1) * csize: pno * csize]
+
+        seg = re.sub(r'\s+', ' ', seg).strip()
+
+        out = {'ok': True,
+
+               'text': _mark_text(seg, _fts_tokens(tok)) if tok else seg,
+
+               'offset': (pno - 1) * csize, 'length': body_len,
+
+               'matched': bool(tok) and tok.lower() in seg.lower(),
+
+               'page': pno, 'pages': pages}
+
+        _PEEK_CACHE[key] = (now, out)
+
+        if len(_PEEK_CACHE) > 200:
+
+            for k in sorted(_PEEK_CACHE, key=lambda k: _PEEK_CACHE[k][0])[:50]:
+
+                _PEEK_CACHE.pop(k, None)
+
+        return out
 
     pos = -1
 
@@ -7831,9 +9612,18 @@ def peek_body(con, path, q='', span=360):
 
     out = {'ok': True, 'text': _mark_text(seg, _fts_tokens(tok)) if tok else seg,
 
-           'offset': offset, 'length': len(body), 'matched': pos >= 0}
+           'offset': offset, 'length': len(body), 'matched': pos >= 0,
+           'page': 1, 'pages': max(1, (body_len + max(200, int(chunk or 900)) - 1) // max(200, int(chunk or 900)))}
 
     _PEEK_CACHE[key] = (now, out)
+
+    # 第 326 项：正文片段缓存原来没有上限 —— 一天点几百篇就在内存里攒几百段，
+    # 每段 360 字。给个 200 条上限（用户真正回看的也就最近几十条）。
+    if len(_PEEK_CACHE) > 200:
+
+        for k in sorted(_PEEK_CACHE, key=lambda k: _PEEK_CACHE[k][0])[:50]:
+
+            _PEEK_CACHE.pop(k, None)
 
     return out
 
@@ -7863,7 +9653,7 @@ def _body_hits(con, q, limit=3):
 
     """正文命中，排在名字命中之后垫底。片段里 char(1)/char(2) 是高亮标记，
 
-    前端换成 <mark> —— 这两家长处都不在正文，这是第二大脑唯一守得住的差异。"""
+    前端换成 <mark> —— 这两家长处都不在正文，这是Memex唯一守得住的差异。"""
 
     try:
 
@@ -8017,7 +9807,9 @@ def _disp_name(name, ext, descr=None):
 
     e = (ext or '').lower()
 
-    if e not in ('.lnk', '.appref-ms', '.exe'):
+    # 第 297 项：.msc（设备管理器/任务计划程序）与 .cpl 也是「程序」，
+    # 显示名同样应该给中文，而不是让用户看到 taskschd.msc。
+    if e not in ('.lnk', '.appref-ms', '.exe', '.msc', '.cpl'):
 
         return name
 
@@ -8029,6 +9821,8 @@ def _disp_name(name, ext, descr=None):
 
             return cand
 
+    if e in ('.msc', '.cpl') and not (descr or '').strip():
+        return name          # 第 297 项：管理工具没有描述时保留扩展名，别只给个 taskschd
     return (descr or '').strip() or stem
 
 
@@ -8269,7 +10063,7 @@ def _target_key(path):
 
             key = os.path.normcase(os.path.realpath(t))
 
-    if len(_TGT_CACHE) > 20000:      # 全盘几十万文件，别让缓存无限长
+    if len(_TGT_CACHE) > 8000:      # 全盘几十万文件，别让缓存无限长（第 326 项：2 万 → 8 千）
 
         _TGT_CACHE.clear()
 
@@ -8459,7 +10253,127 @@ def merge_same_target(items, limit=None):
 
 
 
-def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
+_SCOPE_CACHE = {}
+_SCOPE_TTL = 3.0
+_SCOPE_MAX = 6000
+
+
+def _scope_items(scope, q, limit=9):
+    """在某个目录里找名字（第 197 项「只搜这个文件夹」）。
+
+    两路并用：
+    ① 实时扫目录 —— 用户刚新建 / 刚改名的文件还没进索引，这一路最准；但为了快，
+       只往下 4 层、最多 6000 个条目，大目录 / 深路径靠它翻不完。
+    ② files 表按路径前缀查 —— 不受层数和条目上限影响，深路径、超大目录翻得到。
+
+    以前只有 ①，于是「某个文件夹第 5 层里的文件」怎么都搜不到，用户看到的是
+    被全局结果补满的列表 —— 这就是「只在所在文件夹搜索失败」。
+    """
+    q = (q or '').strip().lower()
+    try:
+        root = os.path.normpath(str(scope or ''))
+    except Exception:
+        return []
+    # 'I:' 这种只写到盘符的形式，normpath 会保留成 'I:'，一刀不减 —— 拿它去
+    # scandir / join，Windows 会当成「该盘的当前目录」，拼出来的路径变成
+    # 'I:文件夹'（少了那个反斜杠），既打不开又和真路径对不上，列表里就会
+    # 出现同一条文件两个样子。盘符一律补成 'I:\'。
+    if len(root) == 2 and root[1] == ':':
+        root += '\\'
+    if not q or not root or not any(ch.isalnum() for ch in q):
+        return []
+    try:
+        pre = os.path.normcase(root).rstrip('\\') + '\\'
+    except Exception:
+        return []
+
+    out, seen = [], set()
+
+    def _push(it):
+        k = os.path.normcase(it.get('p') or '')
+        if not k or k in seen:
+            return
+        seen.add(k)
+        out.append(it)
+
+    # ① 实时扫目录（带 3 秒缓存：连打同一个词不再扫第二遍盘）
+    key = (pre, q)
+    now = time.time()
+    with MINI_LOCK:
+        got = _SCOPE_CACHE.get(key)
+    live = None
+    if got and now - got[0] < _SCOPE_TTL:
+        live = got[1]
+    elif os.path.isdir(root):
+        hits, cnt, stack = [], 0, [(root, 0)]
+        while stack and cnt < _SCOPE_MAX:
+            cur, depth = stack.pop()
+            try:
+                it = os.scandir(cur)
+            except OSError:
+                continue
+            with it:
+                while True:
+                    try:
+                        e = next(it)
+                    except (StopIteration, OSError):
+                        break
+                    cnt += 1
+                    if cnt > _SCOPE_MAX:
+                        break
+                    try:
+                        isdir = e.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    nl = e.name.lower()
+                    if q in nl:
+                        hits.append((0 if nl.startswith(q) else 1, depth,
+                                     len(e.name), nl, e.path, isdir))
+                    if isdir and depth < 3 and not nl.startswith('.'):
+                        stack.append((e.path, depth + 1))
+        hits.sort()
+        live = []
+        for rank, _dep, _ln, _nl, path, isdir in hits:
+            nm = os.path.basename(path)
+            ext = '' if isdir else os.path.splitext(nm)[1].lower()
+            try:
+                st = os.stat(path)
+                mtime, size = st.st_mtime, st.st_size
+            except OSError:
+                mtime, size = None, None
+            live.append({'n': nm, 'p': path, 'd': os.path.dirname(path),
+                         't': 'dir' if isdir else 'file', 'e': ext, 'app': 0,
+                         'dn': _disp_name(nm, ext, None), 'm': mtime, 's': size,
+                         'z': size, 'r': rank, 'in': 1})
+        with MINI_LOCK:
+            if len(_SCOPE_CACHE) > 64:
+                _SCOPE_CACHE.clear()
+            _SCOPE_CACHE[key] = (time.time(), [dict(x) for x in live])
+    for x in (live or []):
+        _push(dict(x))
+
+    # ② 索引补：同一路径前缀下、名字含 q 的条目（深路径只有这一路翻得到）
+    try:
+        with con_lock:
+            rows = conn().execute(
+                'SELECT name, path, dir, ext, size, mtime FROM files '
+                'WHERE instr(lower(path), ?) = 1 AND instr(lower(name), ?) > 0 '
+                'ORDER BY (CASE WHEN substr(lower(name), 1, ?) = ? THEN 0 ELSE 1 END), '
+                'mtime DESC LIMIT ?',
+                (pre, q, len(q), q, max(limit, 9) * 2)).fetchall()
+        for name, path, dirp, ext, size, mtime in rows:
+            _push({'n': name, 'p': path, 'd': dirp or os.path.dirname(path),
+                   't': 'file', 'e': (ext or '').lower(), 'app': 0,
+                   'dn': _disp_name(name, ext, None), 'm': mtime, 's': size,
+                   'z': size, 'r': 0 if (name or '').lower().startswith(q) else 1,
+                   'in': 1})
+    except Exception:
+        pass
+
+    out.sort(key=lambda x: (x.get('r', 1), x.get('t') != 'dir', -(x.get('m') or 0)))
+    return out[:limit]
+
+def mini_search(con, q, limit=9, deep=False, body=False, content_only=False, force_body=False, pf=None):
 
     """返回 {'items': [...], 'deep': bool, 'ms': int}。
 
@@ -8471,7 +10385,8 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
     body=True ：正文命中给固定配额，排在名字命中后面（见下方 body 分支的说明）；
 
-    content_only=True：只搜正文（用户敲了 c: / content: 前缀），名字一个都不要。"""
+    content_only=True：只搜正文（用户敲了 c: / content: 前缀），名字一个都不要。
+    force_body=True：右侧「正文」按钮开启 —— 名字和正文都要，且不受 first_app 掐断。"""
 
     q = (q or '').strip().lower()
 
@@ -8487,7 +10402,25 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
         return {'items': [], 'deep': deep, 'ms': 0, 'n': 0}
 
-    ck = (q, bool(body), bool(content_only))
+    # 第 324 项：空格分隔的多个关键词 = AND。正文那一路（_fts_query）早就是 AND，
+    # 名字这一路却一直把整串当短语（instr(name,'子公司 2025 营收')），
+    # 于是「子公司 2025 营收」名字命中一条都没有，用户看到的就是「搜不到」。
+    _toks = _fts_tokens(q)
+
+    _multi = len(_toks) > 1
+
+    # 第 324 项：左栏「文件夹」子分类点进来时带目录前缀（pf），在 SQL 里就收口，
+    # 不能等 mini_search 回来再过滤 —— 200 条候选里可能一条都不在那个目录，
+    # 用户看到的就是「点了文件夹却是空的」。
+    _pf_sql, _pf_args = '', []
+
+    if pf:
+
+        _pf_sql = ' AND instr(lower(path),?)>0'
+
+        _pf_args = [str(pf).lower()]
+
+    ck = (q, bool(body), bool(content_only), bool(force_body), _multi, str(pf or ''))
 
     if deep:
 
@@ -8573,6 +10506,13 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
         name = os.path.basename(path.rstrip('\\/')) or path
 
+        # 第 246 项：虚拟应用入口的 path 是 AUMID，basename 是包名 ID；
+        # 显示名由 app_entries 写进 files.descr，这里换回来，
+        # 否则搜到 Watt Toolkit 却只显示一串 4651ED44255E...!App。
+        _shell = app_entries.is_shell_app_path(path)
+        if _shell and descr:
+            name = str(descr)
+
         items.append({'n': name, 'p': path,
 
                       'd': os.path.dirname(path.rstrip('\\/')),
@@ -8581,15 +10521,29 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
                       'e': '' if isdir else ext,
 
-                      'app': 1 if (not isdir and apprank.is_app_file(name)) else 0,
+                      'app': 1 if (not isdir and (_shell or apprank.is_app_file(name))) else 0,
 
                       'dn': (None if isdir else apprank.name_for_exe(name)) or _disp_name(name, ext, descr),
 
-                      'm': mtime, 'z': size,
+                      'm': mtime, 's': size, 'z': size,
 
                       'r': _mini_rank(name.lower(), q) if rank is None else rank})
 
         _rk[key] = items[-1]
+
+    # 第 297 项：系统程序（设置 / cmd / 记事本…）不在文件索引里 —— 系统目录被排除、
+    # 「设置」是 MSIX 应用没有 .lnk、cmd 不是「已安装程序」。它们只在查询时补，不写库：
+    # 既不会被对账/清理规则当死路径删掉，也不占索引空间。ab 直接给高权重（排序第一键），
+    # 用户敲 cmd / 设置 时第一行就是它。
+    try:
+        for _sa in sys_apps.match(q, lang=boot_lang()):
+            add(_sa['path'], False, _sa['ext'], 0, _sa['name'])
+            _k = os.path.normcase(_sa['path'])
+            if _k in _rk:
+                _rk[_k]['ab'] = max(int(_rk[_k].get('ab') or 0), int(_sa['ab']))
+                _rk[_k]['app'] = 1
+    except Exception:
+        pass
 
 
 
@@ -8603,7 +10557,7 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
     try:
 
-        if deep:
+        if deep or _multi:
 
             # 深搜：名字任意位置 + descr 任意位置，两路 OR
 
@@ -8611,11 +10565,18 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
             # 老写法 `SELECT path,… WHERE instr(name,?)` 会读整张 216MB 的表（160~203ms）。
 
+            # 第 324 项：多关键词改「每个词都出现在名字里」（AND），单关键词照旧整串。
+            _nm_where = (' AND '.join('instr(name,?)>0' for _ in _toks)
+
+                         if _multi else 'instr(name,?)>0')
+
+            _nm_args = list(_toks) if _multi else [q]
+
             _ids = [r[0] for r in con.execute(
 
-                'SELECT rowid FROM files WHERE instr(name,?)>0 LIMIT ?',
+                'SELECT rowid FROM files WHERE ' + _nm_where + _pf_sql + ' LIMIT ?',
 
-                (q, limit * 45)).fetchall()]
+                (*_nm_args, *_pf_args, limit * 45)).fetchall()]
 
             if _ids:
 
@@ -8633,13 +10594,20 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
             # 而真正有描述的只有 3,749 行。分开查再拼，结果一样，深搜快 170ms。
 
+            # 第 324 项：多关键词同样要 AND（「微软 浏览器」不该命中描述里只有「微软」的项）。
+            _ds_where = (' AND '.join('instr(lower(descr),?)>0' for _ in _toks)
+
+                         if _multi else 'instr(lower(descr),?)>0')
+
+            _ds_args = list(_toks) if _multi else [q]
+
             try:
 
                 frows = list(frows) + list(con.execute(
 
                     'SELECT path, ext, descr, mtime, size FROM appdesc '
 
-                    'WHERE instr(lower(descr),?)>0 LIMIT ?', (q, limit * 10)).fetchall())
+                    'WHERE ' + _ds_where + _pf_sql + ' LIMIT ?', (*_ds_args, *_pf_args, limit * 10)).fetchall())
 
             except sqlite3.Error:
 
@@ -8655,9 +10623,9 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
                 add(_p, False, _e, 1)
 
-            frows = con.execute('SELECT path, ext, descr, mtime, size FROM files WHERE name>=? AND name<? LIMIT ?',
+            frows = con.execute('SELECT path, ext, descr, mtime, size FROM files WHERE name>=? AND name<?' + _pf_sql + ' LIMIT ?',
 
-                                (q, hi, limit * 8)).fetchall()
+                                (q, hi, *_pf_args, limit * 8)).fetchall()
 
             # 前缀命中会被同名文件淹掉：搜「微信」全盘有 289 个「微信-2026*.aac」通话录音，
 
@@ -8673,9 +10641,9 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
                     'SELECT path, ext, descr, mtime, size FROM files WHERE name>=? AND name<? AND ext IN '
 
-                    "('.exe','.lnk','.bat','.cmd','.ps1','.appref-ms') LIMIT ?",
+                    "('.exe','.lnk','.bat','.cmd','.ps1','.appref-ms')" + _pf_sql + ' LIMIT ?',
 
-                    (q, hi, limit * 5)).fetchall()
+                    (q, hi, *_pf_args, limit * 5)).fetchall()
 
                 frows = list(arows) + list(frows)
 
@@ -8693,7 +10661,7 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
                         'SELECT path, ext, descr, mtime, size FROM appdesc '
 
-                        'WHERE instr(lower(descr),?)>0 LIMIT ?', (q, 30)).fetchall()
+                        'WHERE instr(lower(descr),?)>0' + _pf_sql + ' LIMIT ?', (q, *_pf_args, 30)).fetchall()
 
                     frows = list(frows) + list(extra)
 
@@ -9027,7 +10995,9 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
         p = it.get('p', '')
 
-        if p and os.path.exists(p):
+        # 第 246 项：虚拟应用入口没有磁盘路径，exists() 永远 False。
+        # 不放行的话刚写进 files 表的商店应用会被当成死路径丢掉并 _mark_gone。
+        if p and (os.path.exists(p) or app_entries.is_shell_app_path(p)):
 
             # 同名折叠：同一个名字最多两条（不同文件夹里的两份「简历.pdf」可以留，
 
@@ -9083,7 +11053,7 @@ def mini_search(con, q, limit=9, deep=False, body=False, content_only=False):
 
                          and isinstance(_tr, (int, float)) and _tr <= 1)
 
-        slack = _body_slots(len(out), first_app, limit)
+        slack = _body_slots(len(out), first_app and not force_body, limit)
 
         if slack:
 
@@ -9167,6 +11137,12 @@ def _qsize(num, unit):
 
 
 
+# 第 229 项五轮：用户嘴里说的「格式名」→ 真扩展名。ext:word 不是 .word（根本
+# 不存在这个扩展名），用户想要的是 doc/docx。只收最常见的几个，别把「txt 该写
+# txt」这种常识也包进去。
+EXT_ALIASES = {'word': 'doc,docx', 'excel': 'xls,xlsx', 'ppt': 'ppt,pptx',
+               '图片': 'jpg,jpeg,png,gif,webp,bmp'}
+
 def parse_qsyn(q):
 
     """把「WinShun 式」语法从搜索词里剥出来：ext:pdf / size:>10m / dm:7d / -排除 / 某个文件夹/。
@@ -9179,15 +11155,56 @@ def parse_qsyn(q):
 
     raw = str(q or '')
 
+    # 第 309 项：先把「前缀 + 冒号」两边的空白与全角冒号收拢：
+    # `ext : pdf` / `ext： pdf` / `ext: pdf` → `ext:pdf`。
+    # 不这么做的话，`ext:` 会以「空值语法前缀」身份落回关键词，
+    # 变成一个永远匹配不到的字符串，用户看到的就是「关键词 ext:pdf 搜不到东西」。
+    # 只动这几个已知前缀，文件名里正常的冒号（`报告：终稿.docx`）不受影响。
+    raw = re.sub(r'(?i)(^|[\s\u3000])(ext|type|size|dm|content|内容)[\s\u3000]*[:：][\s\u3000]*',
+                 lambda m: m.group(1) + m.group(2) + ':', raw)
+
     syn = {'q': raw.strip(), 'ext': None, 'size': (None, None),
 
            'days': None, 'excl': [], 'folder': None, 'content': False}
 
     rest = []
 
-    for tok in raw.split():
+    # 第 294 项（H）：双引号内的空格不切分 —— 目录名带空格时（"D:\\我的 文件\\"），
+    # 原来按空白切会把路径切成两个词，以斜杠结尾的 folder 规则直接失效。
+    import re as _re_qs
+    _toks = _re_qs.findall(r'"[^"]*"|[^\s\u3000]+', raw)
+
+    # 第 309 项：`ext: pdf, docx` 这种逗号后带空格的写法，切词后 `pdf,` 与 `docx`
+    # 分成两段，后半段会掉成关键词。以逗号结尾的 ext/type 前缀后面再拼回一个词。
+    _merged = []
+    for _t in _toks:
+        _lt = _t.lower()
+        if (_merged and _merged[-1].rstrip().endswith(',')
+                and _merged[-1].lower().startswith(('ext:', 'type:'))):
+            _merged[-1] = _merged[-1] + _t
+        else:
+            _merged.append(_t)
+    _toks = _merged
+    for tok in _toks:
+
+        if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+            tok = tok[1:-1]
 
         low = tok.lower()
+
+        # 第 229 项四轮：全角冒号也认（ext：pdf / size：>10m / dm：7d / 内容：微信）。
+        # 中文输入法默认打「：」，以前只认半角，用户打出来就被当成普通关键词。
+        # 只在「已知语法前缀 + 全角冒号」这个位置替换 —— 文件名里合法的 ： 不受影响
+        # （报告：终稿.docx 照样按名字搜），c：\users 这类盘符路径照旧被 c: 分支放行。
+        for _pfx in ('ext', 'type', 'size', 'dm', 'content', 'c', '内容'):
+
+            if low.startswith(_pfx + '：'):
+
+                tok = tok[:len(_pfx)] + ':' + tok[len(_pfx) + 1:]
+
+                low = low[:len(_pfx)] + ':' + low[len(_pfx) + 1:]
+
+                break
 
         # 不带冒号的写法也认：size>10m / size>=10m / size<1g / size10m、dm<30d。
         # 用户的第一反应就是写 `size>10m`（不是 `size:>10m`），而原来只认后者 ——
@@ -9255,7 +11272,12 @@ def parse_qsyn(q):
 
             v = low.split(':', 1)[1]
 
-            exts = [e.strip().lstrip('.') for e in re.split(r'[,\s]+', v) if e.strip()]
+            # 第 229 项五轮：中文输入法的全角逗号/顿号也当分隔符；word/excel/ppt
+            # 这类「类型名」按 EXT_ALIASES 展开成真扩展名（ext:word 以前永远 0 条）。
+            exts = [x for e in re.split(r'[，、,\s]+', v) if e.strip()
+
+                    for x in EXT_ALIASES.get(e.strip().lstrip('.'),
+                                             e.strip().lstrip('.')).split(',')]
 
             if exts:
 
@@ -9361,6 +11383,14 @@ def syn_ok(path, size, mtime, syn):
 
             return False
 
+    # 「文件夹/」语法（第 238 项）：解析器一直有 syn['folder']，但这里从来没判过，
+    # 于是 `工作\` 被当成「没有关键词」→ 落到「浏览最近 400 条」，筛选等于没写。
+    folder = str(syn.get('folder') or '').strip().lower()
+
+    if folder and folder not in str(path or '').lower():
+
+        return False
+
     for x in (syn.get('excl') or []):
 
         if x and x in str(path or '').lower():
@@ -9375,30 +11405,186 @@ SORT_KEYS = ('rel', 'new', 'old', 'big', 'name')
 
 
 
+def dir_rows(con, q, limit=200, pf=''):
+    """第 327 项：左栏点「文件夹」要有东西。
+
+    目录在 dirs 表，以前这条路走的是 /api/files（只查 files 表），所以左栏数字
+    显示 41072、点进去一片空白 —— 用户原话「还是没东西啊」。
+    关键词按目录名 LIKE，不带关键词就按修改时间倒序（和文件那路一致）。
+    """
+    kw = (q or '').strip().lower()
+    where, args = [], []
+    if pf:
+        pre = os.path.normcase(pf.rstrip('\\/')) + os.sep.lower()
+        where.append('lower(path) LIKE ?')
+        args.append(pre + '%')
+    if kw:
+        where.append('lower(name) LIKE ?')
+        args.append('%' + kw + '%')
+    sql = 'SELECT path,name,mtime FROM dirs'
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY mtime DESC LIMIT %d' % max(1, min(400, int(limit)))
+    try:
+        rows = con.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return []
+    return [{'p': p, 'n': nm, 't': 'dir', 'e': '', 'm': mt, 's': 0}
+            for (p, nm, mt) in rows]
+
+
+def syntax_only_items(con, syn, limit=400):
+
+    """第 229 项五轮：纯语法筛选（无关键词）的统一 SQL 出口。
+
+    ext:pdf / size:>2m / dm:7d 这类不带关键词的查询，以前全靠「最近 400 条再
+    逐条筛」—— 最近 400 条里可能根本没有大文件，「size:>2m 搜不到」就是这么
+    来的（用户 16:1x 实测）。现在把 ext/size/days 直接翻成 SQL WHERE 一次查表：
+    - ext → lower(ext) IN (...)（ext 无索引，全表扫一次百 ms 级）
+    - size → size >= / <=（bytes；边界与 syn_ok 的闭区间一致）
+    - days → mtime >= now-days*86400（走 idx_files_mtime）
+    排序仍 mtime 新的在前；-排除/文件夹/ 这类「名字级」语法留给 syn_ok 在
+    结果上收口。返回 (items, total)，条目形状与 mini_search 一致
+    （n/p/d/t/e/app/dn/m/z/r）。"""
+
+    lo, hi = syn.get('size') or (None, None)
+
+    days = syn.get('days')
+
+    exts = []
+
+    for e in str(syn.get('ext') or '').split(','):
+
+        e = e.strip().lstrip('.').lower()
+
+        if e:
+
+            exts.append('.' + e)
+
+    wheres, args = [], []
+
+    if exts:
+
+        wheres.append('lower(ext) IN (%s)' % ','.join('?' * len(exts)))
+
+        args.extend(exts)
+
+    if lo is not None:
+
+        wheres.append('size >= ?')
+
+        args.append(float(lo))
+
+    if hi is not None:
+
+        wheres.append('size <= ?')
+
+        args.append(float(hi))
+
+    if days:
+
+        wheres.append('mtime >= ?')
+
+        args.append(time.time() - int(days) * 86400)
+
+    # 文件夹限定（`工作\` / `D:/资料/`）：以前只在解析器里存着、没人用。
+    # 这里翻成 SQL，省得先取 400 条再逐条筛（换个目录就一条都不剩）。
+    folder = str(syn.get('folder') or '').strip().lower()
+
+    if folder:
+
+        wheres.append('instr(lower(path), ?) > 0')
+
+        args.append(folder)
+
+    if not wheres:
+
+        return [], 0
+
+    rows = con.execute(
+        'SELECT path,name,ext,mtime,size FROM files WHERE %s '
+        'ORDER BY mtime DESC LIMIT %d' % (' AND '.join(wheres), int(limit)),
+        args).fetchall()
+
+    items = []
+
+    for (p, nm, ex, mt, sz) in rows:
+
+        base = os.path.basename(p.rstrip('/' + chr(92))) or nm
+
+        items.append({'n': base, 'p': p, 'd': os.path.dirname(p.rstrip('/' + chr(92))),
+
+                      't': 'file', 'e': (ex or '').lower(),
+
+                      'app': 1 if apprank.is_app_file(base) else 0,
+
+                      'dn': apprank.name_for_exe(base) or None,
+
+                      'm': mt, 's': sz, 'z': sz, 'r': 0, 'src': 'disk'})
+
+    return items, len(items)
+
+
 def sort_items(items, sort='rel'):
 
     """排序只对已经拿到的一屏结果做，不重查数据库。"""
 
     s = str(sort or 'rel').lower()
 
+    # 第 298 项：ab>0 = 这次查询命中了常用应用白名单（微信本体 / 设置 / cmd…）。
+    # 手选的排序（名称/时间/大小）不该把「真正要打开的那个程序」埋到第十几行，
+    # 所以应用行在任何模式下都排在最前，其余仍在各自模式内部有序。
+    def _app_first(it):
+        return 0 if (it.get('ab') or 0) > 0 else 1
+
     if s == 'new':
 
-        items.sort(key=lambda it: -(it.get('m') or 0))
+        items.sort(key=lambda it: (_app_first(it), -(it.get('m') or 0)))
 
     elif s == 'old':
 
-        items.sort(key=lambda it: (it.get('m') or 0))
+        items.sort(key=lambda it: (_app_first(it), (it.get('m') or 0)))
 
     elif s == 'big':
 
-        items.sort(key=lambda it: -(it.get('s') or 0))
+        items.sort(key=lambda it: (_app_first(it), -(it.get('s') or 0)))
 
     elif s == 'name':
 
-        items.sort(key=lambda it: str(it.get('n') or os.path.basename(str(it.get('p') or ''))).lower())
+        items.sort(key=lambda it: (_app_first(it),
+                                   str(it.get('n') or os.path.basename(str(it.get('p') or ''))).lower()))
 
     return items
 
+
+
+def _v2_add_name_hits(con, q, hits, limit, ext=None, path_filter=None):
+    """v2：正文命中不够时按文件名补（和 v1 一样扫 meta，不碰正文）。"""
+    toks = _fts_tokens(q)
+    if not toks:
+        return hits
+    sql2 = ('SELECT path FROM meta WHERE reason IS NULL AND '
+            + ' AND '.join(['instr(lower(path), lower(?)) > 0'] * len(toks)))
+    a2 = list(toks)
+    e = str(ext or '').strip().lower().lstrip('.')
+    if e:
+        sql2 += ' AND lower(path) LIKE ?'
+        a2.append(f'%.{_like_esc(e)}')
+    if path_filter:
+        sql2 += ' AND instr(lower(path), lower(?)) > 0'
+        a2.append(path_filter)
+    sql2 += ' LIMIT ?'
+    a2.append(limit)
+    seen = {p for p, _ in hits}
+    out = list(hits)
+    for (p,) in con.execute(sql2, a2):
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append((p, _mark_name(p, toks)))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def search_rows(con, q, limit=20, ext=None, path_filter=None, with_name=True):
@@ -9412,6 +11598,12 @@ def search_rows(con, q, limit=20, ext=None, path_filter=None, with_name=True):
     的文档搜不出来（实际用起来这正是最常见的抱怨点）。正文命中不够时再扫一遍路径：
 
     万级路径的 LIKE 是毫秒级，不用为它加索引列——那会逼着所有人重建整个索引。"""
+
+    if doc_mode(con) == 'v2':
+        hits = _search_v2(con, q, limit, ext, path_filter)
+        if len(hits) >= limit or not with_name:
+            return hits
+        return _v2_add_name_hits(con, q, hits, limit, ext, path_filter)
 
     sql, args = _search_sql(q, ext, path_filter, con=con)
 
@@ -9517,7 +11709,7 @@ def search(q, limit=20, ext=None, path_filter=None):
 
 # ---------------------------------------------------------------- Everything 联动（可选）
 
-# 第二大脑只能搜「索引里那几千篇文档」的正文和文件名；Everything 知道整台机器上每个文件名。
+# Memex只能搜「索引里那几千篇文档」的正文和文件名；Everything 知道整台机器上每个文件名。
 
 # 两者合起来才完整：一个答「哪份文件里提过这句」，一个答「这个文件到底在哪」。
 
@@ -10625,6 +12817,106 @@ def sys_icon(ext, isdir=False):
 
 
 
+def shell_app_icon(path, size=48):
+    """第 248 项：虚拟商店应用（shell:AppsFolder\\<AUMID>）的真实图标 → PNG。
+
+    Windows 商店 / MSIX 应用的显示名和图标都不在文件系统里：
+      * `SHGetFileInfoW` 直接传 'shell:AppsFolder\\...' 字符串会失败（实测 ok=0）；
+      * 必须走 IShellItemImageFactory（SHCreateItemFromParsingName + GetImage）
+        才能拿到开始菜单那张磁贴图标。
+    实测 6 个不同 AUMID 的图标 hash 全不相同 —— 不是通用占位图。
+    取不到一律返回 None，调用方回落自绘图标（绝不能让整行结果消失）。
+    """
+    if not app_entries.is_shell_app_path(path):
+        return None
+    aumid = str(path)[len(app_entries.SHELL_PREFIX):]
+    if not app_entries.is_virtual_appid(aumid):
+        return None
+    key = 's:' + os.path.normcase(str(path))
+    with ICON_LOCK:
+        if key in ICON_CACHE:
+            return ICON_CACHE[key]
+    png = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [('Data1', ctypes.c_ulong), ('Data2', ctypes.c_ushort),
+                        ('Data3', ctypes.c_ushort), ('Data4', ctypes.c_ubyte * 8)]
+
+        class _SIZE(ctypes.Structure):
+            _fields_ = [('cx', ctypes.c_long), ('cy', ctypes.c_long)]
+
+        class _BIH(ctypes.Structure):
+            _fields_ = [('biSize', ctypes.c_ulong), ('biWidth', ctypes.c_long),
+                        ('biHeight', ctypes.c_long), ('biPlanes', ctypes.c_ushort),
+                        ('biBitCount', ctypes.c_ushort), ('biCompression', ctypes.c_ulong),
+                        ('biSizeImage', ctypes.c_ulong), ('biXPelsPerMeter', ctypes.c_long),
+                        ('biYPelsPerMeter', ctypes.c_long), ('biClrUsed', ctypes.c_ulong),
+                        ('biClrImportant', ctypes.c_ulong)]
+
+        ole32, shell32, gdi32 = (ctypes.windll.ole32, ctypes.windll.shell32,
+                                 ctypes.windll.gdi32)
+        # HTTP 线程里 COM 未必初始化过；S_FALSE / RPC_E_CHANGED_MODE 都忽略。
+        ole32.CoInitializeEx(None, 2)
+        iid = _GUID()
+        ole32.IIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_GUID)]
+        ole32.IIDFromString.restype = ctypes.c_long
+        if ole32.IIDFromString('{BCC18B79-BA16-442F-80C4-8A59C30C463B}',
+                               ctypes.byref(iid)) != 0:
+            return None
+        shell32.SHCreateItemFromParsingName.argtypes = [
+            wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(_GUID),
+            ctypes.POINTER(ctypes.c_void_p)]
+        shell32.SHCreateItemFromParsingName.restype = ctypes.c_long
+        obj = ctypes.c_void_p()
+        if shell32.SHCreateItemFromParsingName(str(path), None, ctypes.byref(iid),
+                                               ctypes.byref(obj)) != 0 or not obj:
+            return None
+        try:
+            vt = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            # IShellItemImageFactory: IUnknown(3) + GetImage(SIZE, SIIGBF, HBITMAP*)
+            get_image = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, _SIZE, ctypes.c_int,
+                ctypes.POINTER(wintypes.HANDLE))(vt[3])
+            hbmp = wintypes.HANDLE()
+            if get_image(obj, _SIZE(size, size), 0, ctypes.byref(hbmp)) != 0 or not hbmp:
+                return None
+            try:
+                gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+                gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+                gdi32.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            wintypes.UINT, wintypes.UINT,
+                                            ctypes.c_void_p, ctypes.POINTER(_BIH),
+                                            wintypes.UINT]
+                gdi32.GetDIBits.restype = ctypes.c_int
+                gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+                gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+                hdc = gdi32.CreateCompatibleDC(0)
+                try:
+                    bih = _BIH()
+                    bih.biSize = ctypes.sizeof(_BIH)
+                    bih.biWidth, bih.biHeight = size, -size
+                    bih.biPlanes, bih.biBitCount, bih.biCompression = 1, 32, 0
+                    buf = (ctypes.c_ubyte * (size * size * 4))()
+                    if gdi32.GetDIBits(hdc, hbmp, 0, size,
+                                       ctypes.cast(buf, ctypes.c_void_p),
+                                       ctypes.byref(bih), 0) == size:
+                        png = _rgba_to_png(bytes(buf), size)
+                finally:
+                    gdi32.DeleteDC(hdc)
+            finally:
+                gdi32.DeleteObject(hbmp)
+        finally:
+            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vt[2])(obj)
+    except Exception:
+        png = None
+    with ICON_LOCK:
+        ICON_CACHE[key] = png
+    return png
+
+
 def path_icon(path):
 
     """按真实文件路径取图标 —— .lnk 由 shell 自动解析到目标应用，
@@ -10739,11 +13031,41 @@ def path_icon(path):
 
 THUMB_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tif', '.tiff'}
 
+# 第 313 项：**不要**在这里给 Word/Excel/PPT 加 Shell 缩略图分支。
+
+# 312 项试过一次，装机的下一个版本就把主窗拖到「未响应」：前端缩略图视图（App.tsx 的
+
+# THUMB_EXT 里本来就有 docx/xlsx/pptx）会对每一格发 /api/thumb，Shell 缩略图处理器在
+
+# 随机线程里调 COM 会卡住，几格就把 6 条 HTTP 线程全占死 —— 连 /api/ping 都不回。
+
+# 本机 WPS 也没注册处理器（实测 docx 全是 None），所以这条路本来就没有收益。
+
+# 详情面板看 Word/Excel 走正文首段（panels.tsx 的 AUTO_PEEK_EXT），不要图。
+
 # 视频：不装 ffmpeg，直接用 Windows 自带的缩略图服务（资源管理器里能看到缩略图的格式它都能出）
 
 VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v', '.ts', '.webm', '.mpg', '.mpeg'}
 
 VIDEO_THUMB_TIMEOUT = 8.0           # 秒；视频取帧超过这个时间就别要了
+
+
+def _thumb_video_size(max_w):
+    """第 336 项：视频缩略图请求尺寸。
+
+    Shell 缩略图服务按调用方给的尺寸解码：网格格子（max_w≈320）给 256 就够，
+    详情栏（big=1，max_w=900）给 640 才不至于糊成一团，展开（xl，1600）给 960。
+    上限压到 960，再大就要多等几百毫秒，收益不值。
+    """
+    try:
+        w = int(max_w)
+    except Exception:
+        w = 320
+    if w >= 1200:
+        return 960
+    if w >= 600:
+        return 640
+    return 256
 
 THUMB_LOCK = threading.Lock()
 
@@ -10759,9 +13081,9 @@ THUMB_DIR = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~
 
 
 
-def _thumb_disk_path(path, max_w, max_h):
+def _thumb_disk_path(path, max_w, max_h, page=0, hl=()):
 
-    """路径 + 修改时间 + 大小 + 尺寸 → 缓存文件名。
+    """路径 + 修改时间 + 大小 + 尺寸（+ 第 326 项：页码、高亮词）→ 缓存文件名。
 
 
 
@@ -10777,7 +13099,8 @@ def _thumb_disk_path(path, max_w, max_h):
 
         stamp = 'na'
 
-    raw = ('%s|%s|%dx%d' % (os.path.normcase(path), stamp, max_w, max_h)).encode('utf-8', 'replace')
+    raw = ('%s|%s|%dx%d|p%d|%s' % (os.path.normcase(path), stamp, max_w, max_h,
+                                   int(page or 0), ','.join(hl or ()))).encode('utf-8', 'replace')
 
     import hashlib
 
@@ -11169,7 +13492,24 @@ def _shell_thumb_png(path, size=256):
 
 
 
-def make_thumb(path, max_w=320, max_h=400):
+def pdf_pages(path):
+    """PDF 总页数（拿不到就 0）。第 325 项：详情栏要显示「12 / 36」。"""
+    try:
+
+        import pdf_engine as pymupdf
+
+        with pymupdf.open(path) as doc:
+
+            return len(doc)
+
+    except Exception:
+
+        return 0
+
+
+
+
+def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
 
     """图片/PDF → 缩略图 PNG 字节。失败返回 None，前端回落到系统图标。
 
@@ -11180,6 +13520,8 @@ def make_thumb(path, max_w=320, max_h=400):
     - 图片：PIL 打开 → 等比缩放（最大 320×400）→ PNG 字节
 
     - PDF：pymupdf 取首页 → PIL 缩放
+
+    - Word/Excel/PPT：**不出图**（第 313 项回滚：Shell 缩略图会卡死 HTTP 线程；详情走正文首段）
 
     - 视频等其它：交给前端用 /api/icon 显示系统大图标"""
 
@@ -11197,7 +13539,11 @@ def make_thumb(path, max_w=320, max_h=400):
 
         stamp = 'na'
 
-    k = os.path.normcase(path) + '|%s|%dx%d' % (stamp, max_w, max_h)
+    # 第 325 项：PDF 详情要能翻页、能把关键词在页面上标出来。
+    # 缓存键要带上页码与高亮词：只按尺寸缓存的话，翻到第 12 页拿到的还是首页。
+    _hl = [t.lower() for t in re.split(r'\s+', str(q or '').strip()) if t][:5]
+    k = os.path.normcase(path) + '|%s|%dx%d|p%d|%s' % (
+        stamp, max_w, max_h, int(page or 0), ','.join(_hl))
 
     with THUMB_LOCK:
 
@@ -11211,9 +13557,14 @@ def make_thumb(path, max_w=320, max_h=400):
 
             return None
 
-    disk = _thumb_disk_path(path, max_w, max_h)
+    # 第 326 项：磁盘缓存以前只存「首页、无高亮」—— 翻页 / 高亮图每次都要重渲染
+    # （40 篇详情图压力测试里，最慢那张 2.5 秒，平均 100ms）。缓存键带上页码和高亮词后，
+    # 每种变体都能落盘，翻回上一页就是读文件。
+    use_disk = True
 
-    hit = _thumb_from_disk(disk)
+    disk = _thumb_disk_path(path, max_w, max_h, page, _hl)
+
+    hit = _thumb_from_disk(disk) if use_disk else None
 
     if hit:
 
@@ -11265,7 +13616,9 @@ def make_thumb(path, max_w=320, max_h=400):
 
                 try:
 
-                    box['png'] = _shell_thumb_png(path)
+                    # 第 336 项：详情栏要「看得清」，别永远按 256 取缩略图 ——
+                    # 网格格子走默认 256，详情 big=1 要 640，展开 xl 要 960。
+                    box['png'] = _shell_thumb_png(path, size=_thumb_video_size(max_w))
 
                 except Exception:
 
@@ -11283,7 +13636,7 @@ def make_thumb(path, max_w=320, max_h=400):
 
         elif ext == '.pdf':
 
-            import pymupdf
+            import pdf_engine as pymupdf
 
             import io
 
@@ -11293,7 +13646,11 @@ def make_thumb(path, max_w=320, max_h=400):
 
                 if len(doc):
 
-                    page = doc[0]
+                    # 第 325 项：页码按 0 基传进来，越界一律夹到最后一页 ——
+                    # 前端翻到 999 页时宁可重复最后一页，也别回 204 让面板空掉。
+                    pg = max(0, min(int(page or 0), len(doc) - 1))
+
+                    page = doc[pg]
 
                     # 算缩放系数：原始页面宽 → max_w
 
@@ -11309,7 +13666,54 @@ def make_thumb(path, max_w=320, max_h=400):
 
                     with Image.frombytes('RGB' if pix.n < 4 else 'RGBA',
 
-                                         (pix.width, pix.height), pix.samples) as im:
+                                         (pix.width, pix.height), pix.samples) as im0:
+
+                        im = im0.convert('RGB')
+
+                        # 第 326 项：pixmap 的原始缓冲区（1600×2200 ≈ 10MB）用完立刻放掉，
+                        # 不然 40 张图连着请求时，内存峰值能到 576MB。
+                        pix = None
+
+                        # 第 325 项：把命中的词画成黄色高亮（gety 同款）。pymupdf 的
+                        # search_for 给的是 PDF 点坐标，乘上同一个缩放系数才落得准。
+                        # 只标前 5 个词、每词最多 60 处：一份 36 页的财报正文里
+                        # 「报告」能出现上千次，全画完既慢又糊成一片。
+                        if _hl:
+
+                            try:
+
+                                from PIL import ImageDraw
+
+                                overlay = Image.new('RGBA', im.size, (0, 0, 0, 0))
+
+                                dr = ImageDraw.Draw(overlay)
+
+                                marked = False
+
+                                for _t in _hl:
+
+                                    try:
+
+                                        rects = page.search_for(_t)
+                                    except Exception:
+
+                                        rects = []
+
+                                    for _r in rects[:60]:
+
+                                        dr.rectangle([_r.x0 * zw, _r.y0 * zw, _r.x1 * zw, _r.y1 * zw],
+
+                                                     fill=(255, 214, 0, 120))
+
+                                        marked = True
+
+                                if marked:
+
+                                    im = Image.alpha_composite(im.convert('RGBA'), overlay).convert('RGB')
+
+                            except Exception:
+
+                                pass
 
                         im.thumbnail((max_w, max_h))
 
@@ -11335,7 +13739,9 @@ def make_thumb(path, max_w=320, max_h=400):
 
             THUMB_FAIL.pop(k, None)
 
-        _thumb_to_disk(disk, png)
+        if use_disk:
+
+            _thumb_to_disk(disk, png)
 
     else:
 
@@ -11405,6 +13811,152 @@ def allow_open(paths, replace=False):
 
 
 
+def _qs_items():
+
+    """第 194 项：快搜窗「当前打开的文件夹」的数据源。
+
+    先列资源管理器正在看的目录（智能推荐），再用最近打开过的目录补位。
+
+    不扫描磁盘、不读浏览器历史，拿不到就返回空列表。"""
+
+    items, seen = [], set()
+
+    try:
+
+        folders = quick_switch.open_folders()
+
+    except Exception:
+
+        folders = []
+
+    for p in folders:
+
+        k = os.path.normcase(p)
+
+        if k in seen:
+
+            continue
+
+        seen.add(k)
+
+        items.append({'p': p, 'n': os.path.basename(p.rstrip('\\/')) or p, 'k': 'open'})
+
+    try:
+
+        with con_lock:
+
+            rows = recent_rows(conn(), 8)
+
+    except Exception:
+
+        rows = []
+
+    for r in rows:
+
+        if r.get('t') != 'dir':
+
+            continue
+
+        p = str(r.get('p') or '')
+
+        k = os.path.normcase(p)
+
+        if not p or k in seen:
+
+            continue
+
+        seen.add(k)
+
+        if not os.path.isdir(p):
+
+            continue          # 目录都删了就别再推荐（第 199 项顺手补的）
+
+        items.append({'p': p, 'n': r.get('n') or os.path.basename(p) or p, 'k': 'recent'})
+
+        if len(items) >= 7:
+
+            break
+
+    return items
+
+
+
+
+
+def _api_open_dirs():
+
+    """GET /api/open_dirs：候选目录 + 当前有没有可用的文件对话框。"""
+
+    items = _qs_items()
+
+    try:
+
+        allow_open([x['p'] for x in items])
+
+    except Exception:
+
+        pass
+
+    pr = quick_switch.probe()
+
+    return {'items': items, 'dialog': bool(pr.get('dialog')),
+
+            'title': pr.get('title', ''), 'probe': pr.get('ok', False)}
+
+
+
+
+
+def _api_dialog_jump(req):
+
+    """POST /api/dialog_jump：把目录送进正在使用的打开/保存对话框。
+
+    白名单：目录必须存在，且是「当前打开的文件夹 / 最近打开目录 / 刚搜出来的结果」。
+
+    绝不接受页面随手拼的一个路径。"""
+
+    p = str(req.get('p') or '')
+
+    target = quick_switch.jump_target(p)
+
+    if not target:
+
+        return {'ok': False, 'reason': 'bad_path'}
+
+    allow = set()
+
+    try:
+
+        allow = {os.path.normcase(x['p']) for x in _qs_items()}
+
+    except Exception:
+
+        allow = set()
+
+    if (os.path.normcase(target) not in allow
+
+            and not ev_recent(p) and not ev_recent(target)):
+
+        return {'ok': False, 'reason': 'not_allowed'}
+
+    r = quick_switch.jump(target)
+
+    if r.get('ok'):
+
+        # 第 196 项：跳成功就记一次「最近访问」，下次推荐自动把它排前面。
+
+        try:
+
+            with con_lock:
+
+                record_open(conn(), target, True)
+
+        except Exception:
+
+            pass
+
+    return r
+
 def ev_recent(p):
 
     """这个路径是不是刚搜出来的（决定能不能点「打开」）"""
@@ -11450,6 +14002,15 @@ PRUNE_BULK_RATIO = 0.5
 # 单个索引范围里的失踪率阈值（防止「范围根还在、子目录整块搬走」被静默清掉）
 
 PRUNE_SCOPE_MIN = 30         # 相对上限：一次消失超过库内一半，不可能是人删的
+
+# 第 236 项「范围对账」的保护阈值。和上面两个故意不同：改一次排除规则后，
+# 一次清掉四成条目本来就是预期结果（实测 AppData 就占 31%），
+# 用 50 条当上限会让这个功能永远不敢动。而且对账只删索引记录、不动文件，
+# 最坏情况是重建一次索引，所以比例闸放在 60%，只挡「规则写反了」这种灾难。
+
+RECONCILE_BULK_LIMIT = 180000
+
+RECONCILE_RATIO = 0.6
 
 
 
@@ -11833,6 +14394,41 @@ def _settings_path():
 
 
 
+def snip_translate(text, tgt_lang='auto'):
+    """第 361 项：截图翻译。把 OCR 文本送 translator 翻一遍，取首选结果。
+
+    只在服务端串一次（取字 → 段落无意义、这里已经是整段文本 → 翻译），
+    前端拿到 {'ok','src','text','tgt_lang'} 就能切原文/译文。
+    翻译一定出网（走用户勾选的引擎），取字仍在本机 RapidOCR。
+    """
+    text = str(text or '').strip()
+    if not text:
+        try:
+            import snip_ocr
+            text = str(snip_ocr.get_snip_result().get('text') or '').strip()
+        except Exception:
+            text = ''
+    if not text:
+        return {'ok': False, 'src': '', 'text': '', 'why': 'empty', 'results': []}
+    try:
+        import translator
+        res = translator.translate_text(text, src_lang='auto',
+                                        tgt_lang=(tgt_lang or 'auto'))
+    except Exception as e:
+        return {'ok': False, 'src': text, 'text': '', 'why': str(e)[:120], 'results': []}
+
+    best, eng = '', ''
+    for r in (res.get('results') or []):
+        t = (r.get('text') or '').strip() if isinstance(r, dict) else ''
+        if t:
+            best, eng = t, (r.get('engine') or '')
+            break
+    return {'ok': bool(best), 'src': text, 'text': best, 'engine': eng,
+            'src_lang': res.get('src_lang'), 'tgt_lang': res.get('tgt_lang'),
+            'why': '' if best else 'noresult',
+            'results': (res.get('results') or [])[:4]}
+
+
 def _settings_read():
 
     """带锁读配置。文件损坏 / 不是对象时先备份成 .bad-* 再返回空 dict，
@@ -11898,6 +14494,50 @@ def _settings_read():
 PALETTE_IDS = ('auto', 'light', 'dark', 'paper', 'amber', 'pure', 'mint', 'blue',
 
                'lilac', 'sakura', 'graphite', 'night', 'contrast', 'black', 'cyber')
+
+# 网页把「整套配色」报上来（第 369 项）：原生窗口（截图翻译卡片等）直接用这份**具体值**，
+# 不必再拿 id 去反查 —— 用户自定义变量、auto 跟随系统深浅，光有 id 都表达不出来。
+_PALETTE_VAR_KEYS = ('bg', 'card', 'ink', 'sub', 'line', 'accent')
+
+def _clean_palette_vars(raw):
+
+    """只收 6 个键的 "r g b" 三元组；缺键、多值、越界一律整包拒掉（宁可不写，也别写脏）。"""
+
+    if not isinstance(raw, dict):
+
+        return None
+
+    out = {}
+
+    for k in _PALETTE_VAR_KEYS:
+
+        v = raw.get(k)
+
+        if not isinstance(v, str):
+
+            return None
+
+        parts = v.replace(',', ' ').split()
+
+        if len(parts) != 3:
+
+            return None
+
+        try:
+
+            nums = [int(p) for p in parts]
+
+        except (TypeError, ValueError):
+
+            return None
+
+        if any(n < 0 or n > 255 for n in nums):
+
+            return None
+
+        out[k] = '%d %d %d' % (nums[0], nums[1], nums[2])
+
+    return out
 
 # 壁纸只认这几种位图：故意不收 svg（能带脚本）、不收 ico（多尺寸糊成一团）
 
@@ -11972,6 +14612,15 @@ def _wall_state():
           'opacity': _wall_int(d.get('wall_opacity', 15), 5, 100, 15),
 
           'blur': _wall_int(d.get('wall_blur', 0), 0, 30, 0),
+          # 第 362 项：人像被 cover 裁掉脑袋 —— 焦点可拖、可放大。
+          # 位置用百分比（50/50 = 居中），与 CSS object-position 同一套语义。
+          'pos_x': _wall_int(d.get('wall_pos_x', 50), 0, 100, 50),
+          'pos_y': _wall_int(d.get('wall_pos_y', 50), 0, 100, 50),
+          'zoom': _wall_int(d.get('wall_zoom', 100), 100, 200, 100),
+          # 生效范围：哪几个界面铺壁纸。默认全开 = 老行为不变。
+          'scope_main': bool(d.get('wall_scope_main', True)),
+          'scope_settings': bool(d.get('wall_scope_settings', True)),
+          'scope_mini': bool(d.get('wall_scope_mini', True)),
 
           'v': 0}
 
@@ -12088,6 +14737,17 @@ def _wall_apply(req):
         if 'blur' in req:
 
             patch['wall_blur'] = _wall_int(req.get('blur'), 0, 30, 0)
+        if 'pos_x' in req:
+            patch['wall_pos_x'] = _wall_int(req.get('pos_x'), 0, 100, 50)
+        if 'pos_y' in req:
+            patch['wall_pos_y'] = _wall_int(req.get('pos_y'), 0, 100, 50)
+        if 'zoom' in req:
+            patch['wall_zoom'] = _wall_int(req.get('zoom'), 100, 200, 100)
+        for _k, _key in (('scope_main', 'wall_scope_main'),
+                         ('scope_settings', 'wall_scope_settings'),
+                         ('scope_mini', 'wall_scope_mini')):
+            if _k in req:
+                patch[_key] = bool(req.get(_k))
 
         if patch:
 
@@ -12608,6 +15268,94 @@ def safe_scope_list(targets, allow_unc=False):
     return out or None
 
 
+
+
+
+def is_net_path(p):
+
+    """是不是网络位置（UNC `\\主机\共享\…` 或 `//主机/共享`）。
+
+    第 294 项：网络位置单列一类 —— 可达性会抖、监听不可靠、SMB 协商还会带出凭据。
+    """
+
+    s = str(p or '').strip()
+
+    # `\\?\` / `\\.\` 是 Windows 扩展长度/设备命名空间下的**本地**路径，不是共享
+    if s.startswith('\\\\?\\') or s.startswith('\\\\.\\'):
+
+        return False
+
+    return s.startswith('\\\\') or s.startswith('//')
+
+
+
+def scope_net_blocked(dirs, old_dirs=None):
+
+    """这批待保存的目录里含网络位置、而本机没有 net_index 位 → 该拒绝。
+
+    第 294 项：抽成函数只为可测 —— /api/config 只负责把 k=e_net_pro 交给界面。
+    """
+
+    def _norm(x):
+
+        return os.path.normcase(os.path.normpath(str(x).strip()))
+
+    old = {_norm(d) for d in (old_dirs or [])}
+
+    new = [d for d in (dirs or []) if is_net_path(d) and _norm(d) not in old]
+
+    if not new:
+
+        return False
+
+    return not license_feature('net_index')
+
+
+
+def _path_alive(p, timeout=3.0):
+
+    """目录可达性探测；网络路径放后台线程里等，超时即判不可达。
+
+    为什么必须带超时：NAS 关机/断网时 os.path.isdir('\\\\nas\\share') 会走整套 SMB
+    协商超时（几十秒到几分钟），一轮索引里只要有一条这样的路径，用户看到的就是
+    「更新一直卡在智能扫描」。本地路径不额外开线程，直接查。
+    """
+
+    p = str(p or '').strip()
+
+    if not p:
+
+        return False
+
+    if not is_net_path(p):
+
+        try:
+
+            return os.path.isdir(p)
+
+        except OSError:
+
+            return False
+
+    box = {}
+
+    def _probe():
+
+        try:
+
+            box['ok'] = os.path.isdir(p)
+
+        except Exception:
+
+            box['ok'] = False
+
+    t = threading.Thread(target=_probe, daemon=True)
+
+    t.start()
+
+    t.join(timeout)
+
+    return bool(box.get('ok'))
 
 
 
@@ -13340,6 +16088,310 @@ def _mark_gone(path):
             GONE_SEEN.add(k)
 
 
+def path_alive(p):
+    """单个路径是否还活着（虚拟应用入口按活算，挪到 _mark_gone 旁边统一用）。"""
+
+    if not p:
+
+        return False
+
+    try:
+
+        return bool(os.path.exists(p) or app_entries.is_shell_app_path(p))
+
+    except Exception:
+
+        return True
+
+
+def filter_alive(items, budget=0.9, workers=8):
+    """第 323 项：列表里的路径挨个验活，死行直接不返回。
+
+    为什么要有：`mini_search` 只验「搜索命中」的那几十条，**浏览最近文件 / 纯语法筛选
+    （ext:pdf 这类）** 两条路原来一条都不验 —— 删掉的图片还挂在列表里，用户点它
+    打不开，看着就是「实时检查没做」。
+
+    为什么限时：`os.stat` 碰上掉线的网络盘 / 云盘会卡好几秒，一次 200 条能卡几分钟。
+    这里丢进程池里并发验，**最多等 budget 秒**；超时没回来的按「活着」处理（宁可多留
+    一条，也不能把好文件误删）。"""
+    if not items:
+
+        return items
+
+    from concurrent.futures import ThreadPoolExecutor, wait as _wait
+
+    paths = [str(it.get('p') or '') for it in items]
+
+    alive = [True] * len(paths)
+
+    pending = [i for i, p in enumerate(paths) if p]
+
+    if not pending:
+
+        return items
+
+    ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='alive')
+
+    try:
+
+        futs = {ex.submit(path_alive, paths[i]): i for i in pending}
+
+        done, not_done = _wait(list(futs), timeout=budget)
+
+        gone = []
+
+        for f in done:
+
+            i = futs[f]
+
+            try:
+
+                alive[i] = bool(f.result())
+
+            except Exception:
+
+                alive[i] = True
+
+            if not alive[i]:
+
+                gone.append(paths[i])
+
+        for p in gone:
+
+            _mark_gone(p)
+
+        if not_done:
+
+            _log_file('alive check: %d 条超时未验（按存在处理）' % len(not_done))
+
+    except Exception as e:
+
+        _log_file('alive check FAILED: %r' % (e,))
+
+        return items
+
+    finally:
+
+        ex.shutdown(wait=False)
+
+    return [it for i, it in enumerate(items) if alive[i]]
+
+
+def _reconcile_gone(batch=400, workers=8, pause=0.15):
+    """第 323 项：后台把库里已经不存在的路径清掉（一次一小批，跑完就歇）。
+
+    这是「实时检查」的兜底：ReadDirectoryChangesW 漏事件、盘符变了、索引范围被挪走，
+    都会让 files 表留下死路径。这里按批验活，死行从库里删掉，列表自然就干净了。
+
+    三道保护（和 prune 一个口径）：
+    ① 整盘不可达 → 那批整体跳过，不删（拔了移动硬盘不等于文件被删）；
+    ② 一批里死得多（>20%）→ 隔 0.3 秒**二次确认**，两次都死的才删（不是整轮放弃）；
+    ③ 全量任务在跑时整体让路。"""
+    try:
+
+        con = sqlite3.connect(DB, check_same_thread=False)
+
+        con.execute('PRAGMA busy_timeout=3000')
+
+    except Exception as e:
+
+        _log_file('gone reconcile: open FAILED %r' % (e,))
+
+        return 0
+
+    checked = deleted = skipped = 0
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='reconcile')
+
+    try:
+
+        rows = [r[0] for r in con.execute('SELECT path FROM files')]
+
+        for i in range(0, len(rows), batch):
+
+            if _job_busy():
+
+                break
+
+            chunk = rows[i:i + batch]
+
+            roots = {}
+
+            for p in chunk:
+
+                root = os.path.splitdrive(p)[0] + '\\'
+
+                if root not in roots:
+
+                    try:
+
+                        roots[root] = os.path.exists(root)
+
+                    except Exception:
+
+                        roots[root] = False
+
+            cand = [p for p in chunk if roots.get(os.path.splitdrive(p)[0] + '\\', True)]
+
+            skipped += len(chunk) - len(cand)
+
+            if not cand:
+
+                continue
+
+            futs = {ex.submit(path_alive, p): p for p in cand}
+
+            dead = []
+
+            for f, p in futs.items():
+
+                try:
+
+                    if not f.result():
+
+                        dead.append(p)
+
+                except Exception:
+
+                    pass
+
+            checked += len(cand)
+
+            # 第 323 项 A：一批里死的太多不再「整体放弃」。
+            # 原来的写法是一批死 >20% 就跳出循环 —— 12:12 实测第一轮就撞上
+            # 「132/400」，整轮只清了 122 条就停了，用户看到的就是「死行还在」。
+            # 死得多往往只是某个临时目录被整棵删掉（微信缓存、Temp），完全正常。
+            # 现在改成**二次确认**：死得多的批次隔 0.3 秒再验一遍，两次都死的才删。
+            # 真正「盘拔了」的情况由上面的整盘不可达判定挡住，不靠这个比例。
+            if dead and len(dead) > 50 and len(dead) > len(cand) * 0.2:
+
+                time.sleep(0.3)
+
+                again = []
+
+                for p in dead:
+
+                    try:
+
+                        if not path_alive(p):
+
+                            again.append(p)
+
+                    except Exception:
+
+                        pass
+
+                if len(again) != len(dead):
+
+                    _log_file('gone reconcile: %d 条疑似失效，二次确认后剩 %d'
+                              % (len(dead), len(again)))
+
+                dead = again
+
+            if dead:
+
+                try:
+
+                    with db_lock('gone:del', 10.0):
+
+                        con.executemany('DELETE FROM files WHERE path=?', [(p,) for p in dead])
+
+                        con.commit()
+
+                    deleted += len(dead)
+
+                except LockBusy:
+
+                    break
+
+                except sqlite3.Error as e:
+
+                    _log_file('gone reconcile: delete FAILED %r' % (e,))
+
+                    break
+
+            time.sleep(pause)
+
+    except Exception as e:
+
+        _log_file('gone reconcile FAILED: %r' % (e,))
+
+    finally:
+
+        ex.shutdown(wait=False)
+
+        try:
+
+            con.close()
+
+        except Exception:
+
+            pass
+
+    # 第 323 项：这行**无条件**记（哪怕一条没删）。不然「线程到底跑没跑」
+    # 只能靠猜 —— 12:1x 那次就是 deleted=0 所以什么都没写。
+    _log_file('gone reconcile: checked %d / deleted %d / root-unreachable %d%s'
+              % (checked, deleted, skipped, '（有全量任务在跑，提前让路）' if _job_busy() else ''))
+
+    return deleted
+
+
+def _gone_reconcile_loop():
+    """启动后先扫一遍（别和启动路径抢盘），之后每 30 分钟一次。
+
+    如果启动后那几分钟正有全量任务在跑，就每 60 秒再看一眼，最多让路 3 次。"""
+
+    try:
+
+        time.sleep(40)
+
+    except Exception:
+
+        pass
+
+    for _ in range(3):
+
+        try:
+
+            if not _job_busy():
+
+                break
+
+        except Exception:
+
+            break
+
+        try:
+
+            time.sleep(60)
+
+        except Exception:
+
+            return
+
+    while True:
+
+        try:
+
+            _reconcile_gone()
+
+        except Exception as e:
+
+            _log_file('gone reconcile loop FAILED: %r' % (e,))
+
+        try:
+
+            time.sleep(1800)
+
+        except Exception:
+
+            return
+
+
+
+
 
 def prune(force=False, scope_path=None):
 
@@ -13545,13 +16597,46 @@ def prune(force=False, scope_path=None):
 
             return 0
 
-    rids = _doc_rids(con)
+    # 注意：_doc_rids 返回的是「原始大小写 path → rowid」，而 _doc_del 是按
+    # normcase(path) 去查的。不在这里换算就会永远错过快路径，掉进
+    # `WHERE lower(path)=lower(?)` 的 FTS 全表扫 —— 实测 1,400 条从 7 分钟变成 20 分钟
+    # 还没跑完（「第二大脑」那批旧正文一直留着，一半是这个原因）。
+
+    rids = {os.path.normcase(k): v for k, v in _doc_rids(con).items()}
+
+    # 先批量删正文、再批量删 meta。
+    # 为什么不用 _doc_del 逐条删：它每篇一条 `DELETE FROM docs WHERE rowid=?`，
+    # 而 FTS5 的 trigram 索引删除要重新读正文、重新分词，单独提交时实测 1.3 秒/条
+    # （1,400 条 = 半小时），批量 IN 只要 0.29 秒/条。两者删的东西完全一样
+    # （docs 行 + bigram 倒排），所以这里是 _doc_del 的批量版，语义不变。
+
+    gone_rids = []
 
     for p in gone:
 
         con.execute('DELETE FROM meta WHERE path=?', (p,))
 
-        _doc_del(con, rids, p)
+        r = rids.pop(os.path.normcase(p), None)
+
+        if r is not None:
+
+            gone_rids.append(r)
+
+    for i in range(0, len(gone_rids), 200):
+
+        chunk = gone_rids[i:i + 200]
+
+        q = ','.join('?' * len(chunk))
+
+        con.execute('DELETE FROM bigram WHERE rid IN (%s)' % q, chunk)
+
+        con.execute('DELETE FROM docs WHERE rowid IN (%s)' % q, chunk)
+        if doc_mode(con) == 'v2':
+            con.execute('DELETE FROM doc_rec WHERE id IN (%s)' % q, chunk)
+
+        con.commit()
+
+        print(f'  ...清理失效条目 {min(i + 200, len(gone_rids))}/{len(gone_rids)}', flush=True)
 
     con.commit()
 
@@ -13569,6 +16654,217 @@ def prune(force=False, scope_path=None):
 
     return len(gone)
 
+
+
+def reconcile_scope(dry=False, force=False, scope_path=None):
+
+    """第 236 项：按「当前规则」对账，删掉库里不该再被索引的条目。
+
+    为什么需要它：全量重建（build_files_index）是原子换表，天然干净；但用户平时点的是
+    「更新」，走的是增量 —— 增量只在收到文件系统事件时才判断一条路径，而一个目录被
+    排除、或被移出索引范围之后，它连事件都不会再产生，旧记录就永远留在库里。
+    实测：正文清单里 220 条指向改名前的旧目录（磁盘上一条都不存在），
+    文件名层还有一批落在 AppData / 安装目录里的资源文件。
+
+    它和 prune() 是两件事，别混：
+      · prune   = 「文件还在不在」（文件被删/被搬走）
+      · 本函数  = 「按现在的规则还该不该索引」（规则变了、范围变了）
+
+    返回 (文件名条目数, 目录条目数, 正文条目数)；dry=True 只统计不动库。"""
+
+    con = init_db()
+
+    exckw = _scope_excludes(scope_path)
+
+    conf = _scope_conf(scope_path)
+
+    inc = tuple(os.path.normcase(os.path.normpath(str(d)))
+
+                for d in (conf.get('include_dirs') or []) if str(d).strip())
+
+    # 程序自己的目录（数据库/清单/打包产物/备份）在循环外算一次
+
+    self_base = os.path.normcase(str(app_dir())).rstrip(chr(92) + '/')
+
+    def _drop_file(p, ext):
+
+        # 第 246 项：虚拟应用入口不是磁盘路径，对账不能按文件系统规则清掉它。
+        if app_entries.is_shell_app_path(p):
+            return False
+
+        # 注意：这里不调 _is_self_noise() —— 它内部每次都算一遍 app_dir()，
+        # 30 万条路径就是 30 万次路径解析，实测把对账拖到 12 分钟还没跑完。
+        # 下面把根目录在循环外算好，判定逻辑与 _is_self_noise 完全一致。
+
+        q = os.path.normcase(str(p))
+
+        if q.startswith(self_base):
+
+            rel = q[len(self_base):].lstrip(chr(92) + '/')
+
+            if rel and (rel.split(chr(92))[0].split('/')[0] in _SELF_DIRS
+
+                        or rel.split(chr(92))[-1].split('/')[-1] in _SELF_NAMES):
+
+                return True
+
+        if _excluded(p, exckw):
+
+            return True
+
+        if scan_docs.is_install_root(p) and ext not in scan_docs.APP_ONLY_EXTS:
+
+            return True
+
+        if _soft_dir_file(p, ext):
+
+            return True
+
+        # 第 243 项：短音频 / 音乐平台目录 / 不索引标记文件。
+        # 对账必须与全量扫描同一套判据，否则「重建时干净了、用两天又长回来」。
+        if _media_noise_file(p, ext):
+
+            return True
+
+        if _noindex_marked(p):
+
+            return True
+
+        return False
+
+    def _drop_doc(p):
+
+        pl = os.path.normcase(p)
+
+        if _drop_file(p, os.path.splitext(p)[1].lower()):
+
+            return True
+
+        if any(s in pl for s in _BODY_SKIP_SEGS_NC):
+
+            return True
+
+        # 正文是按 include 白名单索引的，不在任何一个范围里的条目 = 移出范围没清
+
+        if inc and not any(pl.startswith(d) for d in inc):
+
+            return True
+
+        return False
+
+    files_drop = [p for p, e in con.execute('SELECT path, ext FROM files')
+
+                  if _drop_file(p, (e or '').lower())]
+
+    dirs_drop = [p for (p,) in con.execute('SELECT path FROM dirs')
+
+                 if _drop_file(p, '')]
+
+    meta_drop = [p for (p,) in con.execute('SELECT path FROM meta') if _drop_doc(p)]
+
+    n_files = con.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+
+    print(f'[对账] 文件名 {len(files_drop)}/{n_files} 条、目录 {len(dirs_drop)} 条、'
+          f'正文 {len(meta_drop)} 条 按当前规则不该在库里', flush=True)
+
+    if dry:
+
+        return (len(files_drop), len(dirs_drop), len(meta_drop))
+
+    # 保护：规则写错（比如把某个盘整个误判成排除）时，一次删太多 —— 停下，不删。
+    # 注意阈值不能照抄 prune 的 50 条：改规则后一次清几万条本来就是预期的。
+
+    if not force and len(files_drop) > max(RECONCILE_BULK_LIMIT,
+
+                                           int(n_files * RECONCILE_RATIO)):
+
+        # 注意：这里**不能**把 PROG 置成 error —— 对账是 update 流程的收尾步骤，
+        # 置 error 会把整次「更新」标成失败，用户看到的是「更新出错」而不是
+        # 「有一批旧条目没敢清」。只用进度文案提示，流程照常往下走。
+
+        msg = (f'按当前规则这次要清掉 {len(files_drop)} 条文件名（库内共 {n_files} 条），'
+               f'超过安全比例，这次没清。请确认索引范围与排除规则没写错，'
+               f'再从命令行跑一次对账（加 --force）。')
+
+        print('[!] ' + msg, flush=True)
+
+        _prog(msg=msg)
+
+        return 0
+
+    # 正文要直接判 docs 表，不能只认 meta：meta 可能已经被上一轮清过（用户点了更新 /
+    # 中途中断），那时 meta 里已经没有这条路径，再靠它去定位就永远删不掉正文行。
+    # _doc_rids 返回的键是原始写法（不是 normcase），所以用 path 精确取。
+
+    docs_drop = [p for (p,) in con.execute('SELECT path FROM docs') if _drop_doc(p)]
+
+    rids = {os.path.normcase(k): v for k, v in _doc_rids(con).items()}
+
+    drop_rids, seen_rid = [], set()
+
+    for p in docs_drop + meta_drop:
+
+        r = rids.get(os.path.normcase(p))
+
+        if r is not None and r not in seen_rid:
+
+            seen_rid.add(r)
+
+            drop_rids.append(r)
+
+    # 批量删，不逐条调 _doc_del：后者每篇都要 DELETE FROM bigram WHERE rid=?，
+    # 而 bigram 的主键是 (gram, rid)，没有 rid 索引时每次都是 490 万行全表扫 ——
+    # 实测一万篇直接跑过 12 分钟。这里按 rid 分批 IN 删除，几秒结束。
+
+    for i in range(0, len(drop_rids), 200):
+
+        chunk = drop_rids[i:i + 200]
+
+        q = ','.join('?' * len(chunk))
+
+        con.execute('DELETE FROM bigram WHERE rid IN (%s)' % q, chunk)
+
+        con.execute('DELETE FROM docs WHERE rowid IN (%s)' % q, chunk)
+        if doc_mode(con) == 'v2':
+            con.execute('DELETE FROM doc_rec WHERE id IN (%s)' % q, chunk)
+
+        con.commit()
+
+        print('  ...正文 %d/%d' % (min(i + 200, len(drop_rids)), len(drop_rids)), flush=True)
+
+    if meta_drop:
+
+        con.executemany('DELETE FROM meta WHERE path=?', [(p,) for p in meta_drop])
+
+    # 分批提交：一次性删 12 万条会把 WAL 顶到几百 MB 且中途无法 checkpoint，
+    # 分批后每 2000 条落一次，进度可见、崩了也不至于全回滚。
+
+    for i in range(0, len(files_drop), 2000):
+
+        chunk = [(p,) for p in files_drop[i:i + 2000]]
+
+        con.executemany('DELETE FROM files WHERE path=?', chunk)
+
+        con.executemany('DELETE FROM appdesc WHERE path=?', chunk)
+
+        con.commit()
+
+        print('  ...文件名 %d/%d' % (min(i + 2000, len(files_drop)), len(files_drop)), flush=True)
+
+    for i in range(0, len(dirs_drop), 2000):
+
+        con.executemany('DELETE FROM dirs WHERE path=?',
+
+                        [(p,) for p in dirs_drop[i:i + 2000]])
+
+        con.commit()
+
+    con.commit()
+
+    print(f'[对账] 已清理：文件名 {len(files_drop)} 条、目录 {len(dirs_drop)} 条、'
+          f'正文 {len(meta_drop)} 条', flush=True)
+
+    return (len(files_drop), len(dirs_drop), len(meta_drop))
 
 
 def _refresh_names_from_csv(scope_path=None):
@@ -14051,6 +17347,20 @@ def update(targets=None, scope_path=None):
 
         prune()
 
+        # 第 236 项：范围对账。prune 只管「文件还在不在」，这里管「按现在的规则
+        # 还该不该索引」—— 一个目录被排除、或被移出索引范围之后，它连文件系统
+        # 事件都不会再产生，旧记录只靠 prune 永远清不掉。
+
+        _prog(phase='prune', msg='按当前规则对账')
+
+        try:
+
+            reconcile_scope()
+
+        except Exception as _e:
+
+            print('[!] 范围对账没跑完（不影响本次更新的其他部分）：', _e, flush=True)
+
         # prune 踩到"一次删太多"的刹车时会把状态置成 error 并把原因写进 err，
 
         # 这里不能再盖一句"更新完成"——否则用户只看到成功，不知道一条都没清。
@@ -14099,6 +17409,16 @@ def update(targets=None, scope_path=None):
 
         db_reclaim()         # 清理掉一批文件后把空洞还回磁盘
 
+        try:
+
+            if metrics is not None:
+
+                metrics.add('index', 'ok', sub='update')
+
+        except Exception:
+
+            pass
+
         _prog(state='done', phase='', msg='更新完成', k='m_update_done', need_names=_need)
 
     except (Exception, SystemExit) as e:
@@ -14116,6 +17436,243 @@ def update(targets=None, scope_path=None):
 _con = None
 
 con_lock = threading.RLock()
+
+
+class LockBusy(Exception):
+
+    """等 con_lock 太久：有长任务（重扫 / 校验 / 清理）把库占住了。
+
+    第 320 项：以前 HTTP 线程就在这儿一直等，一个卡住的长任务能把整个界面
+    拖到 90 秒以上全无响应（11-19 10:5x 实测：所有 /api 超时，只有不走这把
+    锁的 /api/ping 还是毫秒级）。现在等锁超过 timeout 就放弃，接口快点回
+    「索引在忙」，同时把现场写一行 debug.log —— 先留证据，再谈根治。"""
+
+
+class _DbLock(object):
+
+    """带超时与慢日志的 con_lock。用法：with db_lock('/api/files', 20): ..."""
+
+    __slots__ = ('where', 'timeout', 't0')
+
+    def __init__(self, where='', timeout=20.0):
+
+        self.where = where
+
+        self.timeout = timeout
+
+        self.t0 = 0.0
+
+    def __enter__(self):
+
+        self.t0 = time.time()
+
+        if not con_lock.acquire(timeout=self.timeout):
+
+            try:
+
+                _log_file('DB_LOCK_BUSY %s 等锁超过 %.0fs（有长任务占着库）'
+                          % (self.where, self.timeout))
+
+            except Exception:
+
+                pass
+
+            raise LockBusy(self.where)
+
+        waited = time.time() - self.t0
+
+        if waited > 3:
+
+            try:
+
+                _log_file('DB_LOCK_SLOW %s 等锁 %.1fs' % (self.where, waited))
+
+            except Exception:
+
+                pass
+
+        return self
+
+    def __exit__(self, *a):
+
+        con_lock.release()
+
+        return False
+
+
+def db_lock(where='', timeout=20.0):
+
+    return _DbLock(where, timeout)
+
+
+def _dump_thread_stacks(reason=''):
+
+    """把当前所有线程的调用栈写进 debug.log。
+
+    第 321 项：光知道「锁被占住」不够，要知道**被谁**占住。CPython 的 RLock
+    不给看 owner，所以整份栈都打出来 —— 正在等锁的那几个线程栈里一定有
+    `acquire`，剩下不等的那个就是攥着锁不放的人。"""
+
+    try:
+
+        import sys as _sys
+
+        import traceback
+
+        frames = _sys._current_frames()
+
+        names = {t.ident: t.name for t in threading.enumerate()}
+
+        out = ['=== THREAD DUMP %s (%d threads) ===' % (reason, len(frames))]
+
+        for tid, fr in frames.items():
+
+            out.append('--- %s tid=%s' % (names.get(tid, '?'), tid))
+
+            out.append(''.join(traceback.format_stack(fr, limit=8)).rstrip())
+
+        _log_file('\n'.join(out))
+
+    except Exception:
+
+        pass
+
+
+def wal_tidy_once(min_bytes=8 * 1024 * 1024):
+    """收一次 WAL。返回 (before, after)；出错返回 (-1, -1)。抽出来是为了能单测。"""
+    import sqlite3
+
+    p = Path(DB)
+    wal = Path(str(p) + '-wal')
+    if not wal.exists():
+        return 0, 0
+    before = wal.stat().st_size
+    if before <= min_bytes:
+        return before, before
+    c = sqlite3.connect(DB, timeout=3)
+    try:
+        c.execute('PRAGMA busy_timeout=3000')
+        busy, _log_pages, _done = c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+    finally:
+        c.close()
+    if busy:
+        return before, before
+    after = wal.stat().st_size if wal.exists() else 0
+    return before, after
+
+
+def _wal_keeper_loop():
+    """体积评估 #1：常驻期间每隔一分钟收一次 WAL。
+
+    文档承诺「WAL 超过 8 MB 自动收」，但 autocheckpoint 只把已提交的帧并回主库，
+    **不会缩小 wal 文件**；而 journal_size_limit 只在「真的发生一次 checkpoint」时
+    才生效。长会话里索引/监听不断写，读者不断档，截断机会就一直没等到，
+    文件停在最高水位（实测 60.9 MB）。这里定时主动 TRUNCATE：
+
+    - busy_timeout 给 3 秒，抢不到就跳过这一轮（有长读事务时本来也不该硬截）；
+    - 只在自己新开一条连接上做，不碰 HTTP 层那条共享连接，不会卡搜索；
+    - 小于 8 MB 就不动，省掉无意义的 syscall。
+    """
+    while True:
+        time.sleep(60)
+        try:
+            before, after = wal_tidy_once()
+            if before - after > 1024 * 1024:
+                _log_file('wal keeper: %.1f MB → %.1f MB'
+                          % (before / 1048576, after / 1048576))
+        except Exception as e:
+            _log_file('wal keeper FAILED: %r' % (e,))
+            time.sleep(240)   # 出错就退到 5 分钟一轮，别刷日志
+
+
+def _lock_watchdog():
+
+    """第 321 项：每 1 秒试一下 con_lock；连续 20 秒拿不到就打一份线程栈（4 分钟一次）。
+
+    11-19 11:2x 实测：所有 /api 都 `DB_LOCK_BUSY`，可没人知道是谁攥着锁。
+    这次加个看门狗，把现场抓下来。
+
+    第 327 项：顺手看住「共享连接挂着没提交的事务」。这条比拿不到锁更阴：
+    读接口全正常，只有写库全报 database is locked（实时监听丢事件、bigram 回填失败），
+    用户能感觉到的就是「用着用着突然很卡」。挂了超过 30 秒就直接回滚自愈。
+    """
+
+    streak = 0.0
+
+    last = 0.0
+
+    tx_stuck = 0.0
+
+    while True:
+
+        try:
+
+            time.sleep(1.0)
+
+            # ---- 共享连接的事务泄漏（第 327 项）----
+            # 只在「拿得到 con_lock」时才动手：拿得到说明没人在写批，这条事务是
+            # 孤儿（忘 commit 留下的），回滚安全；拿不到就别碰别人的活。
+            try:
+
+                c = _con
+
+                if c is not None and c.in_transaction:
+
+                    tx_stuck += 1.0
+
+                    if tx_stuck >= 30 and con_lock.acquire(timeout=0.05):
+
+                        try:
+
+                            _log_file('con 事务泄漏 %.0fs，回滚自愈' % tx_stuck)
+
+                            try:
+
+                                c.rollback()
+
+                            except sqlite3.Error as e:
+
+                                _log_file('rollback 失败：%r' % (e,))
+
+                        finally:
+
+                            con_lock.release()
+
+                        tx_stuck = 0.0
+
+                else:
+
+                    tx_stuck = 0.0
+
+            except Exception:
+
+                tx_stuck = 0.0
+
+            if con_lock.acquire(timeout=0.05):
+
+                con_lock.release()
+
+                streak = 0.0
+
+                continue
+
+            streak += 1.0
+
+            now = time.time()
+
+            if streak >= 20 and now - last >= 240:
+
+                last = now
+
+                # 第 366 项：整理索引库本来就独占写锁几十秒，别把它当卡死刷栈。
+                if COMPACT.get('state') != 'busy':
+
+                    _dump_thread_stacks('con_lock 被占 %.0fs' % streak)
+
+        except Exception:
+
+            time.sleep(1.0)
+
 
 _boot_lib_paths()
 
@@ -14159,11 +17716,134 @@ def _boot_care():
 
     try:
 
-        error_report.bootstrap(app_dir(), APP_VERSION)
+        error_report.bootstrap(app_dir(), APP_VERSION, context_fn=report_context)
 
     except Exception:
 
         pass
+
+    # 第 277 项：本机功能计数与动作面包屑。这里故意不 autostart：
+    # 测试 / CLI 导入 brain 时会走到这里，不能顺手起写盘线程；
+    # 真正的 UI 进程在 app_window.main 里再 configure(..., autostart=True)。
+    try:
+
+        if metrics is not None:
+
+            metrics.configure(app_dir())
+
+        if bc is not None:
+
+            bc.configure(app_dir(), keep=True)
+
+    except Exception:
+
+        pass
+
+
+def report_context():
+
+    """错误报告里的「复现必需」环境位：开关、索引规模、最近失败的功能。
+
+    只收布尔与计数，不收任何用户内容；任何一项取不到就跳过，不能让报告本身失败。
+    """
+
+    out = {}
+
+    try:
+
+        st = _settings_read()
+
+        out['settings'] = {
+
+            'compat': bool(st.get('compat')),
+
+            'titlebar': bool(st.get('titlebar')),
+
+            'qs_style': str(st.get('qs_style') or '')[:12],
+
+            'hotkey': bool(st.get('hotkey')),
+
+            'hotkey_mode': str(st.get('hotkey_mode') or '')[:16],
+
+            'floating_ball': bool(st.get('floating_ball')),
+
+            'theme': str(st.get('theme') or '')[:12],
+
+            'lang': str(st.get('lang') or '')[:8],
+
+            'trans_engines': [str(x)[:12] for x in (st.get('trans_engines') or [])][:8],
+
+            'byok': bool(st.get('trans_byok')),
+
+        }
+
+    except Exception:
+
+        pass
+
+    try:
+
+        n_docs = _SUB_CACHE.get('docs')
+
+        n_files = _SUB_CACHE.get('files')
+
+        if n_docs is None or n_files is None:
+
+            with con_lock:
+
+                n_docs = _count_docs(conn())
+
+                n_files = _count_files(conn())
+
+        db = Path(DB)
+
+        out['index'] = {
+
+            'docs': int(n_docs or 0),
+
+            'files': int(n_files or 0),
+
+            'db_mb': int(db.stat().st_size / 1048576) if db.is_file() else 0,
+
+            'wal_mb': int((db.with_name('brain.db-wal')).stat().st_size / 1048576)
+
+            if db.with_name('brain.db-wal').is_file() else 0,
+
+            'db_mtime': time.strftime('%Y-%m-%dT%H:%M:%S',
+
+                                      time.localtime(db.stat().st_mtime)) if db.is_file() else '',
+
+        }
+
+    except Exception:
+
+        pass
+
+    try:
+
+        import libsets
+
+        data = libsets.load(app_dir())
+
+        out['libsets'] = len((data or {}).get('libs') or [])
+
+        out['libset'] = str((data or {}).get('active') or '')[:12]
+
+    except Exception:
+
+        pass
+
+    try:
+
+        if metrics is not None:
+
+            out['metrics'] = metrics.failing(4)
+
+    except Exception:
+
+        pass
+
+    return out
 
 
 
@@ -14201,6 +17881,89 @@ def conn():
                 _con = _open_db_guarded()
 
     return _con
+
+
+# 第 327 项（性能二轮）：只读连接池。
+#
+# 为什么必须这么干：以前**读**也要抢 con_lock，于是「一个慢查询」就等于「整个界面卡住」——
+# 13:37 的 debug.log 里 5.7s 的 `/api:body` 后面跟着 4 条 `/api/files` 等锁 5.3~5.4s，
+# 界面那一屏就是空白（前端等不到结果，catch 完 setRows([])）。而 WAL 模式本来就允许
+# 「一写多读」并发，读根本不需要那把锁。
+#
+# 现在读走自己的只读连接（mode=ro + query_only），写还是走 con_lock：
+# 长任务（重扫 / 瘦身 / VACUUM）期间搜索照样是毫秒级，最坏也只是看到提交前的快照。
+_RO_POOL = queue.Queue(maxsize=6)
+
+
+def _open_ro():
+    """开一条只读连接。busy_timeout 给足 8 秒：碰上 checkpoint 短暂排他也不会立刻报错。"""
+    uri = 'file:' + str(DB).replace('\\', '/') + '?mode=ro'
+    c = sqlite3.connect(uri, uri=True, timeout=8.0, check_same_thread=False)
+    try:
+        c.execute('PRAGMA busy_timeout=8000')       # 不写库，但别被瞬间排他打断
+        c.execute('PRAGMA query_only=ON')            # 兜底：只读连接上绝不允许写
+    except sqlite3.Error:
+        pass
+    return c
+
+
+def _ro_acquire():
+    try:
+        return _RO_POOL.get_nowait()
+    except queue.Empty:
+        return _open_ro()
+
+
+def _ro_release(c):
+    if c is None:
+        return
+    try:
+        _RO_POOL.put_nowait(c)
+    except queue.Full:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+class _RoUse(object):
+    """with ro_db('/api/files') as c: ... —— 借一条只读连接，**不碰 con_lock**。
+
+    取不到连接（库文件不在 / schema 还没建）就退回老路径：拿 con_lock + 主连接，
+    宁可慢一点，也不能因为改造本身把接口弄挂。
+    """
+
+    __slots__ = ('where', 'con', 'fb')
+
+    def __init__(self, where=''):
+        self.where = where
+        self.con = None
+        self.fb = None
+
+    def __enter__(self):
+        try:
+            self.con = _ro_acquire()
+            return self.con
+        except sqlite3.Error:
+            self.con = None
+        except Exception:
+            self.con = None
+        self.fb = db_lock(self.where)
+        self.fb.__enter__()
+        return conn()
+
+    def __exit__(self, *a):
+        if self.con is not None:
+            _ro_release(self.con)
+            self.con = None
+            return False
+        if self.fb is not None:
+            return self.fb.__exit__(*a)
+        return False
+
+
+def ro_db(where=''):
+    return _RoUse(where)
 
 
 def _open_db_guarded():
@@ -14435,6 +18198,139 @@ def db_reclaim(min_free_mb=AUTO_RECLAIM_MB):
 
 # 免得为了两句话去改上面五个字典块的结构。
 
+# 第 203 项：网络搜索关键字。用户可在本机设置里增删改；这里只是出厂默认，
+# 不删用户配置、不联网校验，只有用户主动回车才会让系统浏览器打开一个 URL。
+DEFAULT_WEB_SEARCH = [
+    # 第 310 项：按「国内常用 → 国外常用」分组排序（用户在快搜窗里从上往下念）：
+    #   国内：Baidu / Douyin / Xiaohongshu / Bilibili
+    #   国外：Google / YouTube / TikTok / Bing / Wikipedia / GitHub
+    {'key': 'b', 'title': 'Baidu', 'url': 'https://www.baidu.com/s?wd={query}', 'enabled': True},
+    {'key': 'dy', 'title': 'Douyin', 'url': 'https://www.douyin.com/search/{query}', 'enabled': True},
+    {'key': 'xhs', 'title': 'Xiaohongshu',
+     'url': 'https://www.xiaohongshu.com/search_result?keyword={query}&source=web_search_result_notes',
+     'enabled': True},
+    {'key': 'bi', 'title': 'Bilibili', 'url': 'https://search.bilibili.com/all?keyword={query}', 'enabled': True},
+    {'key': 'g', 'title': 'Google', 'url': 'https://www.google.com/search?q={query}', 'enabled': True},
+    {'key': 'yt', 'title': 'YouTube', 'url': 'https://www.youtube.com/results?search_query={query}', 'enabled': True},
+    {'key': 'tt', 'title': 'TikTok', 'url': 'https://www.tiktok.com/search?q={query}', 'enabled': True},
+    {'key': 'bing', 'title': 'Bing', 'url': 'https://www.bing.com/search?q={query}', 'enabled': True},
+    {'key': 'wiki', 'title': 'Wikipedia', 'url': 'https://zh.wikipedia.org/w/index.php?search={query}', 'enabled': True},
+    {'key': 'gh', 'title': 'GitHub', 'url': 'https://github.com/search?q={query}', 'enabled': True},
+]
+
+# 第 310 项：这批是「老配置里从来没有过」的新引擎。老用户的 settings.json 里
+# 只存着他当年看到的那 7 条，不做合并就永远见不到抖音/小红书/TikTok。
+NEW_WEB_KEYS = ('dy', 'xhs', 'tt')
+
+
+def _normalize_web_search(v):
+    """设置里存进来的 web_search 一律过这道门：只留合法的搜索引擎条目。
+
+    - key 只能是 [a-z0-9_-] 且不带空格（「关键字 + 空格」是切换语法）
+    - url 必须 http(s) 且含 {query} 占位符 —— 挡住 file:// / javascript: /
+      本地回环地址，也挡住用户误填成不含查询词的固定网址
+    - 条数上限 30，key 去重
+    """
+    out, seen = [], set()
+    if not isinstance(v, list):
+        return out
+    for it in v[:30]:
+        if not isinstance(it, dict):
+            continue
+        k = str(it.get('key') or '').strip().lower()
+        title = str(it.get('title') or '').strip()[:40]
+        url = str(it.get('url') or '').strip()[:500]
+        if not re.fullmatch(r'[a-z0-9_-]{1,16}', k) or k in seen:
+            continue
+        if '{query}' not in url:
+            continue
+        try:
+            pr = urllib.parse.urlparse(url.replace('{query}', 'x'))
+            if pr.scheme not in ('http', 'https') or not pr.netloc:
+                continue
+        except Exception:
+            continue
+        # 第 275 项：出厂默认的中文标题改成英文 —— 阿拉伯语/印地语等界面下看不懂「百度」「哔哩哔哩」。
+        # 只迁移出厂那两个字面值，用户自己起的名字（比如「百度一下」）保持原样。
+        if title == '百度':
+            title = 'Baidu'
+        elif title == '哔哩哔哩':
+            title = 'Bilibili'
+        seen.add(k)
+        out.append({'key': k, 'title': title or k,
+                    'url': url, 'enabled': it.get('enabled') is not False})
+    return out
+
+
+def _web_search_effective(stored):
+    """把用户存的表和新出厂默认合起来（第 310 项）。
+
+    - 出厂形状（标题/网址都没改过，只是顺序不同）：按新的「国内 → 国外」顺序重排，
+      并补上他从来没有的那三个新引擎（抖音 / 小红书 / TikTok）。
+      用户删过的老引擎**不复活** —— 那是他的选择，要补让他点「恢复默认引擎」。
+    - 用户自己加过引擎 / 改过标题网址：一条都不动，只把新引擎追加在后面，
+      免得把他排好的顺序打乱。
+    """
+    norm = _normalize_web_search(stored)
+    if not norm:
+        return [dict(x) for x in DEFAULT_WEB_SEARCH]
+    dmap = {x['key']: x for x in DEFAULT_WEB_SEARCH}
+    have = {e['key']: e for e in norm}
+    factory = all(
+        e['key'] in dmap
+        and e['title'] == dmap[e['key']]['title']
+        and e['url'] == dmap[e['key']]['url']
+        for e in norm
+    )
+    if factory:
+        out = []
+        for dflt in DEFAULT_WEB_SEARCH:
+            cur = have.get(dflt['key'])
+            if cur is not None:
+                item = dict(dflt)
+                item['enabled'] = cur['enabled']
+                out.append(item)
+            elif dflt['key'] in NEW_WEB_KEYS:
+                out.append(dict(dflt))
+        return out
+    out = [dict(e) for e in norm]
+    for dflt in DEFAULT_WEB_SEARCH:
+        if dflt['key'] not in have:
+            out.append(dict(dflt))
+    return out
+
+
+def web_search_items():
+    """当前启用的引擎（读 settings.json，缺配置时用出厂默认）。"""
+    try:
+        raw = (_settings_read() or {}).get('web_search')
+    except Exception:
+        raw = None
+    if not isinstance(raw, list) or not raw:
+        raw = DEFAULT_WEB_SEARCH
+    return [x for x in _web_search_effective(raw) if x['enabled']]
+
+
+def web_search_url(key, query):
+    """按 key + query 拼出最终 URL；非法/未启用/空查询一律返回 None。"""
+    q = str(query or '').strip()
+    if not q:
+        return None
+    k = str(key or '').strip().lower()
+    for e in web_search_items():
+        if e['key'] != k:
+            continue
+        url = e['url'].replace('{query}', urllib.parse.quote_plus(q))
+        try:
+            pr = urllib.parse.urlparse(url)
+            if pr.scheme in ('http', 'https') and pr.netloc:
+                return url
+        except Exception:
+            pass
+        return None
+    return None
+
+
 MINI_L_EXTRA = {
 
     'zh': {'foot_typing': '也可以直接打字，正文一样能搜', 'foot_esc': 'Esc 关闭', 'tag_body': '正文'},
@@ -14457,6 +18353,13 @@ MINI_L_EXTRA = {
 
 }
 
+for _lang, _ph in {
+    'zh': '在 {t} 中搜索', 'en': 'Search {t}', 'es': 'Buscar en {t}',
+    'pt': 'Pesquisar no {t}', 'hi': '{t} में खोजें',
+}.items():
+    MINI_L_EXTRA.setdefault(_lang, {})['web_ph'] = _ph
+
+
 MINI_L = {
 
     'zh': {'ph': '搜索文件名、文件夹或正文内容', 'detail': '详细搜索（Ctrl+Enter）', 'search': '搜索',
@@ -14467,13 +18370,17 @@ MINI_L = {
 
            'busy': '正在搜正文…', 'c_hint': 'c: 只搜正文',
 
+           'body_btn': '正文', 'body_on': '正文搜索已开启 · 点此关闭',
+
+           'body_off': '点此连文档正文一起搜', 'busy_all': '正在搜索…',
+
            'none': '没有找到 “{q}” 的文件名或正文',
 
            'empty_hint': '双击 Ctrl 唤出 · Esc 关闭', 'more': '展示更多 “{q}” 的搜索结果',
 
-           'about_name': '第二大脑 · 本地搜索', 'about_ok': '知道了',
+           'about_name': 'Memex · 本地搜索', 'about_ok': '知道了',
 
-           'about_note': '当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。', 'ctx_open': '打开', 'ctx_folder': '打开所在文件夹', 'ctx_copy': '复制路径', 'ctx_props': '属性', },
+           'about_note': '当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。', 'ctx_open': '打开', 'ctx_folder': '打开所在文件夹', 'ctx_copy': '复制路径', 'ctx_props': '属性', 'dh': '当前打开的文件夹', 'dh_recent': '最近访问', 'dh_hint': 'Ctrl+G 跳到打开/保存对话框', 'dh_go': '跳过去', 'qs_ok': '已跳到对话框', 'qs_none': '没有正在使用的打开/保存对话框', 'qs_fail': '跳转失败', 'jm_hint': '正在另存为/打开文件 · 点结果直接选定（目录直接在对话框里打开）', 'ad_hint': '路径已填进地址栏，按回车跳过去', 'nav_hint': '已在对话框中打开该目录', 'scope': '只在「{p}」中搜索', 'scope_clear': '搜索全部位置', 'sel_n': '已选中 {n} 项', 'copied_one': '已复制路径', 'copied_n': '已复制 {n} 条路径', 'copied_dir': '已复制所在文件夹', 'copy_none': '没有可复制的路径', 'copy_fail': '复制失败', },
 
     'en': {'ph': 'Search file names, folders or document text', 'detail': 'Detailed search (Ctrl+Enter)', 'search': 'Search',
 
@@ -14483,13 +18390,17 @@ MINI_L = {
 
            'busy': 'Searching inside documents…', 'c_hint': 'c: text only',
 
+           'body_btn': 'Text', 'body_on': 'Text search on · click to turn off',
+
+           'body_off': 'Click to search inside documents', 'busy_all': 'Searching…',
+
            'none': 'Nothing found for “{q}” in names or text',
 
            'empty_hint': 'Double Ctrl to summon · Esc to close', 'more': 'Show more results for “{q}”',
 
-           'about_name': 'Second Brain · local search', 'about_ok': 'Got it',
+           'about_name': 'Memex · local search', 'about_ok': 'Got it',
 
-           'about_note': 'This is a <b>0.x preview</b>: still being polished.<br>It becomes official at <b>1.0</b>.', 'ctx_open': 'Open', 'ctx_folder': 'Open containing folder', 'ctx_copy': 'Copy path', 'ctx_props': 'Properties', },
+           'about_note': 'This is a <b>0.x preview</b>: still being polished.<br>It becomes official at <b>1.0</b>.', 'ctx_open': 'Open', 'ctx_folder': 'Open containing folder', 'ctx_copy': 'Copy path', 'ctx_props': 'Properties', 'dh': 'Open folders', 'dh_recent': 'Recent', 'dh_hint': 'Ctrl+G to jump into an Open/Save dialog', 'dh_go': 'Jump', 'qs_ok': 'Jumped into the dialog', 'qs_none': 'No Open/Save dialog is active', 'qs_fail': 'Jump failed', 'jm_hint': 'Save as / Open dialog · click a result to select it (folders open in the dialog)', 'ad_hint': 'Path is in the address bar — press Enter to jump', 'nav_hint': 'Opened that folder in the dialog', 'scope': 'Only in “{p}”', 'scope_clear': 'Search everywhere', 'sel_n': '{n} selected', 'copied_one': 'Path copied', 'copied_n': '{n} paths copied', 'copied_dir': 'Containing folder copied', 'copy_none': 'Nothing to copy', 'copy_fail': 'Copy failed', },
 
     'es': {'ph': 'Busca nombres de archivo, carpetas o texto', 'detail': 'Búsqueda detallada (Ctrl+Enter)', 'search': 'Buscar',
 
@@ -14499,13 +18410,17 @@ MINI_L = {
 
            'busy': 'Buscando dentro de los documentos…', 'c_hint': 'c: solo texto',
 
+           'body_btn': 'Texto', 'body_on': 'Búsqueda en texto activada · clic para desactivar',
+
+           'body_off': 'Clic para buscar dentro de los documentos', 'busy_all': 'Buscando…',
+
            'none': 'No se encontró “{q}” en nombres ni texto',
 
            'empty_hint': 'Doble Ctrl para abrir · Esc para cerrar', 'more': 'Ver más resultados de “{q}”',
 
-           'about_name': 'Second Brain · búsqueda local', 'about_ok': 'Entendido',
+           'about_name': 'Memex · búsqueda local', 'about_ok': 'Entendido',
 
-           'about_note': 'Es una <b>vista previa 0.x</b>: aún en ajuste.<br>Pasa a oficial en la <b>1.0</b>.', 'ctx_open': 'Abrir', 'ctx_folder': 'Abrir carpeta contenedora', 'ctx_copy': 'Copiar ruta', 'ctx_props': 'Propiedades', },
+           'about_note': 'Es una <b>vista previa 0.x</b>: aún en ajuste.<br>Pasa a oficial en la <b>1.0</b>.', 'ctx_open': 'Abrir', 'ctx_folder': 'Abrir carpeta contenedora', 'ctx_copy': 'Copiar ruta', 'ctx_props': 'Propiedades', 'dh': 'Carpetas abiertas', 'dh_recent': 'Recientes', 'dh_hint': 'Ctrl+G salta al diálogo Abrir/Guardar', 'dh_go': 'Saltar', 'qs_ok': 'Saltó al diálogo', 'qs_none': 'No hay ningún diálogo Abrir/Guardar activo', 'qs_fail': 'No se pudo saltar', 'jm_hint': 'Guardar como / Abrir diálogo · haz clic en un resultado para seleccionarlo (las carpetas se abren en el diálogo)', 'ad_hint': 'La ruta está en la barra de direcciones: pulsa Enter para saltar', 'nav_hint': 'Carpeta abierta en el diálogo', 'scope': 'Solo en «{p}»', 'scope_clear': 'Buscar en todas partes', 'sel_n': '{n} seleccionados', 'copied_one': 'Ruta copiada', 'copied_n': '{n} rutas copiadas', 'copied_dir': 'Carpeta contenedora copiada', 'copy_none': 'Nada que copiar', 'copy_fail': 'No se pudo copiar', },
 
     'pt': {'ph': 'Busque nomes de arquivo, pastas ou texto', 'detail': 'Busca detalhada (Ctrl+Enter)', 'search': 'Buscar',
 
@@ -14515,13 +18430,17 @@ MINI_L = {
 
            'busy': 'Buscando dentro dos documentos…', 'c_hint': 'c: só texto',
 
+           'body_btn': 'Texto', 'body_on': 'Busca no texto ativada · clique para desativar',
+
+           'body_off': 'Clique para buscar dentro dos documentos', 'busy_all': 'Buscando…',
+
            'none': 'Nada encontrado para “{q}” em nomes ou texto',
 
            'empty_hint': 'Ctrl duas vezes para abrir · Esc para fechar', 'more': 'Ver mais resultados de “{q}”',
 
-           'about_name': 'Second Brain · busca local', 'about_ok': 'Entendi',
+           'about_name': 'Memex · busca local', 'about_ok': 'Entendi',
 
-           'about_note': 'É uma <b>prévia 0.x</b>: ainda em ajuste.<br>Vira oficial na <b>1.0</b>.', 'ctx_open': 'Abrir', 'ctx_folder': 'Abrir pasta do arquivo', 'ctx_copy': 'Copiar caminho', 'ctx_props': 'Propriedades', },
+           'about_note': 'É uma <b>prévia 0.x</b>: ainda em ajuste.<br>Vira oficial na <b>1.0</b>.', 'ctx_open': 'Abrir', 'ctx_folder': 'Abrir pasta do arquivo', 'ctx_copy': 'Copiar caminho', 'ctx_props': 'Propriedades', 'dh': 'Pastas abertas', 'dh_recent': 'Recentes', 'dh_hint': 'Ctrl+G vai para a caixa Abrir/Salvar', 'dh_go': 'Ir', 'qs_ok': 'Foi para a caixa de diálogo', 'qs_none': 'Nenhuma caixa Abrir/Salvar ativa', 'qs_fail': 'Falha ao ir', 'jm_hint': 'Salvar como / Abrir diálogo · clique em um resultado para selecioná-lo (pastas abrem na caixa)', 'ad_hint': 'O caminho está na barra de endereço — pressione Enter para ir', 'nav_hint': 'Pasta aberta na caixa de diálogo', 'scope': 'Somente em “{p}”', 'scope_clear': 'Buscar em todos os lugares', 'sel_n': '{n} selecionados', 'copied_one': 'Caminho copiado', 'copied_n': '{n} caminhos copiados', 'copied_dir': 'Pasta contêiner copiada', 'copy_none': 'Nada para copiar', 'copy_fail': 'Falha ao copiar', },
 
     'hi': {'ph': 'फ़ाइल नाम, फ़ोल्डर या दस्तावेज़ टेक्स्ट खोजें', 'detail': 'विस्तृत खोज (Ctrl+Enter)', 'search': 'खोज',
 
@@ -14531,16 +18450,38 @@ MINI_L = {
 
            'busy': 'दस्तावेज़ों में खोजा जा रहा है…', 'c_hint': 'c: केवल टेक्स्ट',
 
+           'body_btn': 'टेक्स्ट', 'body_on': 'टेक्स्ट खोज चालू · बंद करने के लिए क्लिक करें',
+
+           'body_off': 'दस्तावेज़ों के अंदर खोजने के लिए क्लिक करें', 'busy_all': 'खोजा जा रहा है…',
+
            'none': '“{q}” नाम या टेक्स्ट में नहीं मिला',
 
            'empty_hint': 'Ctrl दो बार खोलें · Esc बंद करें', 'more': '“{q}” के और परिणाम देखें',
 
-           'about_name': 'Second Brain · स्थानीय खोज', 'about_ok': 'समझ गया',
+           'about_name': 'Memex · स्थानीय खोज', 'about_ok': 'समझ गया',
 
-           'about_note': 'यह <b>0.x पूर्वावलोकन</b> है: अभी सुधार जारी है।<br><b>1.0</b> पर आधिकारिक होगा।', 'ctx_open': 'खोलें', 'ctx_folder': 'फ़ोल्डर खोलें', 'ctx_copy': 'पथ कॉपी करें', 'ctx_props': 'गुण', },
+           'about_note': 'यह <b>0.x पूर्वावलोकन</b> है: अभी सुधार जारी है।<br><b>1.0</b> पर आधिकारिक होगा।', 'ctx_open': 'खोलें', 'ctx_folder': 'फ़ोल्डर खोलें', 'ctx_copy': 'पथ कॉपी करें', 'ctx_props': 'गुण', 'dh': 'खुले फ़ोल्डर', 'dh_recent': 'हाल के', 'dh_hint': 'Ctrl+G से खोलें/सहेजें संवाद में जाएँ', 'dh_go': 'जाएँ', 'qs_ok': 'संवाद में पहुँच गया', 'qs_none': 'कोई खोलें/सहेजें संवाद सक्रिय नहीं है', 'qs_fail': 'जाने में विफल', 'jm_hint': 'सहेजें / खोलें डायलॉग · परिणाम पर क्लिक करें (फ़ोल्डर डायलॉग में खुलेंगे)', 'ad_hint': 'पथ पता बार में भर दिया है — जाने के लिए Enter दबाएँ', 'nav_hint': 'डायलॉग में वह फ़ोल्डर खुल गया', 'scope': 'केवल “{p}” में', 'scope_clear': 'सभी जगह खोजें', 'sel_n': '{n} चुने गए', 'copied_one': 'पथ कॉपी हुआ', 'copied_n': '{n} पथ कॉपी हुए', 'copied_dir': 'फ़ोल्डर कॉपी हुआ', 'copy_none': 'कॉपी करने के लिए कुछ नहीं', 'copy_fail': 'कॉपी नहीं हो सका', },
 
 }
 
+
+
+# 第 355 项：命令关键字的名字（快搜窗里那一行）
+MINI_L_CMD = {
+    'zh': {'cmd_shot': '截图取字并复制', 'cmd_verify': '全库校验索引', 'cmd_cmd': '在此目录开 CMD',
+           'cmd_psh': '在此目录开 PowerShell', 'cmd_here': '当前目录', 'cmd_fail': '命令没跑起来'},
+    'en': {'cmd_shot': 'Capture screen text', 'cmd_verify': 'Verify the index', 'cmd_cmd': 'Open CMD here',
+           'cmd_psh': 'Open PowerShell here', 'cmd_here': 'Current folder', 'cmd_fail': 'Command did not run'},
+    'es': {'cmd_shot': 'Capturar texto de pantalla', 'cmd_verify': 'Verificar el índice', 'cmd_cmd': 'Abrir CMD aquí',
+           'cmd_psh': 'Abrir PowerShell aquí', 'cmd_here': 'Carpeta actual', 'cmd_fail': 'El comando no se ejecutó'},
+    'pt': {'cmd_shot': 'Capturar texto da tela', 'cmd_verify': 'Verificar o índice', 'cmd_cmd': 'Abrir CMD aqui',
+           'cmd_psh': 'Abrir PowerShell aqui', 'cmd_here': 'Pasta atual', 'cmd_fail': 'O comando não rodou'},
+    'hi': {'cmd_shot': 'स्क्रीन टेक्स्ट कैप्चर', 'cmd_verify': 'इंडेक्स जाँचें', 'cmd_cmd': 'यहाँ CMD खोलें',
+           'cmd_psh': 'यहाँ PowerShell खोलें', 'cmd_here': 'मौजूदा फ़ोल्डर', 'cmd_fail': 'कमांड नहीं चला'},
+}
+
+for _k, _v in MINI_L_CMD.items():
+    MINI_L.setdefault(_k, {}).update(_v)
 for _k, _v in MINI_L_EXTRA.items():
 
     MINI_L.setdefault(_k, {}).update(_v)
@@ -14549,39 +18490,397 @@ for _k, _v in MINI_L_EXTRA.items():
 
 
 
+
+# 第 280 项：快搜窗里那几个 title（悬停说明）原来写死中文 —— 界面切成英文/西语/印地语
+# 照样弹「屏幕截图（松手即复制）」。这里按界面语言给一份，_subs() 里替换 __TIP_*__ 占位符。
+MINI_TIPS = {
+    'zh-CN': {
+        'snip': '屏幕截图（松手即复制）', 'clip': '剪贴板历史', 'trans': '聚合翻译',
+        'run': '点击立即翻译（或按 Enter）', 'copy_item': '点击复制到剪贴板',
+        'copy_text': '点击复制译文',
+        # 剪贴板面板本体的文案（面板里的条目 detail / 相对时间由后端按语言拼）
+        'cb_title': '剪贴板历史', 'cb_all': '全部', 'cb_fav': '★ 收藏',
+        'cb_text': '文本', 'cb_image': '图片', 'cb_file': '文件',
+        'cb_clear': '清空', 'cb_clear_title': '清空全部', 'cb_close': '关闭 (Esc)',
+        'cb_empty': '暂无剪贴板历史', 'cb_empty_fav': '暂无收藏的剪贴板内容',
+        'cb_load_fail': '加载失败', 'cb_pin_add': '加入收藏', 'cb_pin_del': '取消收藏',
+        'cb_del': '删除', 'cb_badge_file': '📁 文件', 'cb_badge_text': '文本',
+        'cb_badge_image': '图片', 'cb_copied': '已复制到剪贴板 ✓', 'cb_copy_fail': '复制失败',
+        'trans_target': '目标语言',
+    },
+    'en': {
+        'snip': 'Screenshot (copied on release)', 'clip': 'Clipboard history',
+        'trans': 'Aggregate translation', 'run': 'Translate now (or press Enter)',
+        'copy_item': 'Click to copy to clipboard', 'copy_text': 'Click to copy the translation',
+        'cb_title': 'Clipboard history', 'cb_all': 'All', 'cb_fav': '★ Favorites',
+        'cb_text': 'Text', 'cb_image': 'Images', 'cb_file': 'Files',
+        'cb_clear': 'Clear', 'cb_clear_title': 'Clear all', 'cb_close': 'Close (Esc)',
+        'cb_empty': 'No clipboard history yet',
+        'cb_empty_fav': 'No favorites in the clipboard yet',
+        'cb_load_fail': 'Failed to load', 'cb_pin_add': 'Add to favorites',
+        'cb_pin_del': 'Remove from favorites', 'cb_del': 'Delete',
+        'cb_badge_file': '📁 File', 'cb_badge_text': 'Text', 'cb_badge_image': 'Image',
+        'cb_copied': 'Copied to clipboard ✓', 'cb_copy_fail': 'Copy failed',
+        'trans_target': 'Target language',
+    },
+    'es': {
+        'snip': 'Captura de pantalla (se copia al soltar)', 'clip': 'Historial del portapapeles',
+        'trans': 'Traducción agregada', 'run': 'Traducir ahora (o pulsa Enter)',
+        'copy_item': 'Clic para copiar al portapapeles', 'copy_text': 'Clic para copiar la traducción',
+        'cb_title': 'Historial del portapapeles', 'cb_all': 'Todo', 'cb_fav': '★ Favoritos',
+        'cb_text': 'Texto', 'cb_image': 'Imágenes', 'cb_file': 'Archivos',
+        'cb_clear': 'Borrar', 'cb_clear_title': 'Borrar todo', 'cb_close': 'Cerrar (Esc)',
+        'cb_empty': 'Aún no hay historial del portapapeles',
+        'cb_empty_fav': 'Aún no hay favoritos en el portapapeles',
+        'cb_load_fail': 'No se pudo cargar', 'cb_pin_add': 'Añadir a favoritos',
+        'cb_pin_del': 'Quitar de favoritos', 'cb_del': 'Eliminar',
+        'cb_badge_file': '📁 Archivo', 'cb_badge_text': 'Texto', 'cb_badge_image': 'Imagen',
+        'cb_copied': 'Copiado al portapapeles ✓', 'cb_copy_fail': 'No se pudo copiar',
+        'trans_target': 'Idioma de destino',
+    },
+    'pt': {
+        'snip': 'Captura de tela (copiada ao soltar)', 'clip': 'Histórico da área de transferência',
+        'trans': 'Tradução agregada', 'run': 'Traduzir agora (ou pressione Enter)',
+        'copy_item': 'Clique para copiar para a área de transferência',
+        'copy_text': 'Clique para copiar a tradução',
+        'cb_title': 'Histórico da área de transferência', 'cb_all': 'Tudo',
+        'cb_fav': '★ Favoritos', 'cb_text': 'Texto', 'cb_image': 'Imagens',
+        'cb_file': 'Arquivos', 'cb_clear': 'Limpar', 'cb_clear_title': 'Limpar tudo',
+        'cb_close': 'Fechar (Esc)',
+        'cb_empty': 'Ainda não há histórico da área de transferência',
+        'cb_empty_fav': 'Ainda não há favoritos na área de transferência',
+        'cb_load_fail': 'Falha ao carregar', 'cb_pin_add': 'Adicionar aos favoritos',
+        'cb_pin_del': 'Remover dos favoritos', 'cb_del': 'Excluir',
+        'cb_badge_file': '📁 Arquivo', 'cb_badge_text': 'Texto', 'cb_badge_image': 'Imagem',
+        'cb_copied': 'Copiado para a área de transferência ✓', 'cb_copy_fail': 'Falha ao copiar',
+        'trans_target': 'Idioma de destino',
+    },
+    'hi': {
+        'snip': 'स्क्रीनशॉट (छोड़ते ही कॉपी)', 'clip': 'क्लिपबोर्ड इतिहास',
+        'trans': 'एकत्रित अनुवाद', 'run': 'अभी अनुवाद करें (या Enter दबाएँ)',
+        'copy_item': 'क्लिपबोर्ड में कॉपी करने के लिए क्लिक करें',
+        'copy_text': 'अनुवाद कॉपी करने के लिए क्लिक करें',
+        'cb_title': 'क्लिपबोर्ड इतिहास', 'cb_all': 'सभी', 'cb_fav': '★ पसंदीदा',
+        'cb_text': 'टेक्स्ट', 'cb_image': 'चित्र', 'cb_file': 'फ़ाइलें',
+        'cb_clear': 'साफ़ करें', 'cb_clear_title': 'सब साफ़ करें', 'cb_close': 'बंद करें (Esc)',
+        'cb_empty': 'अभी कोई क्लिपबोर्ड इतिहास नहीं',
+        'cb_empty_fav': 'क्लिपबोर्ड में अभी कोई पसंदीदा नहीं',
+        'cb_load_fail': 'लोड नहीं हुआ', 'cb_pin_add': 'पसंदीदा में जोड़ें',
+        'cb_pin_del': 'पसंदीदा से हटाएँ', 'cb_del': 'हटाएँ',
+        'cb_badge_file': '📁 फ़ाइल', 'cb_badge_text': 'टेक्स्ट', 'cb_badge_image': 'चित्र',
+        'cb_copied': 'क्लिपबोर्ड में कॉपी ✓', 'cb_copy_fail': 'कॉपी विफल',
+        'trans_target': 'लक्ष्य भाषा',
+    },
+}
+
+
+def _mini_tip_lang():
+    """界面语言 → MINI_TIPS 的键。取不到或不认识就按中文（和别处一样的老实退路）。"""
+    raw = ''
+    try:
+        raw = str(boot_lang() or '')
+    except Exception:
+        raw = ''
+    if not raw:
+        try:
+            raw = str(_settings_read().get('lang') or '')
+        except Exception:
+            raw = ''
+    code = str(raw).strip().lower()
+    code = {'zh': 'zh-CN', 'zh-cn': 'zh-CN', 'zh_cn': 'zh-CN', 'cn': 'zh-CN'}.get(code, code)
+    return code if code in MINI_TIPS else 'zh-CN'
+
+
+def _mini_tips(lang=None):
+    """lang 可以来自 /mini?lang=xx（页面请求），也可以不传（按 settings）。"""
+    code = str(lang or '').strip().lower()
+    code = {'zh': 'zh-CN', 'zh-cn': 'zh-CN', 'zh_cn': 'zh-CN', 'cn': 'zh-CN'}.get(code, code)
+    if code not in MINI_TIPS:
+        code = _mini_tip_lang()
+    return MINI_TIPS.get(code, MINI_TIPS['zh-CN'])
+
+
+MINI_UI = {
+    'zh-CN': {
+        'about': '关于', 'about_name': 'Memex · 本地搜索', 'about_ok': '知道了',
+        'about_note': '当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。',
+        'docs_line': '正文可搜 <b>__TOTAL__</b> 篇 · 文件名可搜 <b>__FILES__</b> 个',
+        'build_date': '构建日期 <b>__BUILD__</b>',
+        'win_title': 'Memex · 快搜', 'q_ph': '搜索文件名、文件夹或正文内容',
+        'detail': '详细搜索（Ctrl+Enter）', 'detail_short': 'Ctrl+Enter 详细搜索',
+        'search': '搜索', 'recent': '最近打开', 'recent_hint': 'Enter 直接打开',
+'empty': '输入文件名或正文关键词，边打边出结果',
+'empty_hint': '双击 Ctrl 唤出 · Esc 关闭',
+        'snip_title': '截图识字', 'snip_ph': '未识别到文字',
+        'snip_scan': '按 Enter 或点击搜索进行识字...',
+        'snip_tr_hover': '截图翻译', 'snip_trans': '翻译', 'snip_src': '原文', 'snip_dst': '译文',
+        'snip_trans_doing': '翻译中…', 'snip_trans_none': '翻译失败，稍后再试或换个引擎',
+        'snip_trans_hint': '译文可复制，随时切回原文',
+        'copy_text_btn': '复制文字 (Enter)', 'copy_img_btn': '复制图片',
+        'search_this': '搜此文字', 'save_img': '保存图片',
+        'snip_timeout': '识字超时', 'snip_none': '未识别到文字', 'snip_fail': '识字失败',
+        'snip_ready': '截图已就位（按 Enter 识字搜索，Delete 删除）',
+        'snip_lines': '{n} 行文字', 'snip_copied': '已复制！✓',
+        'snip_img_copied': '图片已在剪贴板 ✓', 'snip_saved': '已存至桌面 ✓',
+        'snip_save_fail': '保存失败',
+        'preview_title': '截图预览', 'preview_hint': '按 Enter 识字搜索 · Esc / 点击关闭',
+        'preview_close': '关闭预览 (Esc)',
+        'img_pill': '点击放大查看图片（按 Enter 识字搜索，Delete 删除）',
+        'img_pill_del': '删除图片 (Delete)',
+        'trans_title': '翻译', 'trans_auto': '自动（译成中文）',
+'trans_ph': '请在上方搜索框输入想要翻译的内容', 'trans_doing': '翻译中...',
+'trans_timeout': '翻译超时',
+'trans_fail': '未获取到翻译结果（可能引擎只返回了原文或这会儿连不上）',
+                'trans_bypass': '代理端口连不上，已自动改走直连',
+'trans_copied': '已复制译文 ✓',
+        'cb_confirm': '确定清空未收藏的剪贴板历史吗？（收藏内容将保留）',
+        'cb_loading': '加载中...', 'cb_pin_on': '已加入收藏 ★',
+        'cb_pin_off': '已取消收藏', 'cb_deleted': '已删除', 'cb_cleared': '已清空未收藏历史',
+    },
+    'en': {
+        'about': 'About', 'about_name': 'Memex · local search', 'about_ok': 'Got it',
+        'about_note': 'This is a <b>0.x preview</b>: still being polished.<br>It becomes official at <b>1.0</b>.',
+        'docs_line': 'Searchable text: <b>__TOTAL__</b> docs · file names: <b>__FILES__</b>',
+        'build_date': 'Build date <b>__BUILD__</b>',
+        'win_title': 'Memex · Quick search', 'q_ph': 'Search file names, folders or document text',
+        'detail': 'Detailed search (Ctrl+Enter)', 'detail_short': 'Ctrl+Enter detailed search',
+        'search': 'Search', 'recent': 'Recently opened', 'recent_hint': 'Enter to open',
+        'empty': 'Type a file name or a word from a document',
+        'empty_hint': 'Double Ctrl to summon · Esc to close',
+        'snip_title': 'Snip & OCR', 'snip_ph': 'No text recognised',
+        'snip_scan': 'Press Enter or click to OCR-search...',
+        'snip_tr_hover': 'Snip translate', 'snip_trans': 'Translate', 'snip_src': 'Original', 'snip_dst': 'Translated',
+        'snip_trans_doing': 'Translating…', 'snip_trans_none': 'Translation failed — try again later',
+        'snip_trans_hint': 'Translation is copyable; switch back anytime',
+        'copy_text_btn': 'Copy text (Enter)', 'copy_img_btn': 'Copy image',
+        'search_this': 'Search this text', 'save_img': 'Save image',
+        'snip_timeout': 'OCR timed out', 'snip_none': 'No text recognised',
+        'snip_fail': 'OCR failed',
+        'snip_ready': 'Screenshot ready (Enter to OCR-search, Delete to remove)',
+        'snip_lines': '{n} text lines', 'snip_copied': 'Copied ✓',
+        'snip_img_copied': 'Image copied to clipboard ✓', 'snip_saved': 'Saved to Desktop ✓',
+        'snip_save_fail': 'Save failed',
+        'preview_title': 'Screenshot preview',
+        'preview_hint': 'Enter to OCR-search · Esc / click to close',
+        'preview_close': 'Close preview (Esc)',
+        'img_pill': 'Click to enlarge (Enter to OCR-search, Delete to remove)',
+        'img_pill_del': 'Remove image (Delete)',
+        'trans_title': 'Translate', 'trans_auto': 'Auto (into English)',
+        'trans_ph': 'Type the text to translate in the search box above',
+        'trans_doing': 'Translating...', 'trans_timeout': 'Translation timed out',
+        'trans_fail': 'No translation returned (the engine may have echoed the source, '
+                      'or the connection failed)',
+        'trans_bypass': 'The proxy port is unreachable — switched to a direct connection',
+        'trans_copied': 'Translation copied ✓',
+        'cb_confirm': 'Clear clipboard history except favorites? (Favorites are kept)',
+        'cb_loading': 'Loading...', 'cb_pin_on': 'Added to favorites ★',
+        'cb_pin_off': 'Removed from favorites', 'cb_deleted': 'Deleted',
+        'cb_cleared': 'Cleared (favorites kept)',
+    },
+    'es': {
+        'about': 'Acerca de', 'about_name': 'Memex · búsqueda local', 'about_ok': 'Entendido',
+        'about_note': 'Es una <b>vista previa 0.x</b>: aún se está puliendo.<br>Pasa a oficial en la <b>1.0</b>.',
+        'docs_line': 'Texto buscable: <b>__TOTAL__</b> docs · nombres: <b>__FILES__</b>',
+        'build_date': 'Fecha de compilación <b>__BUILD__</b>',
+        'win_title': 'Memex · Búsqueda rápida',
+        'q_ph': 'Busca nombres de archivo, carpetas o texto',
+        'detail': 'Búsqueda detallada (Ctrl+Enter)',
+        'detail_short': 'Ctrl+Enter búsqueda detallada',
+        'search': 'Buscar', 'recent': 'Abiertos hace poco', 'recent_hint': 'Enter para abrir',
+        'empty': 'Escribe un nombre de archivo o una palabra del documento',
+        'empty_hint': 'Doble Ctrl para abrir · Esc para cerrar',
+        'snip_title': 'Captura y OCR', 'snip_ph': 'No se reconoció texto',
+        'snip_scan': 'Pulsa Enter o haz clic para buscar por OCR...',
+        'snip_tr_hover': 'Traducir captura', 'snip_trans': 'Traducir', 'snip_src': 'Original', 'snip_dst': 'Traducido',
+        'snip_trans_doing': 'Traduciendo…', 'snip_trans_none': 'No se pudo traducir, inténtalo luego',
+        'snip_trans_hint': 'La traducción se puede copiar; vuelve al original cuando quieras',
+        'copy_text_btn': 'Copiar texto (Enter)', 'copy_img_btn': 'Copiar imagen',
+        'search_this': 'Buscar este texto', 'save_img': 'Guardar imagen',
+        'snip_timeout': 'El OCR tardó demasiado', 'snip_none': 'No se reconoció texto',
+        'snip_fail': 'Falló el OCR',
+        'snip_ready': 'Captura lista (Enter para buscar por OCR, Delete para quitar)',
+        'snip_lines': '{n} líneas de texto', 'snip_copied': 'Copiado ✓',
+        'snip_img_copied': 'Imagen copiada al portapapeles ✓',
+        'snip_saved': 'Guardado en el escritorio ✓', 'snip_save_fail': 'No se pudo guardar',
+        'preview_title': 'Vista previa de la captura',
+        'preview_hint': 'Enter para OCR · Esc o clic para cerrar',
+        'preview_close': 'Cerrar vista previa (Esc)',
+        'img_pill': 'Clic para ampliar (Enter para OCR, Delete para quitar)',
+        'img_pill_del': 'Quitar imagen (Delete)',
+        'trans_title': 'Traducir', 'trans_auto': 'Automático (a español)',
+        'trans_ph': 'Escribe arriba, en el buscador, el texto que quieres traducir',
+        'trans_doing': 'Traduciendo...', 'trans_timeout': 'La traducción tardó demasiado',
+        'trans_fail': 'No se obtuvo traducción (puede que el motor solo devolviera el original '
+                      'o que no haya conexión)',
+        'trans_bypass': 'El puerto del proxy no responde — cambiado a conexión directa',
+        'trans_copied': 'Traducción copiada ✓',
+        'cb_confirm': '¿Borrar el historial salvo los favoritos? (Los favoritos se conservan)',
+        'cb_loading': 'Cargando...', 'cb_pin_on': 'Añadido a favoritos ★',
+        'cb_pin_off': 'Quitado de favoritos', 'cb_deleted': 'Eliminado',
+        'cb_cleared': 'Historial borrado (favoritos conservados)',
+    },
+    'pt': {
+        'about': 'Sobre', 'about_name': 'Memex · busca local', 'about_ok': 'Entendi',
+        'about_note': 'É uma <b>prévia 0.x</b>: ainda em ajustes.<br>Vira oficial na <b>1.0</b>.',
+        'docs_line': 'Texto pesquisável: <b>__TOTAL__</b> docs · nomes: <b>__FILES__</b>',
+        'build_date': 'Data da compilação <b>__BUILD__</b>',
+        'win_title': 'Memex · Busca rápida',
+        'q_ph': 'Busque nomes de arquivo, pastas ou texto',
+        'detail': 'Busca detalhada (Ctrl+Enter)',
+        'detail_short': 'Ctrl+Enter busca detalhada',
+        'search': 'Buscar', 'recent': 'Abertos recentemente', 'recent_hint': 'Enter para abrir',
+        'empty': 'Digite um nome de arquivo ou uma palavra do documento',
+        'empty_hint': 'Ctrl duas vezes para abrir · Esc para fechar',
+        'snip_title': 'Captura e OCR', 'snip_ph': 'Nenhum texto reconhecido',
+        'snip_scan': 'Pressione Enter ou clique para busca por OCR...',
+        'snip_tr_hover': 'Traduzir captura', 'snip_trans': 'Traduzir', 'snip_src': 'Original', 'snip_dst': 'Traduzido',
+        'snip_trans_doing': 'Traduzindo…', 'snip_trans_none': 'Falha ao traduzir, tente depois',
+        'snip_trans_hint': 'A tradução pode ser copiada; volte ao original quando quiser',
+        'copy_text_btn': 'Copiar texto (Enter)', 'copy_img_btn': 'Copiar imagem',
+        'search_this': 'Buscar este texto', 'save_img': 'Salvar imagem',
+        'snip_timeout': 'O OCR demorou demais', 'snip_none': 'Nenhum texto reconhecido',
+        'snip_fail': 'Falha no OCR',
+        'snip_ready': 'Captura pronta (Enter para OCR, Delete para remover)',
+        'snip_lines': '{n} linhas de texto', 'snip_copied': 'Copiado ✓',
+        'snip_img_copied': 'Imagem copiada para a área de transferência ✓',
+        'snip_saved': 'Salvo na área de trabalho ✓', 'snip_save_fail': 'Falha ao salvar',
+        'preview_title': 'Prévia da captura',
+        'preview_hint': 'Enter para OCR · Esc ou clique para fechar',
+        'preview_close': 'Fechar prévia (Esc)',
+        'img_pill': 'Clique para ampliar (Enter para OCR, Delete para remover)',
+        'img_pill_del': 'Remover imagem (Delete)',
+        'trans_title': 'Traduzir', 'trans_auto': 'Automático (para português)',
+        'trans_ph': 'Digite acima, na caixa de busca, o texto que quer traduzir',
+        'trans_doing': 'Traduzindo...', 'trans_timeout': 'A tradução demorou demais',
+        'trans_fail': 'Nenhuma tradução recebida (o motor pode ter devolvido o original '
+                      'ou a conexão falhou)',
+        'trans_bypass': 'A porta do proxy não responde — trocado para conexão direta',
+        'trans_copied': 'Tradução copiada ✓',
+        'cb_confirm': 'Limpar o histórico exceto favoritos? (Os favoritos são mantidos)',
+        'cb_loading': 'Carregando...', 'cb_pin_on': 'Adicionado aos favoritos ★',
+        'cb_pin_off': 'Removido dos favoritos', 'cb_deleted': 'Excluído',
+        'cb_cleared': 'Histórico limpo (favoritos mantidos)',
+    },
+    'hi': {
+        'about': 'परिचय', 'about_name': 'Memex · स्थानीय खोज', 'about_ok': 'समझ गया',
+        'about_note': 'यह <b>0.x प्रीव्यू</b> है: अभी निखारा जा रहा है।<br><b>1.0</b> पर यह आधिकारिक होगा।',
+        'docs_line': 'खोजने योग्य टेक्स्ट: <b>__TOTAL__</b> दस्तावेज़ · फ़ाइल नाम: <b>__FILES__</b>',
+        'build_date': 'बिल्ड तिथि <b>__BUILD__</b>',
+        'win_title': 'Memex · तेज़ खोज', 'q_ph': 'फ़ाइल नाम, फ़ोल्डर या दस्तावेज़ टेक्स्ट खोजें',
+        'detail': 'विस्तृत खोज (Ctrl+Enter)', 'detail_short': 'Ctrl+Enter विस्तृत खोज',
+        'search': 'खोजें', 'recent': 'हाल में खोले', 'recent_hint': 'Enter से खोलें',
+        'empty': 'फ़ाइल का नाम या दस्तावेज़ का कोई शब्द लिखें',
+        'empty_hint': 'दो बार Ctrl दबाएँ · Esc से बंद करें',
+        'snip_title': 'स्क्रीनशॉट से टेक्स्ट', 'snip_ph': 'कोई टेक्स्ट नहीं पहचाना',
+        'snip_scan': 'Enter दबाएँ या क्लिक करके टेक्स्ट पहचानें...',
+        'snip_tr_hover': 'स्क्रीनशॉट अनुवाद', 'snip_trans': 'अनुवाद', 'snip_src': 'मूल', 'snip_dst': 'अनुवादित',
+        'snip_trans_doing': 'अनुवाद हो रहा है…', 'snip_trans_none': 'अनुवाद नहीं हो सका, बाद में try करें',
+        'snip_trans_hint': 'अनुवाद कॉपी किया जा सकता है, कभी भी मूल पर लौटें',
+        'copy_text_btn': 'टेक्स्ट कॉपी करें (Enter)', 'copy_img_btn': 'चित्र कॉपी करें',
+        'search_this': 'इस टेक्स्ट को खोजें', 'save_img': 'चित्र सहेजें',
+        'snip_timeout': 'टेक्स्ट पहचान में समय लगा', 'snip_none': 'कोई टेक्स्ट नहीं पहचाना',
+        'snip_fail': 'पहचान विफल',
+        'snip_ready': 'स्क्रीनशॉट तैयार (Enter से खोज, Delete से हटाएँ)',
+        'snip_lines': '{n} पंक्तियाँ', 'snip_copied': 'कॉपी हो गया ✓',
+        'snip_img_copied': 'चित्र क्लिपबोर्ड में कॉपी ✓', 'snip_saved': 'डेस्कटॉप पर सहेजा ✓',
+        'snip_save_fail': 'सहेजना विफल',
+        'preview_title': 'स्क्रीनशॉट पूर्वावलोकन',
+        'preview_hint': 'Enter से खोज · Esc या क्लिक से बंद करें',
+        'preview_close': 'पूर्वावलोकन बंद करें (Esc)',
+        'img_pill': 'बड़ा करने के लिए क्लिक करें (Enter से खोज, Delete से हटाएँ)',
+        'img_pill_del': 'चित्र हटाएँ (Delete)',
+        'trans_title': 'अनुवाद', 'trans_auto': 'स्वतः (हिन्दी में)',
+        'trans_ph': 'ऊपर खोज बॉक्स में वह टेक्स्ट लिखें जिसका अनुवाद चाहिए',
+        'trans_doing': 'अनुवाद हो रहा है...', 'trans_timeout': 'अनुवाद में समय लगा',
+        'trans_fail': 'कोई अनुवाद नहीं मिला (शायद इंजन ने मूल टेक्स्ट लौटाया या कनेक्शन नहीं है)',
+        'trans_bypass': 'प्रॉक्सी पोर्ट उपलब्ध नहीं — सीधे कनेक्शन पर स्विच किया',
+        'trans_copied': 'अनुवाद कॉपी ✓',
+        'cb_confirm': 'पसंदीदा छोड़कर क्लिपबोर्ड इतिहास साफ़ करें? (पसंदीदा सुरक्षित रहेंगे)',
+        'cb_loading': 'लोड हो रहा है...', 'cb_pin_on': 'पसंदीदा में जोड़ा ★',
+        'cb_pin_off': 'पसंदीदा से हटाया', 'cb_deleted': 'हटाया गया',
+        'cb_cleared': 'इतिहास साफ़ (पसंदीदा सुरक्षित)',
+    },
+}
+
+
 MINI_TPL = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 
-<title>第二大脑 · 快搜</title>
+<title>__U_win_title__</title>
 
 <style>
 
 *{box-sizing:border-box;margin:0;padding:0}
 
-html,body{height:100%;background:#fff;overflow:hidden;
+:root{--sb-bg:255 255 255;--sb-card:255 255 255;--sb-ink:26 34 51;--sb-sub:154 160 166;--sb-line:232 234 243;--sb-accent:79 110 247;--sb-side:128 137 160;--sb-glow:255 255 255}
+
+html[data-theme=dark]{--sb-bg:24 27 33;--sb-card:34 38 46;--sb-ink:228 231 238;--sb-sub:154 163 178;--sb-line:46 51 61;--sb-accent:107 138 255;--sb-side:154 164 182;--sb-glow:0 0 0}
+
+html,body{height:100%;background:rgb(var(--sb-bg));overflow:hidden;
 
   font-family:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
 
-  color:#1a2233;-webkit-font-smoothing:antialiased}
+  color:rgb(var(--sb-ink));-webkit-font-smoothing:antialiased}
 
 #pane{display:flex;flex-direction:column;height:100%}
 
 .bar{display:flex;align-items:center;height:62px;padding:0 12px 0 22px;flex:0 0 auto}
 
+.pasted-img-pill{display:inline-flex;align-items:center;gap:6px;padding:3px 6px 3px 4px;margin-right:8px;
+  background:rgb(var(--sb-line) / .65);border:1px solid rgb(var(--sb-line));border-radius:7px;
+  flex:0 0 auto;max-width:140px;position:relative;animation:pill-in .15s ease;cursor:pointer;user-select:none}
+@keyframes pill-in{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+.pasted-img-pill.hide{display:none}
+.pasted-img-pill img{width:26px;height:26px;object-fit:cover;border-radius:4px;display:block}
+.pasted-img-del{border:0;background:transparent;color:rgb(var(--sb-sub));cursor:pointer;
+  width:16px;height:16px;display:flex;align-items:center;justify-content:center;
+  border-radius:50%;font-size:13px;line-height:1;padding:0}
+.pasted-img-del:hover{background:rgb(var(--sb-ink) / .15);color:rgb(var(--sb-ink))}
+.pasted-img-spinner{width:12px;height:12px;border:2px solid rgb(var(--sb-accent) / .3);
+  border-top-color:rgb(var(--sb-accent));border-radius:50%;animation:p-spin .6s linear infinite}
+@keyframes p-spin{to{transform:rotate(360deg)}}
+.pasted-img-spinner.hide{display:none}
+.small .pasted-img-pill{margin-right:6px;padding:2px 5px 2px 3px}
+.small .pasted-img-pill img{width:20px;height:20px}
+
 #q{flex:1;min-width:0;border:0;outline:0;background:transparent;font-size:19px;
 
-  font-family:inherit;color:#101828;letter-spacing:.2px;line-height:1.4}
+  font-family:inherit;color:rgb(var(--sb-ink));letter-spacing:.2px;line-height:1.4}
 
-#q::placeholder{color:#a9b0be;font-weight:400}
+#q::placeholder{color:rgb(var(--sb-sub));font-weight:400}
 
 .act{display:flex;align-items:center;gap:2px;flex:0 0 auto}
 
+/* 第 369 项：截图翻译的「悬停浮层」——只有停在相机键上 0.6 秒才出现，平时零占位。
+   绝对定位盖在结果列表上，出现时不挤动输入框和这排按钮。
+   注意：锚点必须是**相机键自己**（.snipwrap），不是整排按钮 ——
+   否则鼠标移到「详情 / 搜索」上也会冒出截图翻译（用户 2026-11-20 实测报的）。 */
+.actwrap{position:relative;display:flex;align-items:center;flex:0 0 auto}
+.snipwrap{position:relative;display:flex;align-items:center}
+.act-pop{display:none;position:absolute;right:100%;top:50%;transform:translateY(-50%);margin-right:6px;z-index:60;padding:2px;
+  border-radius:9px;background:rgb(var(--sb-card));border:1px solid rgb(var(--sb-line));
+  box-shadow:0 8px 24px rgba(0,0,0,.22)}
+.snipwrap.hover .act-pop{display:block;animation:actfade .12s ease}
+@keyframes actfade{from{opacity:0}to{opacity:1}}
+.act-pop-btn{display:inline-flex;align-items:center;gap:6px;border:0;cursor:pointer;font:inherit;
+  font-size:12px;padding:6px 10px;border-radius:7px;background:transparent;color:rgb(var(--sb-ink));white-space:nowrap}
+.act-pop-btn:hover{background:rgb(var(--sb-accent) / .12);color:rgb(var(--sb-accent))}
+.act-pop-btn svg{width:15px;height:15px}
+
 .ab{border:0;background:transparent;width:34px;height:34px;border-radius:9px;cursor:pointer;
 
-  display:flex;align-items:center;justify-content:center;color:#9aa3b2;transition:.13s}
+  display:flex;align-items:center;justify-content:center;color:rgb(var(--sb-sub));transition:.13s}
 
-.ab:hover{background:#f1f3f8;color:#4f6ef7}
+.ab:hover{background:rgb(var(--sb-line) / .55);color:rgb(var(--sb-accent))}
 
 .ab svg{width:17px;height:17px}
+
+.ab.abtext{width:auto;padding:0 10px;font-size:12px;font-weight:600;letter-spacing:.3px}
+
+.act .ab.abtext{min-width:46px}
+
+.ab.on{background:rgb(var(--sb-accent) / .15);color:rgb(var(--sb-accent))}
+
+.small .ab.abtext{width:auto;min-width:38px;padding:0 6px;font-size:11px}
 
 #list{flex:0 0 auto;padding:0 8px;overflow:hidden}
 
@@ -14591,7 +18890,9 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
 #list.rec .row{height:48px}
 
-.row.on{background:#f1f3f4}
+.row.on{background:rgb(var(--sb-line) / .55)}
+
+.row.mark{background:rgb(var(--sb-line) / .9);box-shadow:inset 3px 0 0 rgb(var(--sb-accent))}
 
 .ico{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:26px;height:26px}
 
@@ -14607,39 +18908,78 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
 .nm{font-size:16.5px;line-height:1.22;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 
-  color:#1a73e8}
+  color:rgb(var(--sb-accent))}
 
-.nm b{font-weight:600;color:#1a73e8;background:#fff3b8;border-radius:2px}
+.nm b{font-weight:600;color:rgb(var(--sb-accent));background:rgb(var(--sb-accent) / .16);border-radius:2px}
 
-.tag{font-style:normal;font-size:10.5px;line-height:1;color:#8b7ad6;background:#f1eefc;
+.tag{font-style:normal;font-size:10.5px;line-height:1;color:rgb(var(--sb-accent));background:rgb(var(--sb-accent) / .13);
 
   border-radius:4px;padding:2px 5px;margin-left:7px;vertical-align:1.5px;letter-spacing:.02em}
 
-.sep{font-size:11px;color:#8b93a6;padding:7px 12px 3px 40px;border-top:1px solid #eef1f7;margin-top:5px}
+.sep{font-size:11px;color:rgb(var(--sb-sub));padding:7px 12px 3px 40px;border-top:1px solid rgb(var(--sb-line));margin-top:5px}
 
-.sn{font-size:12px;line-height:1.25;color:#9aa3b2;white-space:nowrap;overflow:hidden;
+.sn{font-size:12px;line-height:1.25;color:rgb(var(--sb-sub));white-space:nowrap;overflow:hidden;
 
   text-overflow:ellipsis}
 
-.sn mark{background:#fff2b8;border-radius:2px;padding:0 1px;color:#5a4a12;font-weight:500}
+.sn mark{background:rgb(var(--sb-accent) / .16);border-radius:2px;padding:0 1px;color:rgb(var(--sb-ink));font-weight:500}
 
-.pt,.pt b{font-weight:400;font-size:13px;line-height:1.2;color:#9aa0a6;
+.pt,.pt b{font-weight:400;font-size:13px;line-height:1.2;color:rgb(var(--sb-sub));
 
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
 
+/* 第 275 项：空状态那列「最近打开」的**可选紧凑样式**。原来一行两排（16.5px 名称 + 13px 灰路径）
+   占 48px、铺 6 条 300 多像素；紧凑版把名称与路径排同一行、行高 32px、最多 4 条。
+   用户说过"改小一点"，但看到实际观感又觉得不如原样 —— 所以 11-17 20:x 改成
+   **默认还原原样，设置 → 快搜窗「最近记录紧凑显示」自己开**（qs_home_compact）。 */
+#list.compact .row{height:32px;gap:8px;padding:0 11px 0 10px;border-radius:6px}
+
+#list.compact .ico,#list.compact .ico .ic{width:17px;height:17px}
+
+#list.compact .ico .fic{width:14px;height:14px}
+
+#list.compact .txt{flex-direction:row;align-items:baseline;gap:9px;overflow:hidden}
+
+#list.compact .nm{font-size:13.5px;flex:0 0 auto;max-width:58%}
+
+#list.compact .pt{flex:1 1 0;min-width:0;font-size:11px;color:rgb(var(--sb-sub) / .82)}
+
+#list.compact .sn{flex:0 1 auto;min-width:0;font-size:11px}
+
+
 .rh{display:flex;align-items:center;height:26px;padding:0 14px 0 13px;font-size:11px;
 
-  letter-spacing:.06em;color:#b3bac7;flex:0 0 auto}
+  letter-spacing:.06em;color:rgb(var(--sb-sub) / .8);flex:0 0 auto}
 
-.rh span{margin-left:auto;letter-spacing:0;color:#c6ccd7}
+.rh span{margin-left:auto;letter-spacing:0;color:rgb(var(--sb-sub) / .75)}
 
-.kbd{flex:0 0 auto;font-size:12px;color:#c0c6d1;font-variant-numeric:tabular-nums}
+.kbd{flex:0 0 auto;font-size:12px;color:rgb(var(--sb-sub) / .8);font-variant-numeric:tabular-nums}
 
-.row.on .kbd{color:#8b93a5}
+.dlist .row{height:44px;cursor:pointer;gap:10px}
+
+.dlist .row:hover{background:rgb(var(--sb-line) / .55)}
+
+.dlist .row .nm{font-weight:500}
+
+.dlist .row .kbd{color:rgb(var(--sb-accent));font-size:11px}
+
+.dh{color:rgb(var(--sb-accent))}
+
+.dh span{color:rgb(var(--sb-sub))}
+
+.jm{display:flex;align-items:center;height:26px;padding:0 14px 0 13px;font-size:11.5px;
+
+  color:rgb(var(--sb-accent));background:rgb(var(--sb-line) / .55);flex:0 0 auto;
+
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.jm.hide{display:none}
+
+.row.on .kbd{color:rgb(var(--sb-sub))}
 
 .foot{display:flex;align-items:center;justify-content:space-between;height:36px;
 
-  margin:0 8px;padding:0 12px;border-top:1px solid #f1f2f6;font-size:12.5px;color:#7b8398;
+  margin:0 8px;padding:0 12px;border-top:1px solid rgb(var(--sb-line));font-size:12.5px;color:rgb(var(--sb-sub));
 
   gap:10px;flex:0 0 auto}
 
@@ -14647,15 +18987,21 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
 /* 「c: 只搜正文」的顺带提示：比正文更淡，不抢「展示更多」的主次 */
 
-.chint{font-size:11.5px;color:#bcc3d0;white-space:nowrap}
+.chint{font-size:11.5px;color:rgb(var(--sb-sub) / .75);white-space:nowrap}
 
 .foot.clickable{cursor:pointer}
 
-.foot.clickable:hover .fl{color:#0d1424}
+.foot.clickable:hover .fl{color:rgb(var(--sb-ink))}
 
-.foot.clickable:hover .fr{color:#3b465c}
+.foot.clickable:hover .fr{color:rgb(var(--sb-ink))}
 
 .rh.hide{display:none}
+
+#wallbg{position:fixed;inset:0;z-index:-1;background-position:center;background-size:cover;opacity:0;transition:opacity .18s;pointer-events:none}
+
+body.has-wall{background:transparent}
+
+body.has-wall #pane{background:rgb(var(--sb-bg) / .86);text-shadow:0 1px 2px rgb(var(--sb-glow) / .70)}
 
 .foot .fl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:8px}
 
@@ -14665,42 +19011,39 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
   border-top:2px solid #fff;border-right:2px solid #fff;transform:rotate(45deg)}
 
-.foot.clickable .fl{color:#1a73e8}
+.foot.clickable .fl{color:rgb(var(--sb-accent))}
 
-.foot .fr{flex:0 0 auto;color:#a7aebc;font-size:11.5px}
+.foot .fr{flex:0 0 auto;color:rgb(var(--sb-sub));font-size:11.5px}
 
-.foot b{font-weight:600;color:#3b465c}
+.foot b{font-weight:600;color:rgb(var(--sb-ink))}
 
-.empty{height:64px;display:flex;align-items:center;padding:0 24px;font-size:13px;color:#9aa3b2}
+.empty{height:64px;display:flex;align-items:center;padding:0 24px;font-size:13px;color:rgb(var(--sb-sub))}
 
 .empty.hide{display:none}
 
-.empty i{font-style:normal;margin-left:auto;color:#c2c8d4;font-size:11.5px}
+.empty i{font-style:normal;margin-left:auto;color:rgb(var(--sb-sub) / .7);font-size:11.5px}
 
 .fright{display:flex;align-items:center;gap:10px}
 
-.mver{font-size:11.5px;color:#a7aebc;cursor:pointer;font-variant-numeric:tabular-nums}
+.mver{font-size:11.5px;color:rgb(var(--sb-sub));cursor:pointer;font-variant-numeric:tabular-nums}
 
-.mver:hover{color:#3b465c}
+.mver:hover{color:rgb(var(--sb-ink))}
 
 .amask{position:fixed;inset:0;background:rgba(15,22,40,.4);z-index:50;display:none}
 /* 右键菜单（第 123 项）：快搜窗结果行右键 → 打开/所在文件夹/复制路径/属性 */
-#cmenu{position:fixed;z-index:60;display:none;min-width:150px;background:#fff;
-  border:1px solid #e8eaf3;border-radius:10px;box-shadow:0 8px 24px rgba(15,22,40,.16);
+#cmenu{position:fixed;z-index:60;display:none;min-width:150px;background:rgb(var(--sb-card) / .98);
+  border:1px solid rgb(var(--sb-line));border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.28);
   padding:4px;overflow:hidden}
 #cmenu.on{display:block}
 #cmenu .ci{display:block;width:100%;text-align:left;padding:7px 12px;border:0;background:none;
-  font-size:12.5px;color:#2b2f3a;cursor:pointer;border-radius:7px}
-#cmenu .ci:hover{background:#eef1fb;color:#3b5bfd}
-.dark #cmenu{background:#23262f;border-color:#3a3f4d}
-.dark #cmenu .ci{color:#dfe3ea}
-.dark #cmenu .ci:hover{background:#31353f;color:#aebdfc}
+  font-size:12.5px;color:rgb(var(--sb-ink));cursor:pointer;border-radius:7px}
+#cmenu .ci:hover{background:rgb(var(--sb-accent) / .12);color:rgb(var(--sb-accent))}
 
 .amask.on{display:block}
 
 .about{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%) scale(.95);z-index:51;
 
-  width:300px;max-width:86vw;background:#fff;border:1px solid #e8eaf3;border-radius:16px;
+  width:300px;max-width:86vw;background:rgb(var(--sb-card));border:1px solid rgb(var(--sb-line));border-radius:16px;
 
   padding:26px 22px 20px;text-align:center;display:none;box-shadow:0 20px 60px rgba(20,30,60,.28)}
 
@@ -14710,33 +19053,244 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
 .about .alogo{font-size:34px;line-height:1}
 
-.about .aname{font-size:15px;font-weight:700;margin-top:8px;color:#1a2233}
+.about .aname{font-size:15px;font-weight:700;margin-top:8px;color:rgb(var(--sb-ink))}
 
-.about .aver{font-size:30px;font-weight:800;color:#4f6ef7;margin:10px 0 14px;letter-spacing:.02em}
+.about .aver{font-size:30px;font-weight:800;color:rgb(var(--sb-accent));margin:10px 0 14px;letter-spacing:.02em}
 
-.about .ameta{font-size:12.5px;color:#6b7280;line-height:1.95}
+.about .ameta{font-size:12.5px;color:rgb(var(--sb-sub));line-height:1.95}
 
-.about .ameta b{color:#1a2233;font-weight:600;font-variant-numeric:tabular-nums}
+.about .ameta b{color:rgb(var(--sb-ink));font-weight:600;font-variant-numeric:tabular-nums}
 
-.about .anote{font-size:11.5px;color:#8089a0;margin:14px 0 18px;line-height:1.65;
+.about .anote{font-size:11.5px;color:rgb(var(--sb-sub));margin:14px 0 18px;line-height:1.65;
 
-  background:#f6f7fb;border-radius:9px;padding:10px 12px}
+  background:rgb(var(--sb-line) / .45);border-radius:9px;padding:10px 12px}
+
+.pbtn{font-size:12px;padding:5px 12px;border-radius:6px;cursor:pointer;border:0;background:rgb(var(--sb-line));color:rgb(var(--sb-ink))}
+
+.pbtn.blue{background:rgb(var(--sb-accent));color:#fff}
+
+.pbtn:hover{opacity:.9}
 
 .about .pbtn{width:100%}
 
 
 
+.sc{display:flex;align-items:center;gap:6px;margin:2px 12px 6px;padding:3px 8px;border-radius:7px;
+
+box-sizing:border-box;background:rgb(var(--sb-accent) / .13);font-size:12px;color:rgb(var(--sb-sub))}
+
+.sc.hide{display:none}
+
+.sc #sct{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.sc button{border:0;background:transparent;color:rgb(var(--sb-sub));cursor:pointer;font-size:15px;
+
+line-height:1;padding:0 2px}
+
+.sc button:hover{color:rgb(var(--sb-ink))}
+
+/* 小窗模式（第 198 项）：贴在文件夹右下角 / 对话框下方时用，宽度 460。
+   只缩尺寸不删信息，路径和快捷键都还在，只是行高紧一档。 */
+
+.small #pane{width:100%;max-width:100%;overflow:hidden}
+
+.small .txt{min-width:0;max-width:100%;overflow:hidden}
+
+.small .bar{height:46px;padding:0 8px 0 14px}
+
+.small #q{font-size:14px;letter-spacing:0}
+
+.small .ab{width:26px;height:26px}
+
+.small .ab svg{width:14px;height:14px}
+
+.small #list{padding:0 5px}
+
+.small .row{height:38px;gap:8px;padding:0 10px 0 8px;border-radius:7px}
+
+.small #list.rec .row{height:36px}
+
+.small .ico{width:20px;height:20px}
+
+.small .ico .ic{width:20px;height:20px}
+
+.small .ico .fic{width:14px;height:14px}
+
+.small .nm{font-size:13.5px;min-width:0;max-width:100%}
+
+.small .pt{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:100%}
+
+#dlist .grp{font-size:11px;color:rgb(var(--sb-sub));padding:5px 12px 0;opacity:.9}
+
+/* 第 199 项：小窗只有 320~460 宽，标题右边那句提示会挤爆，直接不显示——
+   第一条右边本来就有 Ctrl+G 键帽。 */
+
+.small .dh span{display:none}
+
+.small .dh,.small .rh{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+
+.small #dlist .grp{font-size:10px;padding:3px 10px 0}
+
+.small .row{overflow:hidden}
+
+.small .rh{padding-right:8px;padding-left:10px}
+
+.small .kbd{font-size:10.5px}
+
+.small .sc{font-size:11px;margin:0 8px 4px;padding:2px 6px}
+
+.small .foot{font-size:10.5px}
+
+
+/* 第 203 项：网络搜索模式 —— 输入框左边显示引擎名 + 竖线，结果只有一行 */
+.wtag{flex:0 0 auto;font-size:19px;font-weight:500;color:rgb(var(--sb-accent));
+  padding-right:12px;margin-right:12px;border-right:1px solid rgb(var(--sb-line));
+  white-space:nowrap;max-width:150px;overflow:hidden;text-overflow:ellipsis}
+.wtag.hide{display:none}
+.webrow .wico{display:flex;align-items:center;justify-content:center;
+  width:26px;height:26px;border-radius:7px;background:rgb(var(--sb-accent) / .14);
+  color:rgb(var(--sb-accent));font-size:14px;font-weight:600}
+.small .wtag{font-size:13px;padding-right:8px;margin-right:8px}
+.small .webrow .wico{width:18px;height:18px;font-size:11px;border-radius:5px}
+
+/* 截图大图预览卡片 */
+.img-preview-box{display:flex;flex-direction:column;background:rgb(var(--sb-card));border-bottom:1px solid rgb(var(--sb-line));animation:apop .15s ease}
+.img-preview-box.hide{display:none}
+.ip-head{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:rgb(var(--sb-bg) / .4);border-bottom:1px solid rgb(var(--sb-line) / .5)}
+.ip-title{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:rgb(var(--sb-ink))}
+.ip-meta{font-size:11px;font-weight:normal;color:rgb(var(--sb-sub));margin-left:4px}
+.ip-hint{font-size:11px;color:rgb(var(--sb-sub))}
+.ip-close{border:0;background:transparent;cursor:pointer;font-size:16px;line-height:1;color:rgb(var(--sb-sub));padding:0 4px}
+.ip-close:hover{color:rgb(var(--sb-ink))}
+.ip-body{display:flex;align-items:center;justify-content:center;padding:10px 14px;background:rgb(var(--sb-bg) / .25);max-height:280px;overflow:hidden;cursor:zoom-out}
+.ip-body img{max-width:100%;max-height:260px;object-fit:contain;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,0.12)}
+
+/* 截图识字卡片 */
+.snip-box{display:flex;flex-direction:column;gap:8px;padding:12px;background:rgb(var(--sb-card));border-bottom:1px solid rgb(var(--sb-line));animation:apop .15s ease}
+.snip-box.hide{display:none}
+.sb-head{display:flex;align-items:center;justify-content:space-between}
+.sb-title{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:rgb(var(--sb-ink))}
+.sb-meta{font-size:11px;font-weight:normal;color:rgb(var(--sb-sub));margin-left:4px}
+.sb-close{border:0;background:transparent;cursor:pointer;font-size:16px;line-height:1;color:rgb(var(--sb-sub));padding:0 4px}
+.sb-close:hover{color:rgb(var(--sb-ink))}
+.sb-body{display:flex;gap:10px;max-height:160px}
+.sb-thumb-wrap{flex:0 0 110px;height:120px;border-radius:8px;overflow:hidden;border:1px solid rgb(var(--sb-line));background:rgba(0,0,0,.03);display:flex;align-items:center;justify-content:center}
+.sb-thumb-wrap img{max-width:100%;max-height:100%;object-fit:contain}
+#sbText{flex:1;min-width:0;height:120px;border-radius:8px;border:1px solid rgb(var(--sb-line));padding:8px 10px;font-size:12.5px;line-height:1.5;color:rgb(var(--sb-ink));background:transparent;resize:none;outline:none;font-family:inherit}
+#sbText:focus{border-color:rgb(var(--sb-accent))}
+.sb-foot{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.sb-foot .pbtn{font-size:12px;padding:5px 12px;border-radius:6px;cursor:pointer;border:0}
+.sb-foot .pbtn.blue{background:rgb(var(--sb-accent));color:#fff}
+.sb-foot .pbtn.blue:hover{opacity:.9}
+.sb-foot .pbtn.gray{background:rgb(var(--sb-line));color:rgb(var(--sb-ink))}
+.sb-foot .pbtn.gray:hover{opacity:.8}
+/* 第 361 项：截图翻译 —— 原文 / 译文 切换 */
+.sb-views{display:none;gap:2px;margin-left:6px;padding:2px;border-radius:8px;background:rgb(var(--sb-line) / .38)}
+.sb-views.on{display:inline-flex}
+.sbv{border:0;cursor:pointer;font:inherit;font-size:11px;line-height:1;padding:4px 9px;border-radius:6px;background:transparent;color:rgb(var(--sb-sub))}
+.sbv:hover{color:rgb(var(--sb-ink))}
+.sbv.active{background:rgb(var(--sb-card));color:rgb(var(--sb-ink))}
+.sb-foot .pbtn[disabled]{opacity:.6;cursor:default}
+
+/* 剪贴板历史卡片 */
+.clip-box{display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:rgb(var(--sb-card));border-bottom:1px solid rgb(var(--sb-line));animation:apop .15s ease;max-height:260px}
+.clip-box.hide{display:none}
+.cb-head{display:flex;align-items:center;gap:8px}
+.cb-title{display:flex;align-items:center;gap:5px;font-size:12.5px;font-weight:600;color:rgb(var(--sb-ink))}
+.cb-tabs{display:flex;align-items:center;gap:4px;margin-left:6px}
+.cbt{font-size:11.5px;padding:2px 8px;border-radius:4px;border:0;background:transparent;color:rgb(var(--sb-sub));cursor:pointer}
+.cbt.active{background:rgb(var(--sb-accent));color:#fff;font-weight:500}
+.cb-clear{font-size:11.5px;margin-left:auto;border:0;background:transparent;color:rgb(var(--sb-sub));cursor:pointer;padding:2px 6px;border-radius:4px}
+.cb-clear:hover{color:#ef4444;background:rgba(239,68,68,0.08)}
+.cb-list{display:flex;flex-direction:column;gap:4px;overflow-y:auto;max-height:200px;padding-right:2px}
+.cb-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;transition:background .1s;position:relative}
+.cb-item:hover{background:rgb(var(--sb-line) / .5)}
+.cb-badge{font-size:10.5px;padding:1px 5px;border-radius:3px;background:rgb(var(--sb-line));color:rgb(var(--sb-ink));white-space:nowrap}
+.cb-txt{flex:1;min-width:0;font-size:12px;color:rgb(var(--sb-ink));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cb-time{font-size:10.5px;color:rgb(var(--sb-sub));white-space:nowrap}
+.cb-del{opacity:0;border:0;background:transparent;color:rgb(var(--sb-sub));cursor:pointer;padding:2px 4px;border-radius:3px;font-size:12px}
+.cb-item:hover .cb-del{opacity:1}
+.cb-del:hover{color:#ef4444}
+.cb-pin{opacity:0;border:0;background:transparent;color:rgb(var(--sb-sub));cursor:pointer;padding:2px 4px;border-radius:3px;font-size:13px;line-height:1;transition:all .15s}
+.cb-item:hover .cb-pin{opacity:1}
+.cb-pin.pinned{opacity:1;color:#f59e0b}
+.cb-pin:hover{color:#f59e0b;transform:scale(1.2)}
+.cb-item.cb-copying{background:rgb(var(--sb-accent) / .15);transition:background .1s}
+.cb-img-thumb{width:36px;height:24px;border-radius:3px;object-fit:cover;border:1px solid rgb(var(--sb-line))}
+.mini-toast{position:fixed;top:8px;left:50%;transform:translateX(-50%) translateY(-6px);background:rgba(24,28,38,.94);color:#fff;backdrop-filter:blur(8px);padding:5px 14px;border-radius:6px;font-size:12px;font-weight:500;box-shadow:0 4px 14px rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.14);opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;z-index:999;white-space:nowrap}
+.mini-toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* 聚合翻译卡片 */
+.trans-box{display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:rgb(var(--sb-card));border-bottom:1px solid rgb(var(--sb-line));animation:apop .15s ease;max-height:260px}
+.trans-box.hide{display:none}
+.tb-head{display:flex;align-items:center;gap:8px}
+.tb-title{display:flex;align-items:center;gap:5px;font-size:12.5px;font-weight:600;color:rgb(var(--sb-ink))}
+.tb-actions{display:flex;align-items:center;gap:6px;margin-left:auto}
+.tb-lang-select{font-size:11px;color:rgb(var(--sb-ink));background:rgb(var(--sb-line) / .4);border:1px solid rgb(var(--sb-line));padding:2px 6px;border-radius:5px;outline:none;cursor:pointer}
+.tb-lang-select:hover{border-color:rgb(var(--sb-accent))}
+.tb-run-btn{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:#fff;background:rgb(var(--sb-accent));border:none;padding:3px 9px;border-radius:5px;cursor:pointer;transition:opacity .15s}
+.tb-run-btn:hover{opacity:.9}
+.tb-results{display:flex;flex-direction:column;gap:6px;overflow-y:auto;max-height:200px}
+/* 第 359 项：这两块会滚动，之前用系统滚动条 —— 深色配色下就是一条白轨 */
+.cb-list::-webkit-scrollbar,.tb-results::-webkit-scrollbar{width:8px;height:8px}
+.cb-list::-webkit-scrollbar-thumb,.tb-results::-webkit-scrollbar-thumb{background:rgb(var(--sb-sub) / .45);border-radius:8px}
+.cb-list::-webkit-scrollbar-track,.tb-results::-webkit-scrollbar-track{background:transparent}.cb-list::-webkit-scrollbar-thumb:hover,.tb-results::-webkit-scrollbar-thumb:hover{background:rgb(var(--sb-sub) / .7)}
+.tb-card{display:flex;flex-direction:column;gap:3px;padding:8px 10px;border-radius:6px;border:1px solid rgb(var(--sb-line));background:rgb(var(--sb-bg) / .3);cursor:pointer;transition:border-color .15s}
+.tb-card:hover{border-color:rgb(var(--sb-accent))}
+.tb-card-head{display:flex;align-items:center;justify-content:space-between;font-size:11px}
+.tb-engine{font-weight:600;color:rgb(var(--sb-accent))}
+.tb-extra{color:rgb(var(--sb-sub))}
+.tb-card-text{font-size:12.5px;line-height:1.4;color:rgb(var(--sb-ink))}
+
+/* 第 245 项：方案2（.tbl 紧凑表）整段 CSS 已删除，弹窗样式只保留方案1。 */
 </style></head><body>
 
+<div id="wallbg" aria-hidden="true"></div>
+
 <div id="pane">
+  <div id="miniToast" class="mini-toast" aria-live="polite"></div>
 
   <div class="bar">
 
-    <input id="q" spellcheck="false" autocomplete="off" placeholder="搜索文件名、文件夹或正文内容">
+    <div class="pasted-img-pill hide" id="pastedImgPill" title="__U_img_pill__" onclick="toggleImgPreview(event)">
+      <img id="pastedImgThumb" src="" alt="pasted" />
+      <span class="pasted-img-spinner hide" id="pastedImgSpinner"></span>
+      <button class="pasted-img-del" id="pastedImgDel" onclick="clearPastedImg(event)" title="__U_img_pill_del__">×</button>
+    </div>
 
+    <span class="wtag hide" id="wtag"></span>
+
+    <input id="q" spellcheck="false" autocomplete="off" placeholder="__U_q_ph__">
+
+    <div class="actwrap" id="actWrap">
     <div class="act">
 
-      <button class="ab" id="btnDetail" title="详细搜索（Ctrl+Enter）">
+      <!-- 第 369 项：相机键和它的悬停胶囊单独包一层，胶囊只跟这颗键走 -->
+      <div class="snipwrap" id="snipWrap">
+      <button class="ab" id="btnSnip" title="__TIP_SNIP__" onclick="doSnip(false, event)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v12a2 2 0 0 0 2 2h12"/><path d="M18 21V9a2 2 0 0 0-2-2H4"/></svg>
+      </button>
+
+      <div class="act-pop" id="actPop">
+        <button class="act-pop-btn" id="btnSnipTr" title="__U_snip_trans_hint__" onclick="doSnip(true, event, true)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg>
+          <span>__U_snip_tr_hover__</span>
+        </button>
+      </div>
+      </div>
+
+      <button class="ab" id="btnClip" title="__TIP_CLIP__" onclick="toggleClipPanel(event)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+      </button>
+
+      <button class="ab" id="btnTrans" title="__TIP_TRANS__" onclick="toggleTransPanel(event)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg>
+      </button>
+
+      <button class="ab" id="btnDetail" title="__U_detail__">
 
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
 
@@ -14746,7 +19300,7 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
       </button>
 
-      <button class="ab" id="btnSearch" title="搜索">
+      <button class="ab" id="btnSearch" title="__U_search__">
 
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
 
@@ -14756,19 +19310,120 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
     </div>
 
+    </div>
+
   </div>
 
-  <div class="rh hide" id="rh">最近打开<span>Enter 直接打开</span></div>
+  <div class="sc hide" id="sc"><span id="sct"></span><button id="scx" onclick="clearScope()" title="">×</button></div>
+
+  <div class="jm hide" id="jm"></div>
+
+  <div class="snip-box hide" id="snipBox">
+    <div class="sb-head">
+      <div class="sb-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12a2 2 0 0 0 2 2h12"/><path d="M18 21V9a2 2 0 0 0-2-2H4"/></svg>
+        <span>__U_snip_title__</span>
+        <span class="sb-meta" id="sbMeta"></span>
+        <span class="sb-views" id="sbViews">
+          <button class="sbv active" data-v="src" onclick="snipShow('src', event)">__U_snip_src__</button>
+          <button class="sbv" data-v="dst" onclick="snipShow('dst', event)">__U_snip_dst__</button>
+        </span>
+      </div>
+      <button class="sb-close" onclick="closeSnipBox(event)" title="__TIP_CB_CLOSE__">×</button>
+    </div>
+    <div class="sb-body">
+      <div class="sb-thumb-wrap" id="sbThumbWrap">
+        <img id="sbThumb" src="" alt="" />
+      </div>
+      <textarea id="sbText" spellcheck="false" placeholder="__U_snip_ph__"></textarea>
+    </div>
+    <div class="sb-foot">
+      <button class="pbtn blue" id="sbBtnTrans" onclick="translateSnip(event)" title="__U_snip_trans_hint__">__U_snip_trans__</button>
+      <button class="pbtn gray" id="sbBtnCopy" onclick="copySnipText(event)">__U_copy_text_btn__</button>
+      <button class="pbtn gray" id="sbBtnCopyImg" onclick="copySnipImg(event)">__U_copy_img_btn__</button>
+      <button class="pbtn gray" onclick="fillSnipToSearch(event)">__U_search_this__</button>
+      <button class="pbtn gray" id="sbBtnSave" onclick="saveSnipImg(event)">__U_save_img__</button>
+    </div>
+  </div>
+
+  <div class="img-preview-box hide" id="imgPreviewBox">
+    <div class="ip-head">
+      <div class="ip-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        <span>__U_preview_title__</span>
+        <span class="ip-meta" id="ipMeta"></span>
+      </div>
+      <div class="ip-hint">__U_preview_hint__</div>
+      <button class="ip-close" onclick="closeImgPreview(event)" title="__U_preview_close__">×</button>
+    </div>
+    <div class="ip-body" onclick="closeImgPreview(event)">
+      <img id="ipImg" src="" alt="preview" />
+    </div>
+  </div>
+
+  <div class="clip-box hide" id="clipBox">
+    <div class="cb-head">
+      <div class="cb-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+        <span>__TIP_CB_TITLE__</span>
+      </div>
+      <div class="cb-tabs">
+        <button class="cbt active" data-kind="all" onclick="setClipFilter('all', event)">__TIP_CB_ALL__</button>
+        <button class="cbt" data-kind="fav" onclick="setClipFilter('fav', event)">__TIP_CB_FAV__</button>
+        <button class="cbt" data-kind="text" onclick="setClipFilter('text', event)">__TIP_CB_TEXT__</button>
+        <button class="cbt" data-kind="image" onclick="setClipFilter('image', event)">__TIP_CB_IMAGE__</button>
+        <button class="cbt" data-kind="file" onclick="setClipFilter('file', event)">__TIP_CB_FILE__</button>
+      </div>
+      <button class="cb-clear" onclick="clearClipHistory(event)" title="__TIP_CB_CLEAR_TITLE__">__TIP_CB_CLEAR__</button>
+      <button class="sb-close" onclick="closeClipPanel(event)" title="__TIP_CB_CLOSE__">×</button>
+    </div>
+    <div class="cb-list" id="cbList"></div>
+  </div>
+
+  <div class="trans-box hide" id="transBox">
+    <div class="tb-head">
+      <div class="tb-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg>
+        <span>__TIP_TRANS__</span>
+      </div>
+      <div class="tb-actions">
+        <select class="tb-lang-select" id="tbLangSelect" onchange="onTransLangChange(event)" title="__TIP_TRANS_TARGET__">
+          <option value="auto" id="tbLangAuto">__U_trans_auto__</option>
+          <option value="zh-CN">中文 (简体)</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+          <option value="es">Español</option>
+          <option value="ru">Русский</option>
+          <option value="pt">Português</option>
+          <option value="it">Italiano</option>
+          <option value="ar">العربية</option>
+          <option value="th">ไทย</option>
+          <option value="vi">Tiếng Việt</option>
+        </select>
+        <button class="tb-run-btn" id="tbBtnRun" onclick="doMiniTranslate(event)" title="__TIP_RUN__">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>
+          <span>__U_trans_title__</span>
+        </button>
+      </div>
+      <button class="sb-close" onclick="closeTransPanel(event)" title="__TIP_CB_CLOSE__">×</button>
+    </div>
+    <div class="tb-results" id="tbResults"></div>
+  </div>
+
+  <div class="rh hide" id="rh">__U_recent__<span>__U_recent_hint__</span></div>
 
   <div id="list"></div>
 
   <div class="foot hide" id="foot"><span class="fl" id="ft"></span>
 
-    <span class="fright"><span class="mver" onclick="showAbout()" title="关于 / About">__VER__</span>
+    <span class="fright"><span class="mver" onclick="showAbout()" title="__U_about__">__VER__</span>
 
-    <span class="fr" id="fr">Ctrl+Enter 详细搜索</span></span></div>
+    <span class="fr" id="fr">__U_detail_short__</span></span></div>
 
-  <div class="empty hide" id="empty">输入文件名或正文关键词，边打边出结果<i>双击 Ctrl 唤出 · Esc 关闭</i></div>
+  <div class="empty hide" id="empty">__U_empty__<i>__U_empty_hint__</i></div>
 
 </div>
 
@@ -14784,29 +19439,31 @@ html,body{height:100%;background:#fff;overflow:hidden;
 
   <div class="alogo">🧠</div>
 
-  <div class="aname" data-i18n="about_name">第二大脑 · 本地搜索</div>
+  <div class="aname">__U_about_name__</div>
 
   <div class="aver">__VER__</div>
 
   <div class="ameta" id="ab_meta_s" data-nf="__FILES__" data-nt="__TOTAL__">
 
-    <div id="ab_docs">正文可搜 <b>__TOTAL__</b> 篇 · 文件名可搜 <b>__FILES__</b> 个</div>
+    <div id="ab_docs">__U_docs_line__</div>
 
     <div>Python <b>__PY__</b> · SQLite <b>__SQL__</b></div>
 
-    <div id="ab_build">构建日期 <b>__BUILD__</b></div>
+    <div id="ab_build">__U_build_date__</div>
 
   </div>
 
-  <div class="anote" id="ab_note" data-i18n="about_note">当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。</div>
+  <div class="anote" id="ab_note">__U_about_note__</div>
 
-  <button class="pbtn gray" onclick="hideAbout()" data-i18n="about_ok">知道了</button>
+  <button class="pbtn gray" onclick="hideAbout()">__U_about_ok__</button>
 
 </div>
 
 <script>
 
 var MINI_L = __MINI_L__, MINI_LANG = '__MINI_LANG__';
+
+var WEB_SEARCH = __WEB_SEARCH__, WEB_MODE = null, WEB_Q = '';
 
 function MT(k, a){
 
@@ -14844,6 +19501,146 @@ var TYPE = {'.pdf':'#e05252','.doc':'#2b6cb0','.docx':'#2b6cb0','.xls':'#2f855a'
 
   '.exe':'#475569','.lnk':'#475569','.psd':'#2563eb','.ai':'#d97706'};
 
+function _miniBgHex(){
+
+  /* 把 --sb-bg（'24 27 33' 或 '#18211B'）转成 '#rrggbb'，给原生刷那圈非客户区用 */
+
+  try{
+
+    var v=getComputedStyle(document.documentElement).getPropertyValue('--sb-bg');
+
+    v=(v||'').trim(); if(!v)return null;
+
+    var r,g,b;
+
+    if(v.charAt(0)==='#'){
+
+      if(v.length===4){r=parseInt(v[1]+v[1],16);g=parseInt(v[2]+v[2],16);b=parseInt(v[3]+v[3],16)}
+
+      else{r=parseInt(v.slice(1,3),16);g=parseInt(v.slice(3,5),16);b=parseInt(v.slice(5,7),16)}
+
+    }else{
+
+      var p=v.split(/[\s,\/]+/).map(Number);
+
+      if(p.length<3||p.some(isNaN))return null;
+
+      r=p[0];g=p[1];b=p[2];
+
+    }
+
+    var h=function(n){n=Math.max(0,Math.min(255,n|0));return (n<16?'0':'')+n.toString(16)};
+
+    return '#'+h(r)+h(g)+h(b);
+
+  }catch(e){return null}
+
+}
+
+var _MD_TRIES=0;
+
+function syncMiniDark(dark){
+
+  /* 第 363 项：窗口最外那圈（DPI 150% 实测 11px）不在网页里，是 DWM 的非客户区。
+
+     以前没人告诉原生「这一页现在什么底色」，于是那圈一直停在建窗时的白色 ——
+
+     深色界面上就是右侧一条白边（第 359/363 项）。这里把真实底色报回去。
+
+     注意 pywebview 的 bridge 注入晚于脚本执行，所以带重试。 */
+
+  var tick=function(){
+
+    var api=window.pywebview&&window.pywebview.api;
+
+    if(api&&api.set_dark){try{api.set_dark(!!dark,_miniBgHex())}catch(e){}return}
+
+    if(_MD_TRIES++<20)setTimeout(tick,250);
+
+  };
+
+  tick();
+
+}
+
+function applyLook(){
+
+  /* 第 195 项：快搜窗之前是一套写死的白底 CSS，用户在设置里换配色/壁纸它完全不动。
+
+     localStorage 与主界面同源，主界面 applyPalette 会把 7 个变量写进 sb_vars，
+
+     这里直接复用，不再让后端维护第二份调色板。 */
+
+  try{
+
+    var look=null;
+
+    try{ look=JSON.parse(localStorage.getItem('sb_vars')||'null'); }catch(e2){}
+
+    var dark=!!(look&&look.dark);
+
+    document.documentElement.setAttribute('data-theme', dark?'dark':'light');
+
+    var keys=['bg','card','ink','sub','line','accent','side'];
+
+    if(look&&look.vars){
+
+      for(var i=0;i<keys.length;i++){
+
+        var v=look.vars[keys[i]];
+
+        if(v)document.documentElement.style.setProperty('--sb-'+keys[i], v);
+
+      }
+
+    }else{
+
+      for(var j=0;j<keys.length;j++) document.documentElement.style.removeProperty('--sb-'+keys[j]);
+
+    }
+
+    /* 第 363 项：窗口最外那圈非客户区不在网页里，颜色只能由原生刷。
+       谁比这里更清楚「本窗现在的底色」？没有。所以把算出来的 --sb-bg 报回去。 */
+
+    syncMiniDark(dark);
+
+  }catch(e){}
+
+  try{
+
+    fetch('/api/wall').then(function(r){return r.json()}).then(function(w){
+
+      var el=document.getElementById('wallbg');
+
+      if(!el||!w||!w.on||!w.scope_mini)return;
+
+      el.style.backgroundImage='url(/api/wall/image?v='+(w.v||0)+')';
+
+      /* 第 362 项：焦点位置 + 放大，和主窗同一套百分比语义 */
+      el.style.backgroundPosition=(w.pos_x||50)+'% '+(w.pos_y||50)+'%';
+
+      var _z=(w.zoom||100)/100;
+
+      if(_z>1){
+
+        el.style.transform='scale('+_z+')';
+
+        el.style.transformOrigin=(w.pos_x||50)+'% '+(w.pos_y||50)+'%';
+
+      }
+
+      el.style.opacity=(Math.min(100,Math.max(0,w.opacity||15))/100);
+
+      if(w.blur>0)el.style.filter='blur('+w.blur+'px)';
+
+      document.body.classList.add('has-wall');
+
+    }).catch(function(){});
+
+  }catch(e){}
+
+}
+
 function applyMiniLang(){
 
   try{
@@ -14852,15 +19649,20 @@ function applyMiniLang(){
 
     q.placeholder = MT('ph');
 
+    /* 第 203 项：applyMiniLang() 会在 DOMContentLoaded / __onShow 时重设占位符，
+       网络搜索模式下必须保留引擎提示，否则用户在 Google 模式里看到的是「搜文件名」。 */
+    if(MODE==='web' && WEB_MODE)
+      q.placeholder = MT('web_ph').replace('{t}', String(WEB_MODE.title||WEB_MODE.key));
+
     var bd = document.getElementById('btnDetail'), bs = document.getElementById('btnSearch');
 
     if(bd) bd.title = MT('detail');
 
     if(bs) bs.title = MT('search');
 
-    var rh = document.getElementById('rh');
+    renderHomeHeader();
 
-    if(rh) rh.innerHTML = esc(MT('recent')) + '<span>' + esc(MT('recent_hint')) + '</span>';
+    renderJumpHint();
 
     var fr = document.getElementById('fr');
 
@@ -14902,11 +19704,15 @@ function ico(it){
 
         return '<svg class="fic" viewBox="0 0 24 24"><path d="M4.8 2.6h8.4L18.8 8.3v13.1H4.8z" fill="#fff" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><path d="M13.2 2.6v5.7h5.6" fill="none" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><rect x="7.2" y="11.7" width="9" height="2.6" rx="1.3" fill="'+c+'" opacity=".92"/><rect x="7.2" y="16" width="5.8" height="2.6" rx="1.3" fill="'+c+'" opacity=".45"/></svg>'; })();
 
+  /* 图标接口万一挂了，也不能回落成一张空白纸：给商店应用一个专用应用图标 */
+  if(!dir && String(it.p||'').indexOf('shell:AppsFolder')===0)
+    fb='<svg class="fic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4.5" fill="#5b7cfa"/><path d="M8 8.5h8M8 12h8M8 15.5h5" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>';
   var q = dir ? 'd=1' : 'e='+encodeURIComponent(it.e||'');
 
   /* 应用类按真实路径取图标：shell 解析快捷方式到目标，微信显示绿气泡而不是通用 exe 图标 */
 
-  if(!dir && (it.e==='.exe'||it.e==='.lnk') && it.p) q += '&p='+encodeURIComponent(it.p);
+  /* 第 248 项：虚拟商店应用 e 是空的，也要把 p 带上，后端才能问 Shell 要图标 */
+  if(!dir && it.p && (it.e==='.exe'||it.e==='.lnk'||String(it.p).indexOf('shell:AppsFolder')===0)) q += '&p='+encodeURIComponent(it.p);
 
   return '<img class="ic" src="/api/icon?'+q+'" alt="" '
 
@@ -14966,6 +19772,21 @@ function hl(name,q){
 
 }
 
+function rowCap(){
+
+  /* 第 199 项：小窗能放几行，由宿主按「触发窗口有多大」算出的可用高度 MAXH 决定。
+
+     以前写死 6 行，在 900 宽的文件夹里就已经占掉一半高度了。 */
+
+  if(!SMALL)return 9;
+
+
+  var avail=(MAXH||360)-170;
+
+  return Math.max(2,Math.min(6,Math.floor(avail/38)));
+
+}
+
 function height(){
 
   /* 不再用「62+n*52+36」这种硬编码账本：改字号/行高/提示条都会让它对不上，
@@ -14976,7 +19797,19 @@ function height(){
 
   el=document.querySelector('.bar'); if(el) acc+=el.offsetHeight;
 
+  el=document.getElementById('sc'); if(el&&!el.classList.contains('hide')) acc+=el.offsetHeight;
+
   el=document.getElementById('rh'); if(el&&!el.classList.contains('hide')) acc+=el.offsetHeight;
+
+  el=document.getElementById('jm'); if(el&&!el.classList.contains('hide')) acc+=el.offsetHeight;
+
+  el=document.getElementById('snipBox'); if(el&&!el.classList.contains('hide')) acc+=el.offsetHeight;
+
+  el=document.getElementById('imgPreviewBox'); if(el&&!el.classList.contains('hide')) acc+=el.offsetHeight;
+
+  el=document.getElementById('clipBox'); if(el&&!el.classList.contains('hide')) acc+=el.offsetHeight;
+
+  el=document.getElementById('transBox'); if(el&&!el.classList.contains('hide')) acc+=el.offsetHeight;
 
   el=document.getElementById('list'); if(el) acc+=el.offsetHeight;
 
@@ -14990,7 +19823,7 @@ function height(){
 
 function resize(){
 
-  var h=height();
+  var h=height(); if(MAXH&&h>MAXH)h=MAXH;
 
   if(h===shown)return;
 
@@ -15056,7 +19889,7 @@ function rowHtml(it,i,q,withKey){
 
       +(it.b?'<i class="tag">'+esc(MT('tag_body'))+'</i>':'')+'</span>'+sub+'</span>'
 
-    +(withKey?'<span class="kbd">'+(i<9?'Ctrl+'+(i+1):'')+'</span>':'')+'</div>';
+    +(withKey?'<span class="kbd">'+(HAS_DIALOG?esc(MT('dh_go')):(i<9?'Ctrl+'+(i+1):''))+'</span>':'')+'</div>';
 
 }
 
@@ -15067,6 +19900,13 @@ function render(items,q,keep){
   MODE='result';
 
   rows=items||[];
+
+  /* 第 308 项：换一批结果就把多选清干净，否则下标会指向别的文件 */
+  MARKS=[]; ANCHOR=-1;
+
+  /* 小窗只留 6 行：贴在文件夹角上的小框，结果太多会把窗口撑得比文件夹还高 */
+
+  if(SMALL) rows=rows.slice(0,6);
 
   cur=rows.length?(keep&&old>=0?Math.min(old,rows.length-1):0):-1;
 
@@ -15130,26 +19970,16 @@ function render(items,q,keep){
 
      挂在搜索结果上面等于告诉用户「下面这些是你最近开的」——纯误导。
 
-     只有 renderRecent() 才该让它在场。 */
+     只有 renderHome() 才该让它在场。 */
 
   RH.classList.add('hide');
 
   if(rows.length){
 
-    /* 一条正文都没出、而第一名又是程序时，用户多半会怀疑「正文是不是没搜」。
+    /* 第 230 项：想连正文一起搜，点右侧「正文」按钮即可，不再要求用户敲 c: 前缀。
+       正文命中由 render() 的 sep 分组标注，页脚只留「展示更多」入口。 */
 
-       这不是错觉：搜「微信」正文确实一条都不占位（他要的是打开微信本体）。
-
-       顺手把 c: 语法写在这儿——不占额外空间，也不用去翻文档。 */
-
-    var nb=0;
-
-    for(var j2=0;j2<rows.length;j2++) if(rows[j2].b) nb++;
-
-    var hint=(!nb && rows[0] && rows[0].app) ? '  ·  '+MT('c_hint') : '';
-
-    FT.innerHTML='<span class=mic></span><span>'+esc(MT('more', {q: q}))+'</span>'
-      +(hint?'<span class="chint">'+esc(hint)+'</span>':'');
+    FT.innerHTML='<span class=mic></span><span>'+esc(MT('more', {q: q}))+'</span>';
 
     FR.textContent=MT('fr');
 
@@ -15169,37 +19999,282 @@ function render(items,q,keep){
 
 }
 
-/* 空状态：打开就先给一屏「刚动过的文件」。Listary V7 起就是这个做法——
+/* 空状态：打开就先给一屏「刚动过的文件 / 正开着的文件夹」。Listary V7 起就是
+   这个做法——很多时候要找的东西就在眼前，搜索这一步可以直接省掉。
 
-   很多时候要找的东西就在眼前，搜索这一步可以直接省掉。 */
+   第 234 项：原来这里是两块（上面「最近访问」目录、下面「最近打开」文件），
+   两块的记录同源，并列时几乎一模一样，用户看到的就是重复列表。现在合成一块：
+   目录在前（在对话框里它们就是「跳过去」的目标）、最近文件在后，按路径去重。 */
+var HOME_SIG='';
 
-function renderRecent(items){
+/* 标题跟着场景换：在打开/保存对话框里整块都是跳转目标，标题就叫「最近访问」；
+   平时是「打开」列表，叫「最近打开」。两套文案都是现成的，不加新键。 */
+function renderHomeHeader(){
+  if(RH.classList.contains('hide'))return;
+  RH.innerHTML = esc(HAS_DIALOG?MT('dh_recent'):MT('recent'))
+    + '<span>' + esc(HAS_DIALOG?MT('dh_hint'):MT('recent_hint')) + '</span>';
+}
 
-  MODE='recent';
-
-  rows=items||[]; cur=-1;
-
+function renderHome(){
+  if(Q.value.trim())return;            /* 已经在搜了，交给 render()，别把结果顶掉 */
+  MODE='empty';
+  /* 第 275 项：设置里关掉「最近记录显示」就什么都不列，窗口只剩输入框和底部提示。 */
+  if(!HOME_SHOW){
+    if(HOME_SIG==='off')return;
+    HOME_SIG='off'; rows=[]; cur=-1;
+    LIST.innerHTML=''; LIST.className='rec';
+    RH.classList.add('hide');
+    EMPTY.classList.remove('hide');
+    FOOT.classList.add('hide'); FOOT.classList.remove('clickable'); FOOT.onclick=null;
+    bind(); resize(); return;
+  }
+  var merged=[], seen={}, i, it;
+  for(i=0;i<OPEN_DIRS.length;i++){
+    it=OPEN_DIRS[i]; if(!it||!it.p)continue;
+    var k1=String(it.p).toLowerCase();
+    if(seen[k1])continue; seen[k1]=1;
+    merged.push({t:'dir', e:'', p:it.p, n:it.n||'', dn:it.n||'', d:it.p});
+  }
+  for(i=0;i<RECENT.length;i++){
+    it=RECENT[i]; if(!it||!it.p)continue;
+    var k2=String(it.p).toLowerCase();
+    if(seen[k2])continue; seen[k2]=1;   /* 同一路径只留一份，目录行优先 */
+    merged.push(it);
+  }
+  var cap=rowCap();
+  /* 第 275 项：空状态列几条由设置决定（qs_home_count，默认 4）。
+     夹紧到 1..10，读不到就用 4。 */
+  var want=parseInt(HOME_COUNT,10);
+  if(!(want>0)) want=4;
+  cap=Math.min(10, want);          /* 空状态按设置来，不受 rowCap 的 9 行上限压着 */
+  /* 第 255 项：在上传/选择文件等贴角小窗场景（SMALL 模式），「最近访问」最多只列 2 个，
+     避免窗口过高遮挡宿主对话框列表；未贴角的大窗按设置来。 */
+  if(SMALL) cap=Math.min(cap, 2);
+  if(merged.length>cap) merged=merged.slice(0,cap);
+  var sig=merged.length+':'+(HAS_DIALOG?1:0)+':';
+  for(i=0;i<merged.length;i++) sig+=merged[i].p+'|';
+  /* 宿主每 2 秒推一次目录状态：内容没变就别重建 DOM，
+     否则用户正用方向键选行时高亮会被抹掉。 */
+  var homeCls='rec'+(HOME_COMPACT?' compact':'');
+  if(sig===HOME_SIG && LIST.className===homeCls){ renderHomeHeader(); resize(); return; }
+  HOME_SIG=sig;
+  rows=merged; cur=-1;
+  MARKS=[]; ANCHOR=-1;   /* 第 308 项：首页换了列表，多选下标作废 */
+  var withKey=HAS_DIALOG;
   var html='';
-
-  for(var i=0;i<rows.length;i++) html+=rowHtml(rows[i],i,'',false);
-
-  LIST.className='rec';
-
+  for(i=0;i<rows.length;i++) html+=rowHtml(rows[i],i,'',withKey);
+  LIST.className=homeCls;
   LIST.innerHTML=html;
-
   RH.classList.toggle('hide', !rows.length);
-
+  renderHomeHeader();
   EMPTY.classList.toggle('hide', !!rows.length);
-
   FOOT.classList.toggle('hide', !rows.length);
-
-  if(rows.length){ FT.textContent=MT('foot_typing'); FR.textContent=MT('foot_esc'); }
-
   FOOT.classList.remove('clickable');
-
   FOOT.onclick=null;
+  if(rows.length){ FT.textContent=MT('foot_typing'); FR.textContent=MT('foot_esc'); }
+  bind();
+  /* 兜底：高度算得再准也可能超高，真超了从尾部砍行，绝不让窗口裁掉内容 */
+  var guard=0;
+  while(SMALL && MAXH && rows.length>1 && height()>MAXH && guard++<6){
+    rows.pop();
+    var h2='';
+    for(i=0;i<rows.length;i++) h2+=rowHtml(rows[i],i,'',withKey);
+    LIST.innerHTML=h2; bind();
+  }
+  resize();
+}
 
-  bind(); resize();
+/* 第 245 项：弹窗样式定稿，STYLE 变量与 .tbl 分支一并删除（只剩方案1）。 */
+var OPEN_DIRS=[], HAS_DIALOG=false, SCOPE='', SMALL=false, MAXH=0, BODY_ON=__BODYSEARCH__;
+
+/* 第 275 项：空状态紧凑显示（设置 → 快搜窗「最近记录紧凑显示」）。
+   模板里先按服务端 settings 落一次值，之后宿主改设置会调 __setHomeCompact 现推，
+   不用关窗重开。 */
+var HOME_COMPACT=__HOME_COMPACT__;
+
+/* 第 275 项：空状态列几条，也由设置决定（默认 4，1..20 夹紧）。 */
+var HOME_COUNT=__HOME_COUNT__;
+
+/* 第 275 项：最近记录整块显不显示（qs_home_show，默认显示）。 */
+var HOME_SHOW=__HOME_SHOW__;
+
+window.__setHomeCompact=function(on){
+  on=!!on;
+  if(HOME_COMPACT===on)return;
+  HOME_COMPACT=on; HOME_SIG='';
+  if(!Q.value.trim())renderHome();
+};
+
+window.__setHomeCount=function(n){
+  n=parseInt(n,10); if(!(n>0))return;
+  n=Math.min(10,n);
+  if(HOME_COUNT===n)return;
+  HOME_COUNT=n; HOME_SIG='';
+  if(!Q.value.trim())renderHome();
+};
+
+window.__setHomeShow=function(on){
+  on=!!on;
+  if(HOME_SHOW===on)return;
+  HOME_SHOW=on; HOME_SIG='';
+  if(!Q.value.trim())renderHome();
+};
+
+/* 第 194 项：当前打开的文件夹（智能推荐）。只在空查询、还没打字时出现，
+
+   用户一开始搜就把这一组让位给搜索结果，别跟 9 行结果抢高度。 */
+
+function renderJumpHint(){
+
+  var el=document.getElementById('jm');
+
+  if(!el)return;
+
+  el.classList.toggle('hide',!HAS_DIALOG);
+
+  if(HAS_DIALOG) el.textContent=MT('jm_hint');
+
+}
+
+/* 「只在 XX 中搜索」提示条：从资源管理器里直接打字唤起来的时候显示。
+
+   去掉限定 = 回到全局搜索，不用重新打字。 */
+
+function renderScope(){
+
+  var el=document.getElementById('sc'), t=document.getElementById('sct');
+
+  if(!el||!t)return;
+
+  if(!SCOPE){ el.classList.add('hide'); t.textContent=''; resize(); return; }
+
+  t.textContent=MT('scope').replace('{p}',SCOPE);
+
+  el.classList.remove('hide');
+
+  resize();
+
+}
+
+function clearScope(){ SCOPE=''; renderScope(); schedule(); Q.focus(); }
+
+/* 宿主调用的两个入口：自动弹出（带限定目录 + 可选首字）与按键兜底填入。 */
+
+window.__autoShow=function(o){
+
+  o=o||{};
+
+  SCOPE=o.scope||'';
+
+  SMALL=!!o.small; MAXH=parseInt(o.maxh||0,10)||0;
+
+
+  try{ document.body.classList.toggle('small',SMALL); }catch(e){}
+
+
+  renderScope();
+
+  var q=(typeof o.q==='string')?o.q:'';
+
+  if(q){ Q.value=q; cur=-1; schedule(); }
+
+  else{ Q.value=''; seq++; MODE='empty'; HOME_SIG=''; renderHome(); fetchOpenDirs(); }
+
+  Q.focus();
+
+};
+
+window.__autoQuery=function(q){
+
+  if(typeof q!=='string'||!q)return;
+
+  Q.value=q; cur=-1; Q.focus(); schedule();
+
+};
+
+/* 对话框状态变了（用户点了保存/取消）：宿主推一下，别等下一次轮询。 */
+
+window.__onDialog=function(){ fetchOpenDirs(); };
+
+/* 第 199 项：显示期间宿主每 2 秒推一次，关掉的文件夹立刻从列表里消失。 */
+
+window.__onDirs=function(){ fetchOpenDirs(); };
+
+/* 第 229 项：宿主在锚点对话框变大变小时推过来 —— 只更新高度上限并重排，
+
+   不清搜索词（__autoShow 会清，不能用）。 */
+
+window.__rescale=function(o){
+
+  o=o||{};
+
+  if(o.maxh){ MAXH=parseInt(o.maxh,10)||MAXH; }
+
+  resize();
+
+};
+
+function fetchOpenDirs(){
+  fetch('/api/open_dirs').then(function(r){return r.json()}).then(function(d){
+    OPEN_DIRS=d.items||[]; HAS_DIALOG=!!d.dialog;
+    renderJumpHint();
+    renderHome();
+  }).catch(function(){ OPEN_DIRS=[]; HAS_DIALOG=false; renderJumpHint(); renderHome(); });
+}
+
+function flash(msg){
+
+  try{ FR.textContent=msg; setTimeout(function(){ FR.textContent=MT('foot_typing'); },2600); }catch(e){}
+
+}
+
+/* 点了条目 / 按了 Ctrl+G：先尝试把当前文件对话框切过去；没有对话框就退回
+
+   「在资源管理器里打开」，绝不让用户点了没反应。 */
+
+function jumpDir(p){
+
+  if(!p)return;
+
+  fetch('/api/dialog_jump',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({p:p})})
+
+    .then(function(r){return r.json()}).then(function(d){
+
+      if(d&&d.ok){
+
+        /* 第 229 项：目录结果已自动导航进该目录（对话框保持打开）。
+
+           不 hide —— 用户可能还要在结果里继续挑。 */
+
+        if(d.mode==='nav'){ flash(MT('nav_hint')); return; }
+
+        /* 选择文件夹对话框没有文件名框：路径已填进地址栏，让用户按一次回车。
+
+           这里不能 hide，否则用户看不到那个对话框。 */
+
+        if(d.mode==='addr'){ flash(MT('ad_hint')); return; }
+
+        if(API&&API.hide)API.hide(); return; }
+
+      flash(MT(d&&d.reason==='no_dialog'?'qs_none':'qs_fail'));
+
+      try{ if(API&&API.open_path)API.open_path(p); }catch(e){}
+
+    }).catch(function(){ flash(MT('qs_fail')); });
+
+}
+
+/* 带搜索词时跳当前选中项所在目录；空查询时跳「当前打开的文件夹」第一条。 */
+
+function jumpCur(){
+
+  var p='';
+
+  if(Q.value.trim() && rows.length){ var it=rows[cur<0?0:cur]; p=it?it.p:''; }
+
+  if(!p && OPEN_DIRS.length) p=OPEN_DIRS[0].p;
+
+  if(p)jumpDir(p); else flash(MT('qs_none'));
 
 }
 
@@ -15211,7 +20286,7 @@ function fetchRecent(){
 
     RECENT=d.items||[];
 
-    renderRecent(RECENT);
+    renderHome();
 
   }).catch(function(){});
 
@@ -15225,11 +20300,87 @@ function bind(){
 
     els[i].onmouseenter=function(){ sel(+this.dataset.i); };
 
-    els[i].onclick=function(){ open(+this.dataset.i); };
+    /* 第 308 项：Ctrl/⌘ 点击切换选中，Shift 点击选一段（和资源管理器一致）。
+       普通单击仍然是「打开」，和多选互不干扰。 */
+    els[i].onclick=function(ev){
+      var i=+this.dataset.i;
+      if(ev&&(ev.ctrlKey||ev.metaKey)){ toggleMark(i); return; }
+      if(ev&&ev.shiftKey){ markRange(i); return; }
+      clearMarks();
+      open(i);
+    };
     els[i].oncontextmenu=function(ev){ ev.preventDefault(); showCMenu(ev.clientX, ev.clientY, +this.dataset.i); };
 
   }
 
+}
+
+/* ---- 多选（第 308 项） ---- */
+var MARKS=[], ANCHOR=-1;
+
+function paintMarks(){
+  var els=LIST.querySelectorAll('.row');
+  for(var k=0;k<els.length;k++) els[k].classList.toggle('mark', MARKS.indexOf(+els[k].dataset.i)>=0);
+}
+function markInfo(){
+  if(!MARKS.length) return '';
+  return MT('sel_n').replace('{n}', String(MARKS.length));
+}
+function toggleMark(i){
+  if(i<0||i>=rows.length)return;
+  var at=MARKS.indexOf(i);
+  if(at>=0) MARKS.splice(at,1); else { MARKS.push(i); ANCHOR=i; }
+  sel(i); paintMarks();
+  if(MARKS.length) toast(markInfo(), 1100);
+}
+function markRange(i){
+  if(i<0||i>=rows.length)return;
+  if(ANCHOR<0||ANCHOR>=rows.length) ANCHOR=i;
+  var a=Math.min(ANCHOR,i), b=Math.max(ANCHOR,i);
+  MARKS=[];
+  for(var k=a;k<=b;k++) MARKS.push(k);
+  sel(i); paintMarks();
+  toast(markInfo(), 1100);
+}
+function clearMarks(){
+  if(!MARKS.length) return;
+  MARKS=[]; ANCHOR=-1; paintMarks();
+}
+/* 复制路径：先走服务端剪贴板（WebView2 里 navigator.clipboard 常常静默失败），
+   失败再退回浏览器 API。第 305 项同一套路。 */
+function copyText(t, okMsg){
+  var done=false;
+  function ok(){ if(done)return; done=true; toast(okMsg, 1500); }
+  function fb(){
+    try{
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        navigator.clipboard.writeText(t).then(ok).catch(function(){ toast(MT('copy_fail'),1800); });
+        return;
+      }
+    }catch(e){}
+    toast(MT('copy_fail'),1800);
+  }
+  fetch('/api/snip/copy_text',{method:'POST',
+    headers:{'Content-Type':'application/json','Sec-Fetch-Site':'same-origin'},
+    body:JSON.stringify({text:t})})
+    .then(function(r){return r.json()}).then(function(d){ if(d&&d.ok) ok(); else fb(); })
+    .catch(fb);
+}
+function dirOf(p){
+  var s=String(p||''); var i=Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
+  return i>0? s.slice(0,i): s;
+}
+/* Ctrl+C / Ctrl+Shift+C：多选时复制全部，单选时复制当前项 */
+function copySelection(dirs){
+  var picked = MARKS.length? MARKS.slice().sort(function(a,b){return a-b;}) : [cur];
+  var vals=[];
+  for(var k=0;k<picked.length;k++){
+    var it=rows[picked[k]];
+    if(!it||!it.p)continue;
+    vals.push(dirs? dirOf(it.p): it.p);
+  }
+  if(!vals.length){ toast(MT('copy_none'),1500); return; }
+  copyText(vals.join('\r\n'), dirs? MT('copied_dir'): (vals.length>1? MT('copied_n').replace('{n}',String(vals.length)): MT('copied_one')));
 }
 
 function sel(i){
@@ -15274,13 +20425,25 @@ function ctxAct(act){
 
 function open(i){
 
+  if(MODE==='web'){ openWeb(); return; }
+
   var it=rows[i]; if(!it)return;
+
+  /* 第 196 项：检测到「另存为/打开」对话框时，左键/回车＝把对话框切到该目录。
+
+     用户在另存为时点一条结果，本意是「存到这里」，不是「再打开一个文件」。
+
+     没有对话框时行为不变（打开文件）。 */
+
+  if(HAS_DIALOG){ jumpDir(it.p); return; }
 
   if(API&&API.open_path)API.open_path(it.p);
 
 }
 
 function detail(){
+
+  if(MODE==='web'){ openWeb(); return; }
 
   var v=Q.value.trim();
 
@@ -15324,7 +20487,7 @@ function doPrefix(v){
 
   var my=++seq;
 
-  fetch('/api/mini?q='+encodeURIComponent(v)).then(function(r){return r.json()})
+  fetch('/api/mini?q='+encodeURIComponent(v)+'&scope='+encodeURIComponent(SCOPE)).then(function(r){return r.json()})
 
     .then(function(d){
 
@@ -15374,7 +20537,7 @@ function busy(q){
 
   LIST.className='';
 
-  LIST.innerHTML='<div class="empty">'+esc(MT('busy'))+'<i>'+esc(q)+'</i></div>';
+  LIST.innerHTML='<div class="empty">'+esc(BODY_ON?MT('busy'):MT('busy_all'))+'<i>'+esc(q)+'</i></div>';
 
   EMPTY.classList.add('hide');
 
@@ -15390,7 +20553,13 @@ function doDeep(v,needDeep){
 
   busy(v);
 
-  var u='/api/mini?q='+encodeURIComponent(v)+'&body=1'+(needDeep?'&deep=1':'');
+  /* 第 230 项修订：按钮必须能真正管控正文 —— 关着就纯文件名、一条正文都不搜；
+
+     点亮才带 body=1&fb=1（名字+正文一起，且绕过 first_app 归零）。 */
+
+  var bdq = BODY_ON ? '&body=1&fb=1' : '';
+
+  var u='/api/mini?q='+encodeURIComponent(v)+bdq+(needDeep?'&deep=1':'')+'&scope='+encodeURIComponent(SCOPE);
 
   fetch(u).then(function(r){return r.json()})
 
@@ -15424,13 +20593,187 @@ function doDeep(v,needDeep){
 
 }
 
+/* 第 203 项：网络搜索。用户原话：「输入 g 然后空格，一下就变成了 Google
+   搜索，在简要搜索框里面就能谷歌搜索，然后输入你要搜索的东西，按 enter
+   就会打开浏览器帮你去搜索」。关键字和 URL 全在本机设置里，默认不联网。 */
+function fetchWeb(){
+  fetch('/api/web_search').then(function(r){return r.json()}).then(function(d){
+    if(d && d.items) WEB_SEARCH=d.items;
+  }).catch(function(){});
+}
+function matchWeb(v){
+  if(!WEB_SEARCH||!WEB_SEARCH.length)return null;
+  var s=String(v||''), i, e, k;
+  for(i=0;i<WEB_SEARCH.length;i++){
+    e=WEB_SEARCH[i]; if(!e||e.enabled===false||!e.key)continue;
+    k=String(e.key).toLowerCase();
+    if(s.length>=k.length+1 && s.slice(0,k.length).toLowerCase()===k
+       && s.charAt(k.length)===' ') return {eng:e,q:s.slice(k.length+1)};
+  }
+  return null;
+}
+function leaveWeb(){
+  if(!WEB_MODE)return;
+  WEB_MODE=null; WEB_Q='';
+  var w=document.getElementById('wtag'); if(w)w.classList.add('hide');
+  Q.placeholder=MT('ph');
+  renderScope();
+}
+/* 第 355 项：命令关键字。输入 shot / verify / cmd / psh 直接做事，和 Listary 的
+   「关键字 → 动作」同一套思路，但只做白名单内的本机动作，不执行任意命令。 */
+var CMDS = [
+  {k:'shot',   label:'cmd_shot'},
+  {k:'verify', label:'cmd_verify'},
+  {k:'cmd',    label:'cmd_cmd',  args:'path'},
+  {k:'psh',    label:'cmd_psh',  args:'path'}
+];
+var CMD_MODE = null;
+
+function matchCmd(v){
+  var s = String(v||''), i, e;
+  for(i=0;i<CMDS.length;i++){
+    e = CMDS[i];
+    if(s === e.k) return {cmd:e, arg:''};
+    if(s.length > e.k.length && s.slice(0, e.k.length) === e.k
+       && s.charAt(e.k.length) === ' ') return {cmd:e, arg:s.slice(e.k.length+1).trim()};
+  }
+  return null;
+}
+
+function cmdTarget(arg){
+  if(arg) return arg;
+  if(typeof SCOPE === 'string' && SCOPE) return SCOPE;
+  return '';
+}
+
+function renderCmd(m){
+  MODE = 'cmd'; CMD_MODE = m;
+  seq++; clearTimeout(timer); clearTimeout(deeptimer);
+  rows = []; cur = -1;
+  var ids=['rh','empty','foot','sc','jm'], i, el;
+  for(i=0;i<ids.length;i++){ el=document.getElementById(ids[i]); if(el) el.classList.add('hide'); }
+  var lbl = MT(m.cmd.label);
+  var sub = m.arg ? m.arg : (cmdTarget('') || MT('cmd_here'));
+  LIST.className='';
+  LIST.innerHTML = '<div class="row" id="cmdRow">'
+    + '<span class="ico">' + esc('>') + '</span>'
+    + '<span class="txt"><span class="nm">' + esc(lbl) + '</span></span>'
+    + '<span class="kbd">Enter</span></div>'
+    + '<div class="empty">' + esc(sub) + '</div>';
+  var r = document.getElementById('cmdRow');
+  if(r) r.onclick = function(){ runCmd(); };
+  resize();
+}
+
+function leaveCmd(){
+  if(!CMD_MODE) return;
+  CMD_MODE = null;
+  if(MODE === 'cmd') MODE = 'empty';
+}
+
+function runCmd(){
+  var m = CMD_MODE; if(!m) return;
+  var done = false;
+  function bye(){ if(done) return; done = true; try{ if(API && API.hide) API.hide(); }catch(e){} }
+  if(m.cmd.k === 'shot'){
+    fetch('/api/snip/trigger', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ocr:true})}).then(bye).catch(bye);
+    setTimeout(bye, 600);
+    return;
+  }
+  if(m.cmd.k === 'verify'){
+    fetch('/api/index/verify', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:'{}'}).then(bye).catch(bye);
+    setTimeout(bye, 600);
+    return;
+  }
+  var dir = cmdTarget(m.arg);
+  fetch('/api/shell_open', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:m.cmd.k, dir:dir})}).then(function(r){return r.json()})
+    .then(function(d){ if(!d || !d.ok) toast(MT('cmd_fail')); bye(); })
+    .catch(function(){ toast(MT('cmd_fail')); bye(); });
+  setTimeout(bye, 600);
+}
+
+function renderWeb(m){
+  WEB_MODE=m.eng; WEB_Q=m.q; MODE='web';
+  seq++; clearTimeout(timer); clearTimeout(deeptimer);
+  rows=m.q?[{web:true}]:[]; cur=rows.length?0:-1;
+  var ids=['rh','empty','foot','sc','jm'], i, el;
+  for(i=0;i<ids.length;i++){el=document.getElementById(ids[i]); if(el)el.classList.add('hide');}
+  var name=String(m.eng.title||m.eng.key);
+  var w=document.getElementById('wtag');
+  if(w){ w.textContent=name; w.classList.remove('hide'); }
+  Q.placeholder=MT('web_ph').replace('{t}',name);
+  LIST.className='';
+  LIST.innerHTML=m.q?('<div class="row webrow'+(cur===0?' on':'')+'" data-i="0">'
+    +'<span class="ico wico">'+esc(name.charAt(0))+'</span>'
+    +'<span class="txt"><span class="nm">'+esc(m.q)+'</span></span>'
+    +'<span class="kbd">Ctrl+1</span></div>'):'';
+  bind(); resize();
+}
+function openWeb(){
+  if(!WEB_MODE)return;
+  var q=String(WEB_Q||'').trim();
+  if(!q){ Q.focus(); return; }
+  /* URL 由后端按本机配置拼接并校验，前端只传 key + 查询词 */
+  var done=false;
+  function bye(){ if(done)return; done=true; try{ if(API&&API.hide)API.hide(); }catch(e){} }
+  fetch('/api/web_search_open',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:WEB_MODE.key,query:q})})
+    .then(function(r){return r.json()}).then(function(d){
+      if(!d||!d.ok)console.warn('web search failed',d); bye();
+    }).catch(function(e){console.warn('web search failed',e); bye();});
+  /* 本地接口再慢也不会让快搜窗赖在屏幕上 */
+  setTimeout(bye, 200);
+}
+
+
 function schedule(){
+
+  /* 关键字 + 空格：切换成网络搜索，不发本地检索请求。
+     命中后把「g 」这类前缀吃掉，输入框里只留查询词 —— 引擎名已经在
+     左边的标签上（Listary 就是这个样子），不必让用户看着两遍。 */
+  var cm = matchCmd(Q.value);
+  if(cm){ renderCmd(cm); return; }
+  leaveCmd();
+
+  var wm=matchWeb(Q.value);
+  if(wm){ WEB_MODE=wm.eng; Q.value=wm.q; renderWeb(wm); return; }
+  /* 已经在引擎模式里：继续输入就沿用当前引擎；清空（退格到空）才退回本地搜索 */
+  if(WEB_MODE){
+    var wq=Q.value;
+    if(!wq.trim()){ leaveWeb(); }
+    else { renderWeb({eng:WEB_MODE,q:wq}); return; }
+  }
+  leaveWeb();
+
+  var tb = document.getElementById('transBox');
+  if(tb && !tb.classList.contains('hide')){
+    LIST.innerHTML = '';
+    FOOT.classList.add('hide');
+    RH.classList.add('hide');
+    var em = document.getElementById('empty');
+    if(em) em.classList.add('hide');
+    scheduleTrans();
+    return;
+  }
+
+  renderHome();
 
   clearTimeout(timer); clearTimeout(deeptimer);
 
+  scheduleTrans();
+
   var v=Q.value.trim();
 
-  if(!v){ seq++; MODE='empty'; renderRecent(RECENT); return; }
+  /* 第 306 项：清空到空必须把首页 DOM 重建一次。
+     renderHome() 里有一层「HOME_SIG 和上次一样 + LIST.className 一样就直接返回」的缓存，
+     而搜索结果的容器 class 也是 'rec' —— 沿用它就会命中这层缓存，
+     于是输入框已经空了、列表里却还挂着上一条搜索的 5 条结果和「展示更多 “打”」的页脚。
+     把 HOME_SIG 打成空串，逼它重算。 */
+  if(!v){ seq++; MODE='empty'; HOME_SIG=''; renderHome(); return; }
 
   timer=setTimeout(function(){ doPrefix(v); },80);
 
@@ -15456,15 +20799,70 @@ Q.addEventListener('keydown',function(e){
 
     e.preventDefault();
 
+    if(pastedImgData && !pastedImgOcred){
+      ocrPastedImage();
+      return;
+    }
+
+    var tb = document.getElementById('transBox');
+    if(tb && !tb.classList.contains('hide')){
+      doMiniTranslate();
+      return;
+    }
+
     if(e.ctrlKey||e.metaKey){ detail(); return; }
+
+    if(MODE === 'cmd'){ runCmd(); return; }
 
     if(rows.length) open(cur<0?0:cur); else detail();
 
   }
 
-  else if(k==='Escape'){ e.preventDefault(); if(API&&API.hide)API.hide(); }
+  /* 第 308 项：标准键。Ctrl+C 复制选中项路径（多选时一次复制多条）；
+     输入框里自己选中了文字就让浏览器照常复制，别抢。 */
+  else if((k==='c'||k==='C') && (e.ctrlKey||e.metaKey)){
+    try{
+      if(typeof Q.selectionStart==='number' && Q.selectionStart!==Q.selectionEnd) return;
+    }catch(err){}
+    e.preventDefault();
+    copySelection(!!e.shiftKey);
+  }
+
+  else if(k==='Delete'){
+    if(pastedImgData){
+      e.preventDefault();
+      clearPastedImg();
+      return;
+    }
+    if(MARKS.length){ e.preventDefault(); clearMarks(); }
+  }
+
+  else if(k==='Backspace'){
+    if(!Q.value && pastedImgData){
+      e.preventDefault();
+      clearPastedImg();
+      return;
+    }
+  }
+
+  else if(k==='Escape'){
+    var pb = document.getElementById('imgPreviewBox');
+    if(pb && !pb.classList.contains('hide')){
+      e.preventDefault();
+      closeImgPreview();
+      return;
+    }
+    if(pastedImgData){
+      e.preventDefault();
+      clearPastedImg();
+      return;
+    }
+    e.preventDefault(); if(API&&API.hide)API.hide();
+  }
 
   else if(e.ctrlKey&&k>='1'&&k<='9'){ e.preventDefault(); var i=+k-1; if(rows[i])open(i); }
+
+  else if(e.ctrlKey&&(k==='g'||k==='G')){ e.preventDefault(); jumpCur(); }
 
   else if(k==='Tab'){ e.preventDefault(); detail(); }
 
@@ -15477,10 +20875,733 @@ document.addEventListener('click', function(e){
 document.addEventListener('contextmenu', function(e){
   if(CMENU && !CMENU.contains(e.target) && !(e.target.closest && e.target.closest('.row'))) hideCMenu();
 });
-document.addEventListener('keydown', function(e){ if(e.key==='Escape') hideCMenu(); });
+document.addEventListener('keydown', function(e){
+  if(e.key==='Escape'){
+    hideCMenu();
+    var pb = document.getElementById('imgPreviewBox');
+    if(pb && !pb.classList.contains('hide')){
+      closeImgPreview(e);
+      return;
+    }
+    var sb = document.getElementById('snipBox');
+    if(sb && !sb.classList.contains('hide')){
+      closeSnipBox(e);
+    }
+  } else if(e.key==='Enter'){
+    var sb = document.getElementById('snipBox');
+    if(sb && !sb.classList.contains('hide') && document.activeElement !== document.getElementById('sbText') && document.activeElement !== Q){
+      copySnipText(e);
+    }
+  }
+});
+
+var snipPollTimer = null;
+var pastedImgData = null;
+var pastedImgOcred = false;
+
+function setPastedImg(dataUrl){
+  if(!dataUrl) return;
+  pastedImgData = dataUrl;
+  pastedImgOcred = false;
+  var pill = document.getElementById('pastedImgPill');
+  var thumb = document.getElementById('pastedImgThumb');
+  var spinner = document.getElementById('pastedImgSpinner');
+  if(thumb) thumb.src = dataUrl;
+  if(spinner) spinner.classList.add('hide');
+  if(pill) pill.classList.remove('hide');
+  Q.placeholder = '__U_snip_scan__';
+  Q.focus();
+}
+
+function toggleImgPreview(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  if(!pastedImgData) return;
+  var box = document.getElementById('imgPreviewBox');
+  if(!box) return;
+  if(box.classList.contains('hide')){
+    showImgPreview();
+  } else {
+    closeImgPreview();
+  }
+}
+
+function showImgPreview(){
+  if(!pastedImgData) return;
+  var box = document.getElementById('imgPreviewBox');
+  var img = document.getElementById('ipImg');
+  var meta = document.getElementById('ipMeta');
+  if(img) img.src = pastedImgData;
+  if(box) box.classList.remove('hide');
+  if(img && meta){
+    var naturalImg = new Image();
+    naturalImg.onload = function(){
+      meta.textContent = naturalImg.width + ' × ' + naturalImg.height;
+    };
+    naturalImg.src = pastedImgData;
+  }
+  resize();
+}
+
+function closeImgPreview(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var box = document.getElementById('imgPreviewBox');
+  if(box && !box.classList.contains('hide')){
+    box.classList.add('hide');
+    resize();
+  }
+}
+
+function clearPastedImg(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  closeImgPreview();
+  pastedImgData = null;
+  pastedImgOcred = false;
+  var pill = document.getElementById('pastedImgPill');
+  var thumb = document.getElementById('pastedImgThumb');
+  var spinner = document.getElementById('pastedImgSpinner');
+  if(pill) pill.classList.add('hide');
+  if(thumb) thumb.src = '';
+  if(spinner) spinner.classList.add('hide');
+  try {
+    Q.placeholder = (typeof MT === 'function' ? MT('placeholder') : '') || '';
+  } catch(err){}
+}
+
+function ocrPastedImage(){
+  closeImgPreview();
+  if(!pastedImgData) return;
+  var spinner = document.getElementById('pastedImgSpinner');
+  if(spinner) spinner.classList.remove('hide');
+  var api = window.pywebview && window.pywebview.api;
+  var promise = null;
+  if(api && api.ocr_image){
+    try {
+      promise = api.ocr_image(pastedImgData);
+    } catch(e) {
+      promise = null;
+    }
+  }
+  if(!promise){
+    promise = fetch('/api/snip/ocr_image', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({image: pastedImgData})
+    }).then(function(r){ return r.json(); });
+  }
+  var timer = setTimeout(function(){
+    if(spinner) spinner.classList.add('hide');
+    toast('__U_snip_timeout__');
+  }, 8000);
+  promise.then(function(res){
+    clearTimeout(timer);
+    if(spinner) spinner.classList.add('hide');
+    pastedImgOcred = true;
+    if(res && res.ok && res.text){
+      var txt = res.text.trim();
+      if(txt){
+        Q.value = txt;
+        clearPastedImg();
+        schedule();
+      } else {
+        toast('__U_snip_none__');
+      }
+    } else {
+      toast('__U_snip_none__');
+    }
+  }).catch(function(err){
+    clearTimeout(timer);
+    if(spinner) spinner.classList.add('hide');
+    toast('__U_snip_fail__');
+  });
+}
+
+window.addEventListener('paste', function(e){
+  var cd = e.clipboardData || window.clipboardData;
+  var items = cd && cd.items;
+  if(items){
+    for(var i=0; i<items.length; i++){
+      if(items[i].type && items[i].type.indexOf('image') !== -1){
+        e.preventDefault();
+        var blob = items[i].getAsFile();
+        if(blob){
+          var reader = new FileReader();
+          reader.onload = function(evt){
+            setPastedImg(evt.target.result);
+          };
+          reader.readAsDataURL(blob);
+          return;
+        }
+      }
+    }
+  }
+  var api = window.pywebview && window.pywebview.api;
+  if(api && api.read_clipboard_image){
+    api.read_clipboard_image().then(function(res){
+      if(res && res.has_image && res.data_url){
+        setPastedImg(res.data_url);
+      }
+    }).catch(function(){});
+  } else {
+    fetch('/api/snip/clipboard_img').then(function(r){ return r.json(); }).then(function(res){
+      if(res && res.has_image && res.data_url){
+        setPastedImg(res.data_url);
+      }
+    }).catch(function(){});
+  }
+});
+
+function doSnip(ocr, e, translate){
+  if(e) e.stopPropagation();
+  var withOcr = !!ocr;
+  var withTr = !!translate;
+  // 第 369 项：截图翻译。译文由原生卡片贴在选区原位显示，快搜窗让位、不抢焦点。
+  try{ if(snipWrapEl) snipWrapEl.classList.remove('hover'); }catch(_e){}
+  var startTs = Date.now() / 1000;
+  var api = window.pywebview && window.pywebview.api;
+  if(api && api.trigger_snip){
+    try {
+      Promise.resolve(api.trigger_snip(withOcr || withTr, withTr)).then(function(id){
+        startSnipPoll(startTs, id);
+      }).catch(function(){ startSnipPoll(startTs); });
+    } catch(err){ startSnipPoll(startTs); }
+  } else {
+    fetch('/api/snip/trigger', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ocr: withOcr || withTr, translate: withTr})})
+      .then(function(r){ return r.json(); })
+      .then(function(d){ startSnipPoll(startTs, d && d.snip_id); })
+      .catch(function(){ startSnipPoll(startTs); });
+  }
+}
+
+/* 第 369 项：相机键自己的悬停浮层 —— 只认这颗键，停 600ms 冒出「截图翻译」，移开就收。
+   锚点是 #snipWrap（相机键 + 胶囊那个盒子），**不是整排按钮**：
+   挂在整排上会让鼠标划过「详情 / 搜索」也冒出截图翻译（用户 2026-11-20 实测报的）。
+   胶囊是 snipWrap 的 DOM 子节点（绝对定位在它左侧），所以从按键挪到胶囊不算离开、
+   不会被中途收走；再留 200ms 宽限防手抖/防抖掉帧。 */
+var snipWrapEl = document.getElementById('snipWrap');
+var actHoverTimer = null;
+(function(){
+  if(!snipWrapEl) return;
+  var hideTimer = null;
+  snipWrapEl.addEventListener('mouseenter', function(){
+    if(hideTimer){ clearTimeout(hideTimer); hideTimer = null; }
+    if(actHoverTimer) clearTimeout(actHoverTimer);
+    actHoverTimer = setTimeout(function(){ snipWrapEl.classList.add('hover'); }, 600);
+  });
+  snipWrapEl.addEventListener('mouseleave', function(){
+    if(actHoverTimer){ clearTimeout(actHoverTimer); actHoverTimer = null; }
+    if(hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(function(){
+      hideTimer = null;
+      snipWrapEl.classList.remove('hover');
+    }, 200);
+  });
+})();
+
+function startSnipPoll(startTs, expectedId){
+  if(snipPollTimer) clearInterval(snipPollTimer);
+  var tries = 0;
+  snipPollTimer = setInterval(function(){
+    tries++;
+    if(tries > 80){ clearInterval(snipPollTimer); snipPollTimer = null; return; }
+    fetch('/api/snip/result?_t=' + Date.now()).then(function(r){ return r.json(); }).then(function(res){
+      if(res && res.status === 'done'){
+        if(expectedId && res.snip_id && res.snip_id < expectedId) return;
+        if(res.ts && res.ts < startTs) return;
+        clearInterval(snipPollTimer);
+        snipPollTimer = null;
+        if(window.__onSnipDone) window.__onSnipDone(res);
+      }
+    }).catch(function(){});
+  }, 250);
+}
+
+window.__onSnipDone = function(st){
+  if(st && st.status === 'done'){
+    // 第 369 项：翻译模式的译文由原生卡片负责，快搜窗既不再挂缩略图、也不弹识字面板
+    if(st.do_translate) return;
+    if(snipPollTimer){ clearInterval(snipPollTimer); snipPollTimer = null; }
+    var dataUrl = st.thumb_data_url;
+    var attachThumb = function(url){
+      setPastedImg(url);
+      if(st.do_ocr){
+        pastedImgOcred = true;
+        if(st.text && st.text.trim()){
+          Q.value = st.text.trim();
+          schedule();
+        } else {
+          ocrPastedImage();
+        }
+      } else {
+        toast('__U_snip_ready__');
+      }
+    };
+    if(dataUrl){
+      attachThumb(dataUrl);
+    } else {
+      fetch('/api/snip/thumb?_t=' + (st.ts || Date.now())).then(function(r){ return r.blob(); }).then(function(blob){
+        var reader = new FileReader();
+        reader.onload = function(evt){
+          attachThumb(evt.target.result);
+        };
+        reader.readAsDataURL(blob);
+      }).catch(function(){
+        if(st.do_ocr) renderSnip(st);
+      });
+    }
+    return;
+  }
+  fetch('/api/snip/result?_t=' + Date.now()).then(function(r){ return r.json(); }).then(function(res){
+    if(res && res.status === 'done'){
+      if(window.__onSnipDone) window.__onSnipDone(res);
+    }
+  }).catch(function(){});
+};
+
+var snipSrcText = '', snipDstText = '', snipView = 'src';
+
+/* 第 361 项：截图翻译。原文/译文只换 textarea 里的内容，
+   复制按钮直接拿 textarea 的值 —— 所以译文天然可复制，也能一键切回原文。 */
+function snipSetView(v){
+  snipView = (v === 'dst' && snipDstText) ? 'dst' : 'src';
+  var el = document.getElementById('sbText');
+  if(el) el.value = (snipView === 'dst') ? snipDstText : snipSrcText;
+  var wrap = document.getElementById('sbViews');
+  if(wrap){
+    var bs = wrap.querySelectorAll('.sbv');
+    for(var i=0;i<bs.length;i++){
+      bs[i].className = 'sbv' + (bs[i].getAttribute('data-v') === snipView ? ' active' : '');
+    }
+    wrap.classList.toggle('on', !!(snipDstText));
+  }
+}
+
+function snipShow(v, e){
+  if(e) e.stopPropagation();
+  snipSetView(v);
+}
+
+function translateSnip(e){
+  if(e) e.stopPropagation();
+  var el = document.getElementById('sbText');
+  var txt = ((el && el.value) || snipSrcText || '').trim();
+  if(!txt){ toast('__U_snip_none__'); return; }
+  var btn = document.getElementById('sbBtnTrans');
+  if(btn){ btn.disabled = true; btn.innerText = '__U_snip_trans_doing__'; }
+  fetch('/api/snip/translate', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({text: txt})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(btn){ btn.disabled = false; btn.innerText = '__U_snip_trans__'; }
+      if(d && d.ok && d.text){
+        snipSrcText = d.src || txt;
+        snipDstText = d.text;
+        snipSetView('dst');
+      } else {
+        toast('__U_snip_trans_none__');
+      }
+    }).catch(function(){
+      if(btn){ btn.disabled = false; btn.innerText = '__U_snip_trans__'; }
+      toast('__U_snip_trans_none__');
+    });
+}
+
+function renderSnip(res){
+  var box = document.getElementById('snipBox');
+  if(!box) return;
+  box.classList.remove('hide');
+  var txtEl = document.getElementById('sbText');
+  snipSrcText = res.text || ''; snipDstText = '';
+  var vw = document.getElementById('sbViews');
+  if(vw){ vw.classList.remove('on'); }
+  var vt = document.getElementById('sbBtnTrans');
+  if(vt){ vt.disabled = false; vt.innerText = '__U_snip_trans__'; }
+  if(txtEl) txtEl.value = snipSrcText;
+  var meta = document.getElementById('sbMeta');
+  if(meta) meta.innerText = (res.lines ? '__U_snip_lines__'.replace('{n}', res.lines.length) : '') + (res.img_size ? ' · ' + res.img_size[0] + 'x' + res.img_size[1] : '');
+  var img = document.getElementById('sbThumb');
+  if(img) img.src = '/api/snip/thumb?_t=' + (res.ts || Date.now());
+  var copyBtn = document.getElementById('sbBtnCopy');
+  if(copyBtn){ copyBtn.innerText = '__U_copy_text_btn__'; copyBtn.focus(); }
+  resize();
+}
+
+function closeSnipBox(e){
+  if(e) e.stopPropagation();
+  var box = document.getElementById('snipBox');
+  if(box) box.classList.add('hide');
+  resize();
+}
+
+function copySnipText(e){
+  if(e) e.stopPropagation();
+  var txt = document.getElementById('sbText').value;
+  fetch('/api/snip/copy_text', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text: txt})})
+  .then(function(r){ return r.json(); }).then(function(d){
+    var btn = document.getElementById('sbBtnCopy');
+    if(btn) btn.innerText = '__U_snip_copied__';
+    setTimeout(function(){ if(btn) btn.innerText = '__U_copy_text_btn__'; }, 1500);
+  }).catch(function(){
+    if(navigator.clipboard) navigator.clipboard.writeText(txt);
+  });
+}
+
+function copySnipImg(e){
+  if(e) e.stopPropagation();
+  var btn = document.getElementById('sbBtnCopyImg');
+  if(btn){
+    var orig = btn.innerText;
+    btn.innerText = '__U_snip_img_copied__';
+    setTimeout(function(){ btn.innerText = orig; }, 1500);
+  }
+}
+
+function fillSnipToSearch(e){
+  if(e) e.stopPropagation();
+  var txt = (document.getElementById('sbText').value || '').replace(/\r?\n+/g, ' ').trim();
+  closeSnipBox();
+  if(Q){
+    Q.value = txt;
+    Q.focus();
+    schedule();
+  }
+}
+
+function saveSnipImg(e){
+  if(e) e.stopPropagation();
+  fetch('/api/snip/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+  .then(function(r){ return r.json(); }).then(function(d){
+    var btn = document.getElementById('sbBtnSave');
+    if(btn){
+      var orig = btn.innerText;
+      btn.innerText = d.ok ? '__U_snip_saved__' : '__U_snip_save_fail__';
+      setTimeout(function(){ btn.innerText = orig; }, 2000);
+    }
+  }).catch(function(){});
+}
+
+var curClipKind = 'all';
+
+function toggleClipPanel(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var box = document.getElementById('clipBox');
+  if(!box) return;
+  if(!box.classList.contains('hide')){
+    closeClipPanel();
+  } else {
+    closeSnipBox();
+    closeTransPanel();
+    closeImgPreview();
+    box.classList.remove('hide');
+    fetchClipHistory(curClipKind);
+    resize();
+  }
+}
+
+function closeClipPanel(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var box = document.getElementById('clipBox');
+  if(box && !box.classList.contains('hide')){
+    box.classList.add('hide');
+    resize();
+  }
+}
+
+function setClipFilter(kind, e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  curClipKind = kind;
+  var btns = document.querySelectorAll('.cb-tabs .cbt');
+  for(var i=0; i<btns.length; i++){
+    btns[i].classList.toggle('active', btns[i].getAttribute('data-kind') === kind);
+  }
+  fetchClipHistory(kind);
+}
+
+var _miniToastTimer = null;
+function toast(m, dur){
+  var el = document.getElementById('miniToast');
+  if(!el) return;
+  el.textContent = m;
+  el.classList.add('on');
+  clearTimeout(_miniToastTimer);
+  _miniToastTimer = setTimeout(function(){
+    el.classList.remove('on');
+  }, dur || 1600);
+}
+
+function fetchClipHistory(kind){
+  var list = document.getElementById('cbList');
+  if(!list) return;
+  list.innerHTML = '<div style="padding:16px;text-align:center;color:rgb(var(--sb-sub));font-size:12px">__U_cb_loading__</div>';
+  fetch('/api/clipboard?kind=' + (kind || 'all') + '&limit=40', {headers: {'Sec-Fetch-Site': 'same-origin'}})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if(d && d.ok && d.items && d.items.length){
+      var html = '';
+      for(var i=0; i<d.items.length; i++){
+        var it = d.items[i];
+        var iconHtml = '';
+        if(it.kind === 'image'){
+          iconHtml = '<img class="cb-img-thumb" src="/api/clipboard/thumb/' + it.content + '" />';
+        } else if(it.kind === 'file' && it.thumb){
+          /* 第 339 项：复制进来的图片文件也有缩略图，不再只显示一个 📁 */
+          iconHtml = '<img class="cb-img-thumb" src="/api/clipboard/thumb/' + it.thumb + '" />';
+        } else if(it.kind === 'file'){
+          iconHtml = '<span class="cb-badge">__TIP_CB_BADGE_FILE__</span>';
+        } else {
+          iconHtml = '<span class="cb-badge">__TIP_CB_BADGE_TEXT__</span>';
+        }
+        html += '<div class="cb-item" onclick="copyClipItem(' + it.id + ', event)" title="__TIP_COPY_ITEM__">'
+          + iconHtml
+          + '<span class="cb-txt">' + esc(it.preview) + '</span>'
+          + '<span class="cb-time">' + it.relative_time + '</span>'
+          + '<button class="cb-pin' + (it.pinned ? ' pinned' : '') + '" onclick="togglePinClipItem(' + it.id + ', event)" title="' + (it.pinned ? '__TIP_CB_PIN_DEL__' : '__TIP_CB_PIN_ADD__') + '">' + (it.pinned ? '★' : '☆') + '</button>'
+          + '<button class="cb-del" onclick="deleteClipItem(' + it.id + ', event)" title="__TIP_CB_DEL__">✕</button>'
+          + '</div>';
+      }
+      list.innerHTML = html;
+    } else {
+      list.innerHTML = '<div style="padding:20px;text-align:center;color:rgb(var(--sb-sub));font-size:12px">' + (kind === 'fav' ? '__TIP_CB_EMPTY_FAV__' : '__TIP_CB_EMPTY__') + '</div>';
+    }
+    resize();
+  }).catch(function(){
+    list.innerHTML = '<div style="padding:20px;text-align:center;color:rgb(var(--sb-sub));font-size:12px">__TIP_CB_LOAD_FAIL__</div>';
+    resize();
+  });
+}
+
+function copyClipItem(id, e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var row = (e && (e.currentTarget || e.target)) ? (e.currentTarget || e.target) : null;
+  if(row && row.closest){
+    var itemEl = row.closest('.cb-item');
+    if(itemEl) itemEl.classList.add('cb-copying');
+  }
+  fetch('/api/clipboard/copy', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin'},
+    body: JSON.stringify({id: id})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if(d && d.ok){
+      toast(d.msg || '__TIP_CB_COPIED__');
+      setTimeout(function(){
+        closeClipPanel();
+        if(Q) Q.focus();
+      }, 140);
+    } else {
+      toast(d && d.msg ? d.msg : '__TIP_CB_COPY_FAIL__');
+    }
+  }).catch(function(){
+    toast('__TIP_CB_COPY_FAIL__');
+  });
+}
+
+function togglePinClipItem(id, e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  fetch('/api/clipboard/pin', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin'},
+    body: JSON.stringify({id: id})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if(d && d.ok){
+      toast(d.pinned ? '__U_cb_pin_on__' : '__U_cb_pin_off__');
+      fetchClipHistory(curClipKind);
+    }
+  }).catch(function(){});
+}
+
+function deleteClipItem(id, e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  fetch('/api/clipboard/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin'},
+    body: JSON.stringify({id: id})
+  }).then(function(){
+    toast('__U_cb_deleted__');
+    fetchClipHistory(curClipKind);
+  }).catch(function(){});
+}
+
+function clearClipHistory(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  if(!confirm('__U_cb_confirm__')) return;
+  fetch('/api/clipboard/clear', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin'},
+    body: '{}'
+  }).then(function(){
+    fetchClipHistory(curClipKind);
+    toast('__U_cb_cleared__');
+  }).catch(function(){});
+}
+
+var transTimer = null;
+var transLiveEnabled = true;
+
+function scheduleTrans(){
+  var box = document.getElementById('transBox');
+  if(!box || box.classList.contains('hide')) return;
+  if(!transLiveEnabled) return;
+  clearTimeout(transTimer);
+  transTimer = setTimeout(function(){
+    doMiniTranslate();
+  }, 350);
+}
+
+function fetchTransSettings(){
+  fetch('/api/settings').then(function(r){ return r.json(); }).then(function(s){
+    if(s){
+      if(s.trans_target_lang){
+        var sel = document.getElementById('tbLangSelect');
+        if(sel) sel.value = s.trans_target_lang;
+      }
+      if(s.trans_live !== undefined){
+        transLiveEnabled = !!s.trans_live;
+      }
+      // 第 273 项：「自动」不是"只在中英之间互转"，而是"译成界面语言"，文字由后端算好下发
+      if(s.trans_auto_label){
+        var av = document.getElementById('tbLangAuto');
+        if(av) av.textContent = s.trans_auto_label;
+      }
+    }
+  }).catch(function(){});
+}
+
+// 引擎 id → 界面名（没翻出来时告诉用户是哪家没给译文、为什么）
+var TRANS_ENGINE_NAMES = {
+  google: 'Google', mymemory: 'MyMemory', youdao: 'Youdao',
+  baidu: 'Baidu', iciba: 'Iciba',
+  deepseek: 'DeepSeek', deepl: 'DeepL', baidu_api: 'Baidu API',
+  google_api: 'Google API', openai: 'OpenAI'
+};
+
+function transSkipText(d){
+  try{
+    if(!d || !d.skipped || !d.skipped.length) return '';
+    var parts = [];
+    for(var i=0;i<d.skipped.length;i++){
+      var x = d.skipped[i] || {};
+      parts.push((TRANS_ENGINE_NAMES[x.engine] || x.engine) + '：' + (x.reason || ''));
+    }
+    return parts.join('；');
+  }catch(e){ return ''; }
+}
+
+function onTransLangChange(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var langSel = document.getElementById('tbLangSelect');
+  var val = langSel ? langSel.value : 'auto';
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({trans_target_lang: val})
+  }).catch(function(){});
+  doMiniTranslate();
+}
+
+function toggleTransPanel(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var box = document.getElementById('transBox');
+  if(!box) return;
+  if(!box.classList.contains('hide')){
+    closeTransPanel();
+  } else {
+    closeSnipBox();
+    closeClipPanel();
+    closeImgPreview();
+    LIST.innerHTML = '';
+    FOOT.classList.add('hide');
+    RH.classList.add('hide');
+    var em = document.getElementById('empty');
+    if(em) em.classList.add('hide');
+    box.classList.remove('hide');
+    fetchTransSettings();
+    doMiniTranslate();
+    resize();
+    if(Q) Q.focus();
+  }
+}
+
+function closeTransPanel(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var box = document.getElementById('transBox');
+  if(box && !box.classList.contains('hide')){
+    box.classList.add('hide');
+    var resDiv = document.getElementById('tbResults');
+    if(resDiv) resDiv.innerHTML = '';
+    if(Q && Q.value.trim()){
+      schedule();
+    } else {
+      renderHome();
+    }
+    resize();
+  }
+}
+
+function doMiniTranslate(e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  var resDiv = document.getElementById('tbResults');
+  if(!resDiv) return;
+  var txt = (Q ? Q.value : '').trim();
+  if(!txt){
+    resDiv.innerHTML = '<div style="padding:16px;text-align:center;color:rgb(var(--sb-sub));font-size:12px">__U_trans_ph__</div>';
+    resize();
+    return;
+  }
+  var langSel = document.getElementById('tbLangSelect');
+  var tgt = langSel ? langSel.value : 'auto';
+  resDiv.innerHTML = '<div style="padding:16px;text-align:center;color:rgb(var(--sb-sub));font-size:12px">__U_trans_doing__</div>';
+  fetch('/api/translate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin'},
+    body: JSON.stringify({text: txt, to: tgt, target_lang: tgt})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if(d && d.ok && d.results && d.results.length){
+      var html = '';
+      for(var i=0; i<d.results.length; i++){
+        var r = d.results[i];
+        html += '<div class="tb-card" onclick="copyTransText(' + JSON.stringify(r.text) + ', event)" title="__TIP_COPY_TEXT__">'
+          + '<div class="tb-card-head"><span class="tb-engine">' + esc(r.engine) + '</span><span class="tb-extra">' + esc(r.extra || '') + '</span></div>'
+          + '<div class="tb-card-text">' + esc(r.text) + '</div>'
+          + '</div>';
+      }
+      resDiv.innerHTML = html;
+    } else {
+      var why = transSkipText(d);
+      /* 第 341 项：代理端口连不上时后端已自动改直连，明说出来，别让人以为软件坏了 */
+      var byp = (d && d.proxy_bypass) ? ('__U_trans_bypass__') : '';
+      resDiv.innerHTML = '<div style="padding:16px;text-align:center;color:rgb(var(--sb-sub));font-size:12px">'
+        + '__U_trans_fail__'
+        + (byp ? '<div style="margin-top:6px;font-size:11px">' + byp + '</div>' : '')
+        + (why ? '<div style="margin-top:6px;font-size:11px;opacity:.85">' + esc(why) + '</div>' : '')
+        + '</div>';
+    }
+    resize();
+  }).catch(function(){
+    resDiv.innerHTML = '<div style="padding:16px;text-align:center;color:rgb(var(--sb-sub));font-size:12px">__U_trans_timeout__</div>';
+    resize();
+  });
+}
+
+function copyTransText(txt, e){
+  if(e && e.stopPropagation) e.stopPropagation();
+  if(navigator.clipboard){
+    navigator.clipboard.writeText(txt);
+  }
+  toast('__U_trans_copied__');
+}
 
 document.getElementById('btnSearch').onclick=function(){
 
+  if(pastedImgData && !pastedImgOcred){
+    ocrPastedImage();
+    return;
+  }
+  var tb = document.getElementById('transBox');
+  if(tb && !tb.classList.contains('hide')){
+    doMiniTranslate();
+    return;
+  }
+  if(MODE==='web'){ openWeb(); return; }
   var v=Q.value.trim(); if(v) doPrefix(v); else Q.focus();
 
 };
@@ -15503,9 +21624,15 @@ document.addEventListener('DOMContentLoaded',function(){
 
   applyMiniLang();
 
+  applyLook();
+
+  fetchTransSettings();
+
   Q.focus();
 
   fetchRecent();
+
+  fetchOpenDirs();
 
   if(PRESET_Q){ Q.value=PRESET_Q; schedule(); }
 
@@ -15533,7 +21660,15 @@ function checkLang(){
 
     fetch('/api/ping').then(function(r){return r.json()}).then(function(v){
 
-      if(v && v.lang && v.lang !== MINI_LANG){ location.search = '?lang=' + v.lang }
+      if(v && v.lang && v.lang !== MINI_LANG){
+        /* QA BUG-07：重载会把 SMALL/MAXH/STYLE/SCOPE 全清掉，而宿主不会
+           重推 __autoShow，贴角小窗就变回大窗布局并被裁。先存下来，
+           新页面一加载由 restoreMiniState() 恢复。 */
+        try{ sessionStorage.setItem('sb_mini_state', JSON.stringify({
+          small:SMALL, maxh:MAXH, scope:SCOPE, q:Q.value
+        })); }catch(e){}
+        location.search = '?lang=' + v.lang;
+      }
 
     }).catch(function(){});
 
@@ -15541,11 +21676,57 @@ function checkLang(){
 
 }
 
+/* QA BUG-07：语言切换导致的重载之后恢复贴角小窗状态。
+   宿主只在 show 时推 __autoShow，重载后的新页面不会再收到一次。 */
+function restoreMiniState(){
+  try{
+    var s=JSON.parse(sessionStorage.getItem('sb_mini_state')||'null');
+    if(!s)return;
+    sessionStorage.removeItem('sb_mini_state');
+    SMALL=!!s.small; MAXH=parseInt(s.maxh||0,10)||0;
+    SCOPE=s.scope||'';
+    document.body.classList.toggle('small',SMALL);
+    if(typeof s.q==='string' && s.q) Q.value=s.q;
+    renderScope();
+    shown=-1; resize();
+  }catch(e){}
+}
+restoreMiniState();
+
 setInterval(checkLang, 4000);
 
-window.__onShow=function(){
+window.__onShow=function(opts){
+
+  if(!opts || !opts.from_snip){
+    clearPastedImg();
+  }
+
+  /* 每次唤出快搜窗，收起所有子面板（剪贴板/翻译/截图等），恢复默认清爽初始态 */
+  closeClipPanel();
+  closeTransPanel();
+  closeSnipBox();
+  closeImgPreview();
 
   applyMiniLang();
+
+  applyLook();
+
+  fetchTransSettings();
+
+  /* 每次唤出刷新引擎配置，用户在设置里改完不用重启就能生效 */
+  leaveWeb(); fetchWeb();
+
+  /* 每次唤出先回到大窗：宿主紧接着会调 __autoShow({small:true}) 把它切小，
+
+     顺序不能反（先大后小不会闪，反过来会先小一下再变大）。 */
+
+  SMALL=false; MAXH=0;
+
+  try{ document.body.classList.remove('small'); }catch(e){}
+
+  renderScope();
+
+  fetchOpenDirs();
 
   /* 语言在设置里改过之后，快搜窗要跟着换：问一下后端当前的界面语言，
 
@@ -15563,7 +21744,7 @@ window.__onShow=function(){
 
   Q.value=PRESET_Q; cur=-1; seq++;
 
-  renderRecent(RECENT);        /* 先用上次那一屏，秒出；下面再后台刷新 */
+  renderHome();        /* 先用上次那一屏，秒出；下面再后台刷新 */
 
   if(PRESET_Q){ setTimeout(function(){ schedule(); },0); }
 
@@ -15594,6 +21775,11 @@ window.addEventListener('blur',function(){
   setTimeout(function(){
 
     if(document.hasFocus())return;
+
+    closeClipPanel();
+    closeTransPanel();
+    closeSnipBox();
+    closeImgPreview();
 
     if(API&&API.blurred)API.blurred();
 
@@ -15665,7 +21851,7 @@ def _sb_err(handler):
 
         tail = tb.strip().splitlines()[-1]
 
-        html = ('<!doctype html><meta charset="utf-8"><title>第二大脑 · 出错了</title>'
+        html = ('<!doctype html><meta charset="utf-8"><title>Memex · 出错了</title>'
 
                 '<body style="font:14px/1.7 system-ui,Segoe UI,Microsoft YaHei;padding:40px;'
 
@@ -15755,3220 +21941,755 @@ def web_ui_dir():
 
 
 
+def _licenses_base():
+
+    """第 380 项：随包许可清单所在目录（打包后在 _internal，开发时在仓库根）。"""
+
+    cands = []
+
+    try:
+
+        if getattr(sys, 'frozen', False):
+
+            cands.append(Path(sys.executable).parent / '_internal')
+
+        cands.append(Path(app_dir()))
+
+    except Exception:
+
+        pass
+
+    cands.append(Path(__file__).resolve().parent)
+
+    for base in cands:
+
+        try:
+
+            if (base / 'THIRD-PARTY-NOTICES.md').is_file():
+
+                return base
+
+        except Exception:
+
+            continue
+
+    return None
+
+
+
+_LIC_CACHE = {}
+
+
+
+def _load_licenses_manifest():
+
+    """解析 THIRD-PARTY-NOTICES.md 的表格；解析不了就返回空（前端显示提示，不报错）。"""
+
+    if 'rows' in _LIC_CACHE:
+
+        return _LIC_CACHE['rows']
+
+    base = _licenses_base()
+
+    rows = []
+
+    if base:
+
+        try:
+
+            txt = (base / 'THIRD-PARTY-NOTICES.md').read_text(encoding='utf-8')
+
+            for line in txt.splitlines():
+
+                line = line.strip()
+
+                if not line.startswith('|') or '---' in line:
+
+                    continue
+
+                cells = [c.strip() for c in line.strip('|').split('|')]
+
+                if len(cells) < 5 or cells[0] in ('组件', '组件名'):
+
+                    continue
+
+                rows.append({'name': cells[0], 'version': cells[1], 'license': cells[2],
+
+                             'use': cells[3], 'url': cells[4]})
+
+        except Exception:
+
+            rows = []
+
+    _LIC_CACHE['rows'] = rows
+
+    return rows
+
+
+
+def _model_digests():
+
+    """OCR 模型的身份：文件名 + 大小 + SHA-256 前 12 位（首次算一次后缓存）。"""
+
+    if 'models' in _LIC_CACHE:
+
+        return _LIC_CACHE['models']
+
+    out = []
+
+    try:
+
+        import ocr_engine
+
+        info = ocr_engine.engine_info()
+
+        digests = ocr_engine.model_digest()
+
+        for m in info.get('models') or []:
+
+            out.append({'name': m.get('name'), 'mb': m.get('mb'),
+
+                        'sha256': (digests.get(m.get('name')) or '')[:12]})
+
+        _LIC_CACHE['engine'] = {'version': info.get('version')}
+
+    except Exception:
+
+        pass
+
+    _LIC_CACHE['models'] = out
+
+    return out
+
+
+
+
+
+# ---------------------------------------------------------------- 第 326 项：正文库瘦身 + 计数暖缓存
+# 实测（2026-11-19）：库 2.2GB / 正文 700MB / FTS 影子表 1.9GB，
+# 其中 337 篇 >200KB 的文档（大头是爆破字典里的 txt）就占 565MB。
+# 做法：新正文按 MAX_BODY 截断、数据文件 >8MB 不读正文、老库一次性瘦身 + FTS 合并 + 增量回收页。
+
+_SLIM_KV = 'slim_docs_v1'
+
+
+def _slim_docs_once():
+
+    """老库一次性瘦身（做完打 kv 标记，之后不再跑）。
+
+    第 327 项改了两处，都是被实测教训出来的（13:04 那次跑了 **74 秒**，
+    期间界面上搜什么都白屏）：
+    1. **先把标记写掉再干活**。以前是「全部干完才写标记」，中途崩一次就下次开机重跑，
+       于是同一台机器上看得到两次「截断 210 篇 / 回收 86581 页」。
+    2. **等用户闲下来再做**（2 分钟没有任何 /api 请求）。开机就抢盘，用户一打开主窗
+       正好撞上它 —— 这才是「用着用着突然很卡」的一大半。
+    """
+
+    con = conn()
+
+    try:
+
+        if _kv_get(con, _SLIM_KV) == '1':
+
+            return
+
+        _kv_set(con, _SLIM_KV, '1')      # 先占坑：崩了也不再重跑
+
+        con.commit()                     # 第 327 项：同上，漏了就是全程序写库被锁
+
+    except Exception:
+
+        return
+
+    try:
+
+        time.sleep(15)              # 别和启动路径抢盘
+
+    except Exception:
+
+        pass
+
+    # 等到用户真的停手（2 分钟没有请求）再动库；最多等 10 分钟，等到就干
+    t_wait = time.time()
+
+    while time.time() - _ACTIVITY['t'] < 120 and time.time() - t_wait < 600:
+
+        time.sleep(5)
+
+    t0 = time.time()
+
+    trimmed = dropped = 0
+
+    # 1) 超长正文截到 MAX_BODY
+    while True:
+
+        try:
+
+            with db_lock('slim:trim', 8.0):
+
+                if doc_mode(con) == 'v2':
+                    rs = con.execute('SELECT id FROM doc_rec WHERE n > ? LIMIT 200',
+                                     (MAX_BODY,)).fetchall()
+                else:
+                    rs = con.execute('SELECT rowid FROM docs WHERE LENGTH(body) > ? LIMIT 200',
+                                     (MAX_BODY,)).fetchall()
+
+                if not rs:
+
+                    break
+
+                for (rid,) in rs:
+
+                    if doc_mode(con) == 'v2':
+                        body = doc_body_get(con, rid)
+                        doc_replace_body(con, rid, body[:MAX_BODY])
+                    else:
+                        con.execute('UPDATE docs SET body=substr(body,1,?) WHERE rowid=?',
+                                    (MAX_BODY, rid))
+
+                con.commit()
+
+                trimmed += len(rs)
+
+        except LockBusy:
+
+            time.sleep(2)
+
+        except sqlite3.Error as e:
+
+            _log_file('slim trim FAILED: %r' % (e,))
+
+            break
+
+    # 2) 数据文件（>8MB 的 txt/log/csv…）不再正文索引，只留文件名
+    try:
+
+        with db_lock('slim:scan', 8.0):
+
+            rows = doc_all_rows(con)
+
+    except Exception:
+
+        rows = []
+
+    rids = {os.path.normcase(p): rid for rid, p in rows}
+
+    victims = []
+
+    for _rid, p in rows:
+
+        if os.path.splitext(str(p))[1].lower() not in TEXT_DUMP_EXTS:
+
+            continue
+
+        try:
+
+            if os.path.getsize(p) > TEXT_DUMP_MAX:
+
+                victims.append(p)
+
+        except OSError:
+
+            continue
+
+    for p in victims:
+
+        try:
+
+            with db_lock('slim:del', 8.0):
+
+                _doc_del(con, rids, p)
+
+                con.commit()
+
+                dropped += 1
+
+        except Exception:
+
+            continue
+
+    # 3) FTS5 合并段：trigram 索引段多了以后查询和体积都会变差。
+    # 不用 'optimize' —— 那个命令会把整棵 b-tree 一次合并完，几 GB 的库能锁上好几分钟，
+    # 期间所有搜索都在等锁。改成多次小 rank 的 'merge'，每次只合几十页。
+    for _ in range(6):
+
+        try:
+
+            with db_lock('slim:merge', 20.0):
+
+                con.execute("INSERT INTO docs(docs, rank) VALUES('merge', 32)")
+
+                con.commit()
+
+        except Exception as e:
+
+            _log_file('slim merge skipped: %r' % (e,))
+
+            break
+
+    # 4) 增量回收空闲页（库是 auto_vacuum=INCREMENTAL）
+    #    第 327 项：每次最多回收 60×500 页就收手。以前 300 轮能跑一分多钟，
+    #    期间写锁基本被它一个人占着（实时索引只能不停重试）。剩下的交给月度 compact。
+    reclaimed = 0
+
+    try:
+
+        vac = sqlite3.connect(DB, timeout=15)
+
+        try:
+
+            vac.execute('PRAGMA busy_timeout=8000')
+
+        except sqlite3.Error:
+
+            pass
+
+        for _ in range(60):
+
+            try:
+
+                free = vac.execute('PRAGMA freelist_count').fetchone()[0]
+
+                if not free:
+
+                    break
+
+                vac.execute('PRAGMA incremental_vacuum(500)').fetchall()
+
+                reclaimed += min(free, 500)
+
+            except sqlite3.Error:
+
+                time.sleep(1)
+
+        vac.close()
+
+    except Exception:
+
+        pass
+
+    try:
+
+        _kv_set(con, _SLIM_KV, '1')
+
+        con.commit()          # 第 327 项：别忘了提交，否则写锁就一直攥在手里
+
+    except Exception:
+
+        pass
+
+    # 瘦身写了几百 MB，WAL 会被撑大（实测 603MB）—— 这里截断一次再报结论。
+    try:
+
+        con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
+    except Exception:
+
+        pass
+
+    size_mb = os.path.getsize(DB) / 1048576.0 if os.path.exists(DB) else 0
+
+    _log_file('slim docs done: 截断 %d 篇 / 丢数据文件 %d 篇 / 回收 %d 页 / 库 %.0fMB / %.1fs'
+
+              % (trimmed, dropped, reclaimed, size_mb, time.time() - t0))
+
+
+def _facets_warm_loop():
+
+    """启动 20 秒后先算一次空关键词计数，之后每 60 秒补一次。
+
+    缓存 TTL 30 秒，所以用户随时点开主窗，左栏数字都是现成的。
+
+    第 328 项：**数据没变就别重算**。之前是每 60 秒无条件重算一遍 ——
+    py-spy 抓到的结论是这条线程每分钟把 CPU 打满 2~3 秒，而且它攥着 GIL，
+    那两三秒里所有 HTTP 请求线程一起停摆（用户体感就是「隔一会儿卡一下」）。
+    现在先比 files/dirs 的行数：没变就把缓存时间戳往后推，一秒都不用花。
+    """
+
+    try:
+
+        time.sleep(20)
+
+    except Exception:
+
+        return
+
+    state = [None, None]      # [files 行数, dirs 行数]
+
+    while True:
+
+        try:
+
+            # 第 327 项：暖缓存也走只读连接 —— 它每分钟跑一次，没理由去抢写锁
+            with ro_db('/api/facets:warm') as rc:
+
+                nf = rc.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+
+                nd = rc.execute('SELECT COUNT(*) FROM dirs').fetchone()[0]
+
+                if [nf, nd] != state or not _FACETS_CACHE:
+
+                    facets(rc, {})
+
+                    state[0], state[1] = nf, nd
+
+                else:
+
+                    # 数据没变：续期，不重算（12k 组归桶的活就省下来了）
+                    now = time.time()
+
+                    for k in list(_FACETS_CACHE.keys()):
+
+                        v = _FACETS_CACHE.get(k)
+
+                        if v:
+
+                            _FACETS_CACHE[k] = (now, v[1])
+
+        except Exception:
+
+            pass
+
+        try:
+
+            time.sleep(60)
+
+        except Exception:
+
+            return
+
+
+# 第 326 项：空闲压缩用得到的两件东西
+_ACTIVITY = {'t': time.time()}
+
+# 第 366 项：只读「心跳」路径 —— 这些接口是前端定时轮询的（面板关着也照打），
+# 不应该算成「用户在使用」。不排除它们，主窗 WebView 活着活动戳就永远新鲜，
+# 326 的空闲压缩与老库自动迁移会被 5 秒轮询永久饿死（线上库一直卡在 v1 就是这么来的）。
+_HB_PATHS = (
+    '/api/ocr_batch',        # App 每 5 秒一次（OCR 面板开着时 1 秒）
+    '/api/index/verify',     # 校验跑起来时 3 秒一次
+    '/api/update_status',    # 下载/解包进度
+    '/api/snip/result',      # 截图翻译等结果
+    '/api/ping',
+    '/api/compact',          # 第 366 项：整理索引库状态（自己也不能把自己当活动）
+)
+
+
+def _is_heartbeat(path):
+
+    """只读轮询不算用户活动。只认 GET，且必须整段匹配（/api/ping/x 不算）。"""
+
+    try:
+
+        p = path.split('?')[0].rstrip('/')
+
+    except Exception:
+
+        return False
+
+    return p in _HB_PATHS
+
+
+def _touch_activity():
+
+    _ACTIVITY['t'] = time.time()
+
+
+def _trim_working_set():
+
+    """第 326 项：空闲时把工作集还给系统。
+
+    Python 堆用过的页不会主动还 —— 实测压测峰值 584MB，收尾仍有 334MB，
+    用户就记成「这软件越用越吃内存」。SetProcessWorkingSetSize(-1,-1) 等价于
+    EmptyWorkingSet：把冷页交回系统，下次要用再读回来（磁盘上全是缓存，代价很小）。
+    """
+
+    try:
+
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+
+        k32.SetProcessWorkingSetSize(k32.GetCurrentProcess(), ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+
+    except Exception:
+
+        pass
+
+
+def _compact_loop():
+
+    """第 326 项：空闲时压缩 FTS 段 + VACUUM（30 天一次）。
+
+    FTS5 每次 UPDATE/INSERT 都新写一段；改得多了段越叠越多 —— 实测瘦身后
+    docs_data 反而从 1.2GB 涨到 1.4GB（旧段没合），一条 'optimize' 只用 8.6 秒
+    就压到正文对应的量级，再 VACUUM 一次库从 1.9GB 缩到 0.9GB。
+    代价：optimize / VACUUM 要独占写锁（这时搜索会短暂报忙），所以只在
+    「最近 10 分钟没有任何 HTTP 请求」时才动手，而且 30 天内只做一次。
+    """
+
+    try:
+
+        time.sleep(60)
+
+    except Exception:
+
+        return
+
+    while True:
+
+        try:
+
+            time.sleep(300)
+
+            if time.time() - _ACTIVITY['t'] < 600:
+
+                # 用户刚用过：不 trim、不整理，隔 5 分钟再看一遍
+                continue
+
+            # 空闲 10 分钟以上：先把工作集还给系统（326 的初衷），再看要不要压缩库。
+            # 第 366 项修正：原来 trim 写在「活动<600」的分支里，等于用户正用着才 trim、
+             # 真空闲反而不 trim，跟 docstring 说的正好相反。
+            _trim_working_set()
+
+            con = conn()
+
+            # 第 366 项：迁移与 30 天 optimize 合并成同一个 compact_now()，
+            # 这样手动入口和后台走同一条路径、同一份进度、同一套备份与 VACUUM。
+            try:
+
+                if COMPACT.get('state') == 'busy':
+
+                    continue
+
+                need_mig = (doc_mode(con) == 'v1'
+                            and _kv_get(con, 'compact_v2', '') != '1')
+
+                try:
+
+                    last = float(_kv_get(con, 'fts_opt_at', '0') or 0)
+
+                except Exception:
+
+                    last = 0
+
+                if need_mig or time.time() - last >= 30 * 86400:
+
+                    _log_file('compact: 空闲 %.0fs，开始整理（migrate=%s）'
+                              % (time.time() - _ACTIVITY['t'], need_mig))
+
+                    compact_now(auto=True)
+
+            except Exception as e:
+
+                _log_file('compact skipped: %r' % (e,))
+
+        except Exception as e:
+
+            _log_file('fts compact skipped: %r' % (e,))
+
+
+
+# 第 366 项：整理索引库（老结构迁移 + FTS optimize + VACUUM + WAL 截断）
+# 以前这三步只在「空闲 10 分钟」时后台偷偷做，而前端 5 秒一次的心跳让「空闲」永不成立，
+# 线上库就一直停在 v1。现在：①心跳不算活动（见 _is_heartbeat）；②设置里给手动入口；
+# ③无论手动还是后台，都往同一个进度对象里写，界面能显示「正在整理 / 已完成 X MB」。
+COMPACT = {'state': 'idle', 'phase': '', 'done': 0, 'total': 0, 'k': '', 'a': {},
+           'msg': '', 'err': '', 'before': 0.0, 'after': 0.0, 'secs': 0.0,
+           'at': 0.0, 'auto': False}
+_COMPACT_LOCK = threading.Lock()
+
+
+COMPACT = {'state': 'idle', 'phase': '', 'done': 0, 'total': 0, 'k': '', 'a': {},
+           'msg': '', 'err': '', 'before': 0.0, 'after': 0.0, 'secs': 0.0,
+           'at': 0.0, 'auto': False}
+_COMPACT_LOCK = threading.Lock()
+
+
+def _compact_prog(**kw):
+
+    try:
+
+        COMPACT.update(kw)
+
+    except Exception:
+
+        pass
+
+
+def _db_mb():
+
+    try:
+
+        return os.path.getsize(DB) / 1048576.0
+
+    except Exception:
+
+        return 0.0
+
+
+def compact_now(auto=False, claimed=False):
+
+    """同步跑一次整理（调用方负责开线程）。返回 COMPACT 快照。
+
+    全程独占写锁，搜索会短暂报「忙」——所以必须能看到进度，不能像故障。
+    claimed=True 表示调用方（POST /api/compact）已经把状态置成 busy，跳过重入检查。
+    """
+
+    before = _db_mb()
+
+    with _COMPACT_LOCK:
+
+        if COMPACT.get('state') == 'busy' and not claimed:
+
+            return dict(COMPACT)
+
+        if not claimed:
+
+            COMPACT.update({'state': 'busy', 'phase': 'backup', 'done': 0, 'total': 0,
+                            'k': 'maint_busy_compact', 'a': {}, 'msg': '', 'err': '',
+                            'before': before, 'after': 0.0, 'secs': 0.0,
+                            'at': time.time(), 'auto': bool(auto)})
+
+    t0 = time.time()
+
+    migrated = False
+
+    con = None
+
+    try:
+
+        con = conn()
+
+        if doc_mode(con) == 'v1' and _kv_get(con, 'compact_v2', '') != '1':
+
+            with db_lock('compact:migrate', 600.0):
+
+                migrated = compact_legacy_db(con, log=lambda m: _log_file('compact: ' + m),
+                                             prog=_compact_prog)
+
+        _compact_prog(phase='optimize', done=0, total=0, k='maint_compact_optimize', a={})
+
+        with db_lock('compact:opt', 30.0):
+
+            con.execute("INSERT INTO docs(docs) VALUES('optimize')")
+
+            con.commit()
+
+        _compact_prog(phase='vacuum', done=0, total=0, k='maint_compact_vacuum', a={})
+
+        with db_lock('compact:vac', 180.0):
+
+            con.execute('VACUUM')
+
+            con.commit()
+
+            con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
+        _kv_set(con, 'fts_opt_at', str(time.time()))
+
+        con.commit()
+
+        after = _db_mb()
+
+        COMPACT.update({'state': 'done', 'phase': '', 'after': after,
+                        'secs': time.time() - t0, 'at': time.time(),
+                        'k': 'maint_compact_note',
+                        'a': {'before': '%.1f' % before, 'after': '%.1f' % after,
+                              'mb': '%.1f' % max(0.0, before - after),
+                              's': '%.0f' % (time.time() - t0)}})
+
+        _log_file('compact done migrated=%s %.0fMB -> %.0fMB in %.0fs'
+                  % (migrated, before, after, time.time() - t0))
+
+    except Exception as e:
+
+        try:
+
+            if con is not None:
+
+                con.rollback()
+
+        except Exception:
+
+            pass
+
+        COMPACT.update({'state': 'err', 'phase': '',
+                        'err': '%r' % (e,), 'k': '', 'at': time.time()})
+
+        _log_file('compact failed: %r' % (e,))
+
+    finally:
+
+        try:
+
+            COMPACT.update({'after': _db_mb() if COMPACT.get('after') in (0.0, None) else COMPACT.get('after')})
+
+        except Exception:
+
+            pass
+
+    return dict(COMPACT)
+
+
+def _compact_thread(auto=False, claimed=False):
+
+    try:
+
+        compact_now(auto=auto, claimed=claimed)
+
+    except Exception as e:
+
+        _log_file('compact thread crashed: %r' % (e,))
+
+
+def shell_open(kind, d=None):
+    """第 355 项：命令关键字 cmd / psh 的落地。
+
+    只开一个终端，工作目录用 Popen(cwd=...) 传进去，**不把用户给的路径拼进
+    shell 命令行**——路径里有引号、空格、& 都不会变成命令。
+    kind 白名单之外一律拒绝；目录不存在就退回用户主目录。
+    """
+    if kind not in ('cmd', 'psh'):
+        return {'ok': False, 'err': 'kind'}
+    d = str(d or '').strip()
+    if not d or not os.path.isdir(d):
+        d = os.path.expanduser('~')
+    argv = ['cmd'] if kind == 'cmd' else ['powershell', '-NoExit']
+    flags = getattr(subprocess, 'CREATE_NEW_CONSOLE', 0)
+    try:
+        subprocess.Popen(argv, cwd=d, creationflags=flags, close_fds=True)
+    except Exception as e:
+        return {'ok': False, 'err': repr(e)[:120]}
+    return {'ok': True, 'dir': d}
 
 
 def make_server(port=8765):
 
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    PAGE_TPL = r'''<!doctype html><html lang="zh-CN"><head><meta charset=utf-8>
+    # 第 374 项：旧界面（PAGE_TPL）整块下线。它当年撑起 / 首页和 ?ui=legacy 兜底，
 
-<meta name=viewport content="width=device-width,initial-scale=1">
+    # 现在首页一律 302 到 /web/（React），这块 109KB 的 HTML 只剩「跳过去」一件事，
 
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%236b53e8'/%3E%3Ctext y='.92em' x='8' font-size='82'%3E%F0%9F%A7%A0%3C/text%3E%3C/svg%3E">
+    # 留着它只是给 ?ui=legacy 和未知路径一个不至于白屏的落点。
 
-<title>第二大脑 · 本地文档搜索</title>
+    PAGE_TPL = ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
 
-<style>
+                '<title>Memex</title>'
 
-:root{--bg:#f6f7fb;--card:#fff;--ink:#1a2233;--sub:#6b7280;--acc:#4f6ef7;--mark:#fde68a;--line:#e8eaf3;--sel:#eef1fd;--side:#8089a0}
+                '<meta http-equiv="refresh" content="0;url=/web/">'
 
-[data-theme="dark"]{--bg:#1a1d24;--card:#22262e;--ink:#e4e7ee;--sub:#9aa3b2;--acc:#6b8aff;--mark:#5a4a1a;--line:#2e333d;--sel:#2a3050;--side:#9aa4b6}
+                '</head><body style="margin:0;background:#0a0b0d;color:#c9cdd6;'
 
-*{box-sizing:border-box;margin:0}
+                'font:14px/1.7 system-ui,sans-serif;padding:56px">'
 
-body{font-family:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);min-height:100vh;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+                '界面已经换成新版，正在跳转…'
 
-.topbar{display:flex;gap:8px;align-items:center;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0}
+                '<p><a href="/web/" style="color:#17c6b6">没有自动跳转就点这里</a></p>'
 
-.topbar .logo{font-size:0;display:flex;align-items:center;margin-right:4px;flex-shrink:0}
+                '</body></html>')
 
-.topbar input{border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:8px 12px;font-size:14px;outline:none;transition:.15s;font-family:inherit}
-
-.topbar input:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(79,110,247,.12)}
-
-#q{flex:1;min-width:120px}#t{width:90px}#d{width:120px}
-
-.topbar .sbtn{border:none;border-radius:8px;padding:8px 18px;font-size:14px;font-weight:500;color:#fff;background:var(--acc);cursor:pointer;font-family:inherit;white-space:nowrap}
-
-.topbar .sbtn:hover{background:#3d5bd9}
-
-.topbar .gear{border:1px solid var(--line);background:var(--card);border-radius:8px;width:34px;height:34px;font-size:15px;color:var(--sub);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.15s;flex-shrink:0}
-
-.topbar .gear:hover{color:var(--acc);border-color:var(--acc)}
-
-.filterbar{display:flex;gap:6px;padding:6px 16px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0;overflow-x:auto}
-
-.filterbar:empty{display:none}
-
-.fchip{font-size:12px;padding:3px 10px;border-radius:6px;background:var(--bg);color:var(--sub);cursor:pointer;white-space:nowrap;transition:.12s;border:1px solid transparent}
-
-.fchip:hover{color:var(--ink)}
-
-.fchip.on{background:var(--sel);color:var(--acc);border-color:rgba(79,110,247,.2)}
-
-.fchip b{font-weight:600;margin-left:2px}
-
-.main{flex:1;display:flex;overflow:hidden;min-height:0}
-
-.frbar{display:flex;align-items:center;gap:10px;padding:8px 14px;font-size:12.5px;
-
-  color:var(--tx2);background:linear-gradient(90deg,#eef2ff,#f7f9ff);border-bottom:1px solid var(--ln)}
-
-.frbar.hide{display:none}
-
-.frbar b{color:var(--tx);font-variant-numeric:tabular-nums}
-
-.frbar #frmsg{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-
-.frbar .frbtn{flex:0 0 auto;white-space:nowrap}
-
-.frbar .frp{flex:1;height:3px;border-radius:2px;background:#dfe5f5;overflow:hidden;max-width:260px}
-
-.frbar .frp i{display:block;height:100%;width:0;background:var(--acc);transition:width .4s}
-
-.frbar .frbtn{border:1px solid var(--ln);background:#fff;color:var(--tx2);border-radius:6px;
-
-  padding:2px 9px;font-size:12px;cursor:pointer}
-
-.frbar .frbtn:hover{border-color:var(--acc);color:var(--acc)}
-
-.frbar.ok{background:linear-gradient(90deg,#eafaf1,#f6fdf9);border-bottom-color:#bfe8d2;color:#1a7a4a}
-
-.side{flex:0 0 158px;border-right:1px solid var(--line);background:var(--card);overflow-y:auto;padding:6px 6px 10px;display:flex;flex-direction:column;gap:0}
-
-.side .sh{font-size:11.5px;color:var(--side);padding:7px 8px 4px;display:flex;align-items:center;justify-content:space-between;font-weight:500}
-
-.sitem{display:flex;align-items:center;gap:7px;padding:4.5px 9px;border-radius:6px;font-size:12.5px;color:var(--sub);cursor:pointer;transition:.1s;border:1px solid transparent}
-
-.sitem:hover{background:var(--bg);color:var(--ink)}
-
-.sitem.on{background:var(--sel);color:var(--acc);border-color:rgba(79,110,247,.18);font-weight:500}
-
-.sitem .si{width:16px;text-align:center;font-size:13px;opacity:.9}
-
-.spath{display:flex;align-items:center;gap:4px;padding:1px 4px 4px 6px}
-
-.spath input{flex:1;min-width:0;height:26px;border:1px solid var(--line);border-radius:7px;
-
-  background:var(--bg);color:var(--ink);font-size:12px;padding:0 8px;outline:0;font-family:inherit}
-
-.spath input:focus{border-color:#b9c6ff}
-
-.dpclr{font-weight:400;font-size:11px;color:#b6bcc9;cursor:pointer;padding:0 2px;visibility:hidden}
-
-.dpclr:hover{color:#4f6ef7}
-
-.sitem b{margin-left:auto;font-weight:500;font-size:11.5px;color:var(--side)}
-
-.sitem.on b{color:var(--acc)}
-
-.tablewrap{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;overflow-x:auto}
-
-.thead{display:grid;grid-template-columns:26px minmax(150px,1.05fr) minmax(170px,1.55fr) 116px;gap:10px;align-items:center;padding:7px 12px;font-size:11.5px;color:var(--side);border-bottom:1px solid var(--line);background:var(--card);flex-shrink:0;font-weight:500}
-
-.rlist{flex:1;overflow-y:auto;padding:0}
-
-.ritem{display:grid;grid-template-columns:26px minmax(150px,1.05fr) minmax(170px,1.55fr) 116px;gap:10px;align-items:center;padding:6px 12px;border-radius:6px;cursor:pointer;transition:background .08s;border:1px solid transparent}
-
-.ritem:hover{background:var(--bg)}
-
-.ritem.on{background:var(--sel);border-color:rgba(79,110,247,.15)}
-
-.ritem .ico{width:24px;height:24px;flex-shrink:0;border-radius:5px;object-fit:contain}
-
-.ritem .ico .ic{display:block;width:22px;height:22px}
-
-.ritem .ico .fic{display:none;width:22px;height:22px}
-
-.ritem .ico.noic .ic{display:none}
-
-.ritem .ico.noic .fic{display:block}
-
-.ritem .nm{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-
-.ritem .pp{font-size:12px;color:var(--side);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-
-.ritem .mt{font-size:11.5px;color:var(--side);white-space:nowrap;text-align:right}
-
-.ritem .mt.none{color:transparent}
-
-.ritem .rmain{display:none}
-
-.ritem .evtag{font-size:10px;color:#7c3aed;border:1px solid #dfd3fb;border-radius:4px;padding:1px 4px;flex-shrink:0}
-
-.rsnip{font-size:12px;color:var(--sub);line-height:1.5;padding-left:34px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
-
-.ritem .sub{grid-column:2/4;font-size:11.5px;color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:-2px}
-
-.rsnip mark{background:var(--mark);border-radius:2px;padding:0 1px}
-
-[data-theme="dark"] .ritem .badge{background:#2a3050;color:var(--acc)}
-
-.ritem .evtag{font-size:10px;color:#7c3aed;border:1px solid #dfd3fb;border-radius:4px;padding:1px 4px;flex-shrink:0}
-
-.evhead{font-size:11.5px;font-weight:600;color:var(--acc);padding:9px 12px 5px;display:flex;align-items:baseline;gap:6px;background:var(--bg);border-bottom:1px solid var(--line)}
-
-.evhead em{font-weight:400;color:var(--side);font-size:11px}
-
-.evmore{font-size:11.5px;color:var(--side);padding:6px 10px 4px}
-
-.preview{flex:0 0 190px;min-width:0;border-left:1px solid var(--line);background:var(--card);overflow-y:auto;padding:12px 10px;display:none}
-
-.preview.on{display:block}
-
-@media(max-width:900px){.preview{display:none!important}}
-
-@media(max-width:1020px){.preview.on{flex-basis:170px}}
-
-.pv-title{font-size:13px;font-weight:600;margin-bottom:6px;word-break:break-word}
-
-.pv-thumb{margin-bottom:10px;text-align:center;background:var(--bg);border-radius:8px;padding:6px;overflow:hidden}
-
-.pv-thumb img{max-width:100%;max-height:190px;border-radius:4px;object-fit:contain}
-
-.pv-meta{font-size:11px;color:var(--side);margin-bottom:10px;line-height:1.6;word-break:break-word}
-
-.pv-meta b{color:var(--ink);font-weight:500}
-
-.pv-snip{font-size:12px;line-height:1.7;color:#3a4356;background:var(--bg);border-radius:8px;padding:10px 10px;word-break:break-word;border:1px solid var(--line)}
-
-.pv-actions{display:flex;flex-direction:column;gap:6px;margin-top:10px}
-
-.pv-actions .btn{text-align:center}
-
-.pv-empty{color:var(--side);font-size:12px;text-align:center;padding:24px 0;line-height:1.7}
-
-.btn{border:1px solid var(--line);background:var(--card);color:var(--sub);border-radius:7px;padding:6px 12px;font-size:12px;cursor:pointer;transition:.15s;white-space:nowrap;font-family:inherit}
-
-.btn:hover{color:var(--acc);border-color:var(--acc)}
-
-.btn.primary{background:var(--acc);color:#fff;border-color:var(--acc)}
-
-.btn.primary:hover{background:#3d5bd9}
-
-.footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 16px;background:var(--card);border-top:1px solid var(--line);font-size:11.5px;color:var(--side);flex-shrink:0;white-space:nowrap;overflow:hidden}
-
-.footer>span{white-space:nowrap;min-width:0}
-
-.footer .newui{margin-right:6px;color:var(--sub,#8089a0);text-decoration:none;border-bottom:1px dotted currentColor}
-
-.footer .newui:hover{color:var(--acc,#4f6ef7)}
-
-.footer .verbox{overflow:hidden;text-overflow:ellipsis}
-
-@media (max-width:1280px){.footer .hkhint{display:none}}
-
-.footer .hkhint{min-width:0;overflow:hidden;text-overflow:ellipsis}
-
-.footer kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:11px;font-family:inherit;background:var(--bg)}
-
-.footer .hkhint{color:var(--accent,#3b82f6);cursor:pointer}
-
-.empty{text-align:center;color:var(--side);padding:80px 0;font-size:14px;line-height:2}
-
-.empty b{color:var(--ink)}
-
-/* 首页时间轴 */
-
-.tlwrap{padding:6px 16px 24px}
-
-.tlmore{text-align:center;color:#4f6ef7;font-size:12.5px;padding:16px 0 6px;cursor:pointer}
-
-.tlmore:hover{text-decoration:underline}
-
-.tlhead{display:flex;align-items:center;gap:8px;margin:16px 4px 6px;font-size:12px;font-weight:600;color:var(--side);letter-spacing:.5px}
-
-.tln{font-weight:400;color:var(--side);opacity:.7}
-
-.tlrow{display:grid;grid-template-columns:44px minmax(0,2fr) minmax(0,3fr) 96px;gap:10px;align-items:center;padding:7px 8px;border-radius:8px;cursor:default}
-
-.tlrow:hover{background:var(--hov)}
-
-.tlrow.on{background:var(--sel)}
-
-.tlic{font-size:10px;font-weight:700;color:var(--acc);background:var(--accbg);border-radius:4px;text-align:center;padding:2px 0;overflow:hidden}
-
-.tlnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
-
-.tldir{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--side)}
-
-.tlt{font-size:11px;color:var(--side);text-align:right}
-
-/* 右键菜单 */
-
-.ctxm{position:fixed;z-index:9999;background:var(--card);border:1px solid var(--line);border-radius:9px;box-shadow:0 8px 26px rgba(0,0,0,.16);padding:5px;min-width:170px}
-
-.ctxi{padding:7px 10px;font-size:13px;border-radius:6px;cursor:pointer;color:var(--ink)}
-
-.ctxi:hover{background:var(--hov)}
-
-.vmenu{display:none;min-width:172px}
-
-.qsyn{margin-top:10px;font-size:12px;color:#8a91a3;line-height:1.7}
-
-.about.help{width:min(760px,94vw);max-width:94vw;max-height:86vh;overflow:auto;text-align:left;padding:20px 22px 16px}
-
-.help .hhd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-
-.help .hht{font-size:16px;font-weight:700;color:#1a2233}
-
-.help .wx{border:0;background:none;font-size:16px;color:#8a91a3;cursor:pointer;line-height:1}
-
-.help .hcols{display:grid;grid-template-columns:1fr 1fr;gap:8px 26px}
-
-.help .hsec{min-width:0}
-
-.help .hsec:first-child{grid-row:span 2}
-
-.help .hst{font-size:12.5px;font-weight:700;color:#4f6ef7;margin:6px 0 8px;letter-spacing:.02em}
-
-.help .hrow{display:flex;gap:10px;align-items:baseline;padding:3px 0;font-size:12.5px;color:#4a5162;line-height:1.5}
-
-.help .hk{flex:none;min-width:74px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;
-
-  color:#1f2a44;background:#f1f3f9;border:1px solid #e3e7f2;border-radius:5px;padding:1px 6px;text-align:center}
-
-.help .hfoot{margin-top:14px;font-size:11.5px;color:#8a91a3;text-align:center}
-
-@media (max-width:640px){.help .hcols{grid-template-columns:1fr}}
-
-.vmenu.on{display:block}
-
-.vmenu .ctxi{display:flex;align-items:center;gap:8px}
-
-.vmenu .vic{width:14px;color:#4f6ef7;font-weight:700;display:inline-block;text-align:center}
-
-.vsep{height:1px;background:var(--line);margin:5px 6px}
-
-/* 零命中建议 */
-
-.dym{padding:0 24px 24px}
-
-.dymh{font-size:12px;color:var(--side);margin-bottom:8px}
-
-.dymc{display:inline-block;margin:0 6px 6px 0;padding:5px 11px;border-radius:14px;background:var(--accbg);color:var(--acc);font-size:12.5px;cursor:pointer}
-
-/* 反查 / 同名版本 */
-
-.revsec{margin-top:10px;font-size:12px;color:var(--side);font-weight:600}
-
-.revrow{display:flex;gap:6px;flex-direction:column;padding:5px 6px;border-radius:6px;cursor:pointer;font-size:12px}
-
-.revrow:hover{background:var(--hov)}
-
-.revdir{color:var(--side);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-.revt{color:var(--side);font-size:10.5px}
-
-.pvsame{margin-top:12px;border-top:1px dashed var(--line);padding-top:8px}
-
-.pvsame-h{font-size:11.5px;color:var(--side);margin-bottom:4px}
-
-.pvsame-row{display:flex;justify-content:space-between;gap:6px;padding:3px 4px;border-radius:5px;cursor:pointer;font-size:12px}
-
-.pvsame-row:hover{background:var(--hov)}
-
-.pvsame-n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-.pvsame-t{color:var(--side);font-size:10.5px;white-space:nowrap}
-
-mark{background:var(--mark);border-radius:3px;padding:0 2px;font-weight:600}
-
-.drawer{position:fixed;top:0;right:-360px;width:340px;height:100vh;background:var(--card);box-shadow:-4px 0 24px rgba(0,0,0,.08);z-index:20;transition:right .2s;overflow-y:auto;padding:20px 22px}
-
-.drawer.on{right:0}
-
-.drawer h3{font-size:15px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between}
-
-.drawer h3 b{cursor:pointer;color:var(--side);font-weight:400;font-size:18px}
-
-.drawer h3 b:hover{color:var(--ink)}
-
-.dsec{margin-bottom:20px}
-
-.dsec-t{font-size:12px;font-weight:600;color:var(--side);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
-
-.drow{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line)}
-
-.drow:last-child{border-bottom:none}
-
-.drow .dl{font-size:13px}
-
-.drow .dl small{display:block;font-size:11px;color:var(--side);margin-top:2px}
-
-.toggle{width:40px;height:22px;border-radius:11px;background:#d3d5e0;position:relative;cursor:pointer;transition:.2s;flex-shrink:0}
-
-.toggle.on{background:var(--acc)}
-
-.toggle i{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
-
-.toggle.on i{left:20px}
-
-.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-
-.chip{display:flex;align-items:center;gap:6px;background:var(--sel);color:var(--acc);border-radius:7px;padding:5px 9px;font-size:12px;word-break:break-all;max-width:100%}
-
-.chip b{cursor:pointer;font-weight:600;color:var(--side)}
-
-.chip b:hover{color:#e05555}
-
-.pbtn{border:none;border-radius:8px;padding:9px 18px;font-size:13px;font-weight:500;color:#fff;background:var(--acc);cursor:pointer;font-family:inherit}
-
-.pbtn.hot{animation:hotpulse 1.7s ease-in-out infinite}
-
-@keyframes hotpulse{0%,100%{box-shadow:0 0 0 0 rgba(63,125,255,.0)}50%{box-shadow:0 0 0 6px rgba(63,125,255,.18)}}
-
-#pi.indet{width:100%!important;background:repeating-linear-gradient(90deg,var(--acc) 0 14px,rgba(63,125,255,.35) 14px 28px);background-size:28px 100%;animation:indetmove .9s linear infinite}
-
-@keyframes indetmove{from{background-position:0 0}to{background-position:28px 0}}
-
-.pbtn.gray{background:var(--bg);color:var(--ink)}
-
-.pbtn:disabled{opacity:.5;cursor:default}
-
-.prow{display:flex;gap:8px;flex-wrap:wrap}
-
-.pmsg{font-size:13px;color:var(--side);margin-top:10px;line-height:1.7;min-height:18px}
-
-.nstat{font-size:12px;color:var(--side);margin-top:8px;line-height:1.7}
-
-.pbar{height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin-top:10px}
-
-.pbar i{display:block;height:100%;width:0;background:var(--acc);transition:width .3s}
-
-.help{margin-top:12px;font-size:12.5px;color:var(--side)}
-
-.help summary{cursor:pointer;color:var(--acc);font-weight:500;user-select:none}
-
-.help summary:hover{text-decoration:underline}
-
-.help li{margin:5px 0;line-height:1.75}
-
-details.dsec{margin-bottom:20px}
-
-details.dsec>summary::-webkit-details-marker{display:none}
-
-details.dsec[open]>summary span:last-child::before{content:'▾ '}
-
-details.dsec:not([open])>summary span:last-child::before{content:'▸ '}
-
-.crow{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:6px 9px;margin-bottom:6px;font-size:12.5px;cursor:pointer}
-
-.crow input{accent-color:var(--acc)}
-
-.crow .n{color:var(--side);margin-left:auto;white-space:nowrap}
-
-nz{display:inline-block;color:#b45309;font-size:11px;border:1px solid #fde68a;background:#fffbeb;border-radius:4px;padding:1px 5px;white-space:nowrap}
-
-#toast{position:fixed;left:50%;bottom:48px;transform:translateX(-50%) translateY(20px);background:#1a2233;color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;opacity:0;pointer-events:none;transition:.2s;z-index:30;max-width:80vw;text-align:center}
-
-#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
-
-.mask{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.06);z-index:15;display:none}
-
-.mask.on{display:block}
-
-.ver{cursor:pointer;color:var(--acc,#4f6ef7);font-weight:700}
-
-.ver:hover{text-decoration:underline}
-
-.verbox{display:inline-flex;align-items:center;gap:4px}
-
-.amask{position:fixed;inset:0;background:rgba(15,22,40,.4);z-index:50;display:none}
-/* 右键菜单（第 123 项）：快搜窗结果行右键 → 打开/所在文件夹/复制路径/属性 */
-#cmenu{position:fixed;z-index:60;display:none;min-width:150px;background:#fff;
-  border:1px solid #e8eaf3;border-radius:10px;box-shadow:0 8px 24px rgba(15,22,40,.16);
-  padding:4px;overflow:hidden}
-#cmenu.on{display:block}
-#cmenu .ci{display:block;width:100%;text-align:left;padding:7px 12px;border:0;background:none;
-  font-size:12.5px;color:#2b2f3a;cursor:pointer;border-radius:7px}
-#cmenu .ci:hover{background:#eef1fb;color:#3b5bfd}
-.dark #cmenu{background:#23262f;border-color:#3a3f4d}
-.dark #cmenu .ci{color:#dfe3ea}
-.dark #cmenu .ci:hover{background:#31353f;color:#aebdfc}
-
-.amask.on{display:block}
-
-.about{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%) scale(.95);z-index:51;
-
-  width:320px;max-width:86vw;background:var(--card);border:1px solid var(--line);border-radius:16px;
-
-  padding:28px 24px 22px;text-align:center;display:none;box-shadow:0 20px 60px rgba(20,30,60,.28)}
-
-.about.on{display:block;animation:apop .14s ease}
-
-@keyframes apop{from{opacity:0;transform:translate(-50%,-50%) scale(.92)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
-
-.about .alogo{font-size:36px;line-height:1}
-
-.about .aname{font-size:15px;font-weight:700;margin-top:8px;color:var(--ink)}
-
-.about .aver{font-size:32px;font-weight:800;color:var(--acc,#4f6ef7);margin:10px 0 14px;letter-spacing:.02em}
-
-.about .ameta{font-size:12.5px;color:var(--sub);line-height:1.95}
-
-.about .ameta b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
-
-.about .anote{font-size:11.5px;color:var(--side);margin:14px 0 18px;line-height:1.65;
-
-  background:var(--bg);border-radius:9px;padding:10px 12px}
-
-.about.welcome{width:min(880px,92vw);max-width:92vw;max-height:88vh;padding:22px 24px;text-align:left}
-
-.wtop{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-
-.wttl{font-size:19px;font-weight:700}
-
-.wx{border:0;background:transparent;font-size:20px;line-height:1;cursor:pointer;color:var(--tx2);padding:4px 6px}
-
-.wcards{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-
-.about.welcome .wcard .pbtn{font-size:13px;padding:10px 12px}
-
-.wcard{border:1px solid var(--ln);border-radius:14px;padding:16px;display:flex;flex-direction:column}
-
-.wname{font-size:15px;font-weight:600;margin-bottom:6px}
-
-.wpic{font-size:34px;text-align:center;margin:8px 0 10px;opacity:.9}
-
-.whow{font-size:13px;color:var(--tx2);line-height:1.75;flex:1}
-
-.wcard .pbtn{width:100%;margin-top:12px}
-
-@media (max-width:760px){.wcards{grid-template-columns:1fr}}
-
-.aurow{display:flex;gap:8px;margin-top:2px}
-
-.about .aurow .pbtn{flex:1;width:auto;min-width:0}
-
-.about .amsg{margin-top:10px;font-size:12px;line-height:1.7;color:var(--sub);
-
-  max-height:168px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-
-.about .amsg .upd{margin-top:8px;padding:9px 11px;border-radius:9px;background:var(--bg);
-
-  color:var(--ink);font-size:12px;line-height:1.7;white-space:pre-wrap;text-align:left}
-
-.about .amsg .pbtn{margin-top:9px}
-
-.rgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,182px));gap:10px;padding:12px 12px 18px;justify-content:start}
-
-body.gridmode .thead{display:none}
-
-.gitem{border:1px solid var(--line);border-radius:10px;padding:9px;cursor:pointer;display:flex;flex-direction:column;gap:7px;min-width:0;background:var(--card)}
-
-.gitem:hover{background:var(--bg)}
-
-.gitem.on{border-color:rgba(79,110,247,.5);background:var(--sel);box-shadow:0 0 0 1px rgba(79,110,247,.2) inset}
-
-.gthumb{position:relative;height:94px;background:var(--bg);border-radius:7px;overflow:hidden}
-
-.gthumb img{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;object-fit:contain}
-
-.gthumb img.gic{width:42px;height:42px}
-
-.gthumb svg{width:40px;height:40px}
-
-.gname{font-size:12.5px;line-height:1.4;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-all;color:var(--ink)}
-
-.gpath{font-size:11px;color:var(--side);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
-.gextag{font-size:10px;color:var(--sub);letter-spacing:.02em}
-
-.pv-thumb{position:relative;display:flex;align-items:center;justify-content:center}
-
-.pv-loading{position:absolute;font-size:11.5px;color:var(--side)}
-
-/* ---- 深色主题补丁：这些地方原先写死了浅色主题的颜色 ---- */
-
-[data-theme="dark"] body{background:var(--bg);color:var(--ink)}
-
-[data-theme="dark"] #q{color:var(--ink)}
-
-[data-theme="dark"] select{background:var(--card);color:var(--ink);border-color:var(--line)}
-
-[data-theme="dark"] .foot b{color:var(--ink)}
-
-[data-theme="dark"] .foot .fr,
-
-[data-theme="dark"] .footer{color:var(--sub)}
-
-[data-theme="dark"] .footer kbd{background:var(--card);color:var(--ink);border-color:var(--line)}
-
-[data-theme="dark"] .about .aname,
-
-[data-theme="dark"] .about .ameta b,
-
-[data-theme="dark"] .help .hht,
-
-[data-theme="dark"] .mver:hover{color:var(--ink)}
-
-[data-theme="dark"] .about,
-
-[data-theme="dark"] .help{background:var(--card);border-color:var(--line)}
-
-[data-theme="dark"] .about .ameta,
-
-[data-theme="dark"] .about .anote,
-
-[data-theme="dark"] .help .hrow span,
-
-[data-theme="dark"] .help .hfoot{color:var(--sub)}
-
-[data-theme="dark"] .help .hk{background:var(--bg);border-color:var(--line);color:var(--ink)}
-
-[data-theme="dark"] .help .hsec h4{color:var(--acc)}
-
-[data-theme="dark"] .welcome .wcard{background:var(--bg);border-color:var(--line)}
-
-[data-theme="dark"] .welcome .wcard h3,
-
-[data-theme="dark"] .welcome h2{color:var(--ink)}
-
-[data-theme="dark"] .welcome .wcard p{color:var(--sub)}
-
-[data-theme="dark"] .chip{background:var(--bg);border-color:var(--line);color:var(--ink)}
-
-[data-theme="dark"] .pmsg,[data-theme="dark"] .small,[data-theme="dark"] .tip{color:var(--sub)}
-
-[data-theme="dark"] .drow small{color:var(--sub)}
-
-[data-theme="dark"] .pbtn{background:var(--card);border-color:var(--line);color:var(--ink)}
-
-[data-theme="dark"] .pbtn:hover{border-color:var(--acc);color:var(--acc)}
-
-[data-theme="dark"] .pbtn.hot{box-shadow:0 0 0 2px rgba(107,138,255,.25)}
-
-[data-theme="dark"] input::placeholder,[data-theme="dark"] textarea::placeholder{color:#7b8496}
-
-[data-theme="dark"] .tlhead .tln,[data-theme="dark"] .tlt{color:var(--sub)}
-
-[data-theme="dark"] .pv-snip{color:#c3cad8}
-
-[data-theme="dark"] .pv-k{color:var(--sub)}
-
-[data-theme="dark"] .revrow,[data-theme="dark"] .revdir{color:var(--sub)}
-
-[data-theme="dark"] .ctxm{background:var(--card);border-color:var(--line)}
-
-[data-theme="dark"] .ctxm .ctxi{color:var(--ink)}
-
-[data-theme="dark"] .ctxm .ctxi:hover{background:var(--sel)}
-
-[data-theme="dark"] .toast{background:#2b3140;color:#eef1f6}
-
-</style></head><body>
-
-<div class=topbar>
-
-<span class=logo><svg width=20 height=20 viewBox="0 0 24 24" fill="none"><rect width=24 height=24 rx=6 fill="#4f6ef7"/><circle cx=10 cy=10 r=4.5 stroke="#fff" stroke-width=1.6"/><path d="M13.2 13.2L17 17" stroke="#fff" stroke-width=1.8" stroke-linecap="round"/><path d="M7.5 10h5M10 7.5v5" stroke="#fff" stroke-width=1.2 stroke-linecap="round"/></svg></span>
-
-<input id=q data-i18n-ph="ph_q" placeholder="输入关键词，比如：项目方案 / 课程笔记 / 报销标准" autofocus>
-
-<button class="gear" id=viewbtn onclick="viewMenu(event)" title="视图">▦</button>
-
-<button class=sbtn onclick=go() data-i18n="search">搜 索</button>
-
-<button class="gear" id=homebtn onclick=goHome() title="最近动过的文件">🕘</button>
-
-<button class="gear" id=revbtn onclick=pickReverse() title="反查一个文件">🔎</button>
-
-<button class=gear id=gear onclick=showCfg() title="设置">⚙</button>
-
-</div>
-
-<div class=filterbar id=fbar></div>
-
-<div class="ctxm vmenu" id=vmenu>
-
-<div class=ctxi onclick="vPick('list')"><span class=vic id=vm_list></span><span data-i18n="view_list">详情视图</span></div>
-
-<div class=ctxi onclick="vPick('grid')"><span class=vic id=vm_grid></span><span data-i18n="view_grid">缩略图视图</span></div>
-
-<div class=vsep></div>
-
-<div class=ctxi onclick="vPick('pv')"><span class=vic id=vm_pv></span><span data-i18n="view_panel">右侧详情面板</span></div>
-
-<div class=vsep></div>
-
-<div class=ctxi onclick="vPick('sort')"><span class=vic>⇅</span><span id=vm_sortt>排序</span></div>
-
-</div>
-
-<div class=main>
-
-<div class=side id=side>
-
-<div class=sh><span data-i18n="side_filter">筛选</span></div>
-
-<div class="sitem on" data-kind=all onclick="pickKind('all',this)"><span class=si>▦</span><span data-i18n="k_all">全部</span><b id=ck_all></b></div>
-
-<div class=sitem data-kind=dir onclick="pickKind('dir',this)"><span class=si>📁</span><span data-i18n="k_dir">文件夹</span><b id=ck_dir></b></div>
-
-<div class=sitem data-kind=file onclick="pickKind('file',this)"><span class=si>📄</span><span data-i18n="k_file">文件</span><b id=ck_file></b></div>
-
-<div class=sitem data-kind=doc onclick="pickKind('doc',this)"><span class=si>📑</span><span data-i18n="k_doc">文档</span><b id=ck_doc></b></div>
-
-<div class=sitem data-kind=img onclick="pickKind('img',this)"><span class=si>🖼</span><span data-i18n="k_img">图片</span><b id=ck_img></b></div>
-
-<div class=sitem data-kind=video onclick="pickKind('video',this)"><span class=si>🎬</span><span data-i18n="k_video">视频</span><b id=ck_video></b></div>
-
-<div class=sitem data-kind=audio onclick="pickKind('audio',this)"><span class=si>🎵</span><span data-i18n="k_audio">音频</span><b id=ck_audio></b></div>
-
-<div class=sitem data-kind=zip onclick="pickKind('zip',this)"><span class=si>🗜</span><span data-i18n="k_zip">压缩包</span><b id=ck_zip></b></div>
-
-<div class=sitem data-kind=app onclick="pickKind('app',this)"><span class=si>🚀</span><span data-i18n="k_app">应用</span><b id=ck_app></b></div>
-
-<div class=sh><span data-i18n="recent_h">最近修改</span></div>
-
-<div class="sitem on" data-days=0 onclick="pickDays(0,this)"><span class=si>🕒</span><span data-i18n="r_all">全部</span></div>
-
-<div class=sitem data-days=1 onclick="pickDays(1,this)"><span class=si>🕐</span><span data-i18n="r_1d">最近 1 天</span></div>
-
-<div class=sitem data-days=7 onclick="pickDays(7,this)"><span class=si>🕐</span><span data-i18n="r_7d">最近 7 天</span></div>
-
-<div class=sitem data-days=30 onclick="pickDays(30,this)"><span class=si>🕐</span><span data-i18n="r_30d">最近 30 天</span></div>
-
-<div class=sitem data-days=365 onclick="pickDays(365,this)"><span class=si>🕐</span><span data-i18n="r_365d">最近 365 天</span></div>
-
-<div class=sh><span data-i18n="path_h">路径过滤</span></div>
-
-<div class=spath><input id=dp oninput="onPathInput()" data-i18n-ph="ph_d" placeholder="路径包含…"><b id=dpclr class=dpclr onclick="clearPath()" title="清空">✕</b></div>
-
-</div>
-
-<div class=tablewrap>
-
-<div class="frbar hide" id=frbar><b id=frn>0</b><span id=frmsg></span>
-
-<span class=frp><i id=frpi></i></span><button class=frbtn id=frpb onclick="frToggle()">暂停</button>
-
-<button class=frbtn onclick="frHide()" title="收起来">✕</button></div>
-
-<div class=thead><div></div><div data-i18n="col_name">名称</div><div data-i18n="col_path">路径</div><div style="text-align:right" data-i18n="col_mtime">修改时间</div></div>
-
-<div class=rlist id=r><div class=empty>输入关键词开始搜索</div></div>
-
-</div>
-
-<div class=preview id=pv></div>
-
-</div>
-
-<div class=footer>
-
-<span class=nitems id=nitems>0 <span data-i18n="n_items">个项目</span></span>
-
-<span><kbd>↑↓</kbd> <span data-i18n="hk_sel">选择</span> · <kbd>Enter</kbd> <span data-i18n="hk_open">打开</span> · <kbd>Ctrl+Enter</kbd> <span data-i18n="hk_loc">定位</span> · <kbd>Ctrl+1~9</kbd> <span data-i18n="hk_direct">直达</span> · <kbd>Ctrl+S</kbd> <span data-i18n="hk_sort">排序</span> · <kbd>Esc</kbd> <span data-i18n="hk_clr">清除</span></span>
-
-<span class=verbox><span class="hkhint" data-i18n="hk" onclick="showAbout()">双击 Ctrl 呼出快搜窗 —— 关掉本窗口不会退出，程序在托盘里等着</span> <a class=newui href="/web/" title="试用新的 React 界面（实验）">新界面</a> <b class=ver onclick="showAbout()" title="关于 / About">__VER__</b> <span id=fmid data-i18n="footer_mid">· __FILES__ 个文件名 + __TOTAL__ 篇正文可搜 · 本地搜索</span></span>
-
-</div>
-
-<div class=mask id=mask onclick=hideCfg()></div>
-
-<div class=drawer id=cfg>
-
-<h3><span data-i18n="settings">⚙ 设置</span> <b onclick=hideCfg()>✕</b></h3>
-
-<div class=dsec>
-
-<div class=dsec-t data-i18n="d_general">通用</div>
-
-<div class=drow><div class=dl data-i18n="d_autostart">开机启动<small data-i18n="d_autostart_tip">开机时自动后台启动</small></div><div class=toggle id=tg_auto onclick=toggleAuto()><i></i></div></div>
-
-<div class=drow><div class=dl data-i18n="d_hotkey">双击 Ctrl 唤出快搜<small data-i18n="d_hotkey_tip">全局热键，随时唤出</small></div><div class=toggle on id=tg_hotkey onclick=toggleHotkey()><i></i></div></div>
-
-<div class=drow><div class=dl data-i18n="d_lang">界面语言</div><select id=sel_lang onchange=changeLang(this.value) style="border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;background:var(--card)"><option value=zh>中文 / Chinese</option><option value=en>English / 英文</option></select></div>
-
-<div class=drow><div class=dl data-i18n="d_theme">主题<small data-i18n="d_theme_tip">跟随系统 / 浅色 / 深色</small></div><select id=sel_theme onchange=changeTheme(this.value) style="border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;background:var(--card)"><option value=auto data-i18n="th_auto">跟随系统</option><option value=light data-i18n="th_light">浅色</option><option value=dark data-i18n="th_dark">深色</option></select></div>
-
-</div>
-
-<details class=dsec id=scope_details><summary class=dsec-t style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between"><span data-i18n="scope_h">索引范围</span><span style="font-size:11px;color:var(--side)" data-i18n="scope_expand">点击展开</span></summary>
-
-<p id=cfgtip data-i18n="scope_tip" style="font-size:12.5px;color:var(--sub);margin-bottom:10px;line-height:1.7">下面这些文件夹里的文档会被收入索引。</p>
-
-<div class=chips id=dirs></div>
-
-<div id=cand></div>
-
-<button class="pbtn gray" id=addbtn data-i18n="btn_add" data-i18n-title="tip_add" onclick=addDir() style="margin-top:6px">➕ 手动添加文件夹</button>
-
-<div class=nstat id=nstat></div>
-
-</details>
-
-<details class=dsec id=maint_details><summary class=dsec-t style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between"><span data-i18n="maint_h">维护工具</span><span style="font-size:11px;color:var(--side)" data-i18n="scope_expand">点击展开</span></summary>
-
-<div class=prow style="margin-top:8px">
-
-<button class="pbtn" id=smartbtn data-i18n="btn_scan" data-i18n-title="tip_scan" onclick=smartScan(this)>🚀 智能扫描全盘（推荐）</button>
-
-<button class="pbtn gray" id=savebtn data-i18n="btn_save" data-i18n-title="tip_save" onclick=saveUpd(this)>💾 保存并更新索引</button>
-
-<button class="pbtn gray" id=updonly data-i18n="btn_update" data-i18n-title="tip_update" onclick=upd(this)>🔄 按现有范围更新</button>
-
-<button class="pbtn gray" id=stbtn data-i18n="btn_test" data-i18n-title="tip_test" onclick=selfTest(this)>🩺 引擎体检</button>
-
-<button class="pbtn gray" id=nbtn data-i18n="btn_names" data-i18n-title="tip_names" onclick=buildNames(this)>🗂 重建文件名索引</button></div>
-
-</details>
-
-<div class=pbar id=pw style=display:none><i id=pi></i></div>
-
-<div class=pmsg id=pm></div>
-
-<details class=help><summary data-i18n="help_q">❓ 这五个按钮分别是干嘛的？</summary><ul>
-
-<li data-i18n="help_1"></li><li data-i18n="help_2"></li><li data-i18n="help_3"></li><li data-i18n="help_4"></li><li data-i18n="help_5"></li>
-
-</ul></details>
-
-</div>
-
-<div id=toast></div>
-
-<div class=amask id=amask onclick=hideAbout()></div>
-
-<div class=about id=about>
-
-  <div class=alogo>🧠</div>
-
-  <div class=aname data-i18n="about_name">第二大脑 · 本地搜索</div>
-
-  <div class=aver>__VER__</div>
-
-  <div class=ameta id="ab_meta" data-nf="__FILES__" data-nt="__TOTAL__" data-build="__BUILD__">
-
-    <div id="ab_docs">正文可搜 <b>__TOTAL__</b> 篇 · 文件名可搜 <b>__FILES__</b> 个</div>
-
-    <div>Python <b>__PY__</b> · SQLite <b>__SQL__</b></div>
-
-    <div id="ab_build">构建日期 <b>__BUILD__</b></div>
-
-    <div id="ab_dir" style="margin-top:6px">数据目录 <b id="ab_dirp">…</b> <a href="#" onclick="openDataDir();return false" style="color:var(--acc)">打开</a></div>
-
-  </div>
-
-  <div class=anote id="ab_note" data-i18n="about_note">当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。</div>
-
-  <div class=aurow>
-
-    <button class="pbtn gray" id=ab_chk onclick=checkUpdate() data-i18n="about_check">检查更新</button>
-
-    <button class="pbtn gray" onclick=hideAbout() data-i18n="about_ok">知道了</button>
-
-  </div>
-
-  <div class=amsg id=ab_msg></div>
-
-</div>
-
-<div class=amask id=hmask onclick=hideHelp()></div>
-
-<div class="about help" id=help>
-
- <div class=hhd><span class=hht data-i18n="hp_title">使用帮助</span>
-
-  <button class=wx onclick=hideHelp()>✕</button></div>
-
- <div class=hcols>
-
-<div class=hsec><div class=hst data-i18n="hp_s_kb">快捷键</div>
-
-<div class=hrow><span class=hk>↑ ↓</span><span class=ht data-i18n="hp_kb1">上下选择</span></div>
-
-<div class=hrow><span class=hk>Enter</span><span class=ht data-i18n="hp_kb2">打开选中的</span></div>
-
-<div class=hrow><span class=hk>Ctrl+Enter</span><span class=ht data-i18n="hp_kb3">在文件夹里定位</span></div>
-
-<div class=hrow><span class=hk>Ctrl+1~9</span><span class=ht data-i18n="hp_kb4">直接打开第 1~9 条</span></div>
-
-<div class=hrow><span class=hk>Ctrl+S</span><span class=ht data-i18n="hp_kb5">换排序：相关度 / 最新 / 最早 / 最大 / 名称</span></div>
-
-<div class=hrow><span class=hk>Ctrl+F</span><span class=ht data-i18n="hp_kb6">回到搜索框</span></div>
-
-<div class=hrow><span class=hk>Esc</span><span class=ht data-i18n="hp_kb7">清空搜索 / 关掉面板</span></div>
-
-<div class=hrow><span class=hk>双击 Ctrl</span><span class=ht data-i18n="hp_kb8">唤出快搜窗（关掉窗口程序还在托盘）</span></div>
-
-</div>
-
-<div class=hsec><div class=hst data-i18n="hp_s_q">搜索框里能直接写</div>
-
-<div class=hrow><span class=hk>ext:pdf</span><span class=ht data-i18n="hp_q1">只看 PDF；写 ext:pdf,docx 看两种</span></div>
-
-<div class=hrow><span class=hk>size:>10m</span><span class=ht data-i18n="hp_q2">按大小；也支持 &lt; 和区间 1k-2m</span></div>
-
-<div class=hrow><span class=hk>dm:7d</span><span class=ht data-i18n="hp_q3">最近 7 天改过的；2w 两周、1m 一个月</span></div>
-
-<div class=hrow><span class=hk>-草稿</span><span class=ht data-i18n="hp_q4">排除路径里带这个词的</span></div>
-
-<div class=hrow><span class=hk>资料/</span><span class=ht data-i18n="hp_q5">只看这个文件夹（末尾加斜杠）</span></div>
-
-<div class=hrow><span class=hk>content:</span><span class=ht data-i18n="hp_q6">只搜正文，不要文件名凑数</span></div>
-
-</div>
-
-<div class=hsec><div class=hst data-i18n="hp_s_more">其它好用的</div>
-
-<div class=hrow><span class=hk>🕘</span><span class=ht data-i18n="hp_m1">首页时间轴：不输入时列出最近改过的文件</span></div>
-
-<div class=hrow><span class=hk>右键</span><span class=ht data-i18n="hp_m2">打开 / 定位 / 复制路径 / 打包成一个 zip</span></div>
-
-<div class=hrow><span class=hk>拖进来</span><span class=ht data-i18n="hp_m3">把文件拖进窗口，反查有没有被索引、同名版本有几个</span></div>
-
-<div class=hrow><span class=hk>▦</span><span class=ht data-i18n="hp_m4">列表 / 缩略图 / 右侧详情面板</span></div>
-
-<div class=hrow><span class=hk>🔎</span><span class=ht data-i18n="hp_m5">选一个文件反查（不会上传任何东西）</span></div>
-
-<div class=hrow><span class=hk>托盘</span><span class=ht data-i18n="hp_m6">设置、关于、检查更新都在这里</span></div>
-
-</div>
-
- </div>
-
- <div class=hfoot data-i18n="hp_foot">这些都不需要记，用久了自然会。忘了就右键托盘图标 →「使用帮助」。</div>
-
-</div>
-
-<div class=amask id=wmask onclick=hideWelcome(1)></div>
-
-<div class="about welcome" id=welcome>
-
- <div class=wtop><span class=wttl data-i18n="wel_title">欢迎使用第二大脑</span>
-
-  <button class=wx onclick=hideWelcome(1)>✕</button></div>
-
- <div class=wcards>
-
-  <div class=wcard><div class=wname data-i18n="wel_c1">搜索文件</div>
-
-   <div class=wpic>⌨️</div>
-
-   <div class=whow data-i18n="wel_c1h">双击 Ctrl 立刻弹出快搜窗，边打边出结果；也可以点托盘图标打开详细搜索。</div>
-
-   <button class=pbtn onclick=welcomeMini() data-i18n="wel_b1">打开快搜窗口（双击 Ctrl）</button></div>
-
-  <div class=wcard><div class=wname data-i18n="wel_c2">不打字也能用</div>
-
-   <div class=wpic>🕘</div>
-
-   <div class=whow data-i18n="wel_c2h">首页列出最近改过的文件；右键有打开 / 定位 / 复制路径 / 打包；把文件拖进窗口可以反查它有没有被索引。</div>
-
-   <button class="pbtn gray" onclick=hideWelcome(1) data-i18n="wel_b2">开始搜索</button></div>
-
- </div>
-
-</div>
-
-<script>
-
-const DICT={
-
-zh:{
-
-title:'第二大脑 · 本地文档搜索',
-
-brand:'第二大脑',
-
-sub:'搜文档内容和文件名 —— __FILES__ 个文件名 + __TOTAL__ 篇正文可搜 · 全程本地',
-
-hk:'双击 <kbd>Ctrl</kbd> 呼出快搜窗 —— 关掉本窗口不会退出，程序在托盘里等着',
-
-settings:'⚙ 设置',
-
-d_general:'通用',d_autostart:'开机启动',d_autostart_tip:'开机时自动后台启动',
-
-d_hotkey:'双击 Ctrl 唤出快搜',d_hotkey_tip:'全局热键，随时唤出',
-
-d_autostart_on:'已设置开机启动',d_autostart_off:'已取消开机启动',d_hotkey_change:'热键状态已切换',
-
-d_hotkey_on:'双击 Ctrl 已开启',d_hotkey_off:'双击 Ctrl 已关闭',
-
-d_lang:'界面语言',d_theme:'主题',d_theme_tip:'跟随系统 / 浅色 / 深色',
-
-th_auto:'跟随系统',th_light:'浅色',th_dark:'深色',
-
-hk_sel:'选择',hk_open:'打开',hk_loc:'定位',hp_title:'使用帮助',hp_foot:'这些都不需要记，用久了自然会。忘了就右键托盘图标 →「使用帮助」。',hp_s_kb:'快捷键',hp_s_q:'搜索框里能直接写',hp_s_more:'其它好用的',hp_kb1:'上下选择',hp_kb2:'打开选中的',hp_kb3:'在文件夹里定位',hp_kb4:'直接打开第 1~9 条',hp_kb5:'换排序：相关度 / 最新 / 最早 / 最大 / 名称',hp_kb6:'回到搜索框',hp_kb7:'清空搜索 / 关掉面板',hp_kb8:'唤出快搜窗（关掉窗口程序还在托盘）',hp_q1:'只看 PDF；写 ext:pdf,docx 看两种',hp_q2:'按大小；也支持 < 和区间 1k-2m',hp_q3:'最近 7 天改过的；2w 两周、1m 一个月',hp_q4:'排除路径里带这个词的',hp_q5:'只看这个文件夹（末尾加斜杠）',hp_q6:'只搜正文，不要文件名凑数',hp_m1:'首页时间轴：不输入时列出最近改过的文件',hp_m2:'打开 / 定位 / 复制路径 / 打包成一个 zip',hp_m3:'把文件拖进窗口，反查有没有被索引、同名版本有几个',hp_m4:'列表 / 缩略图 / 右侧详情面板',hp_m5:'选一个文件反查（不会上传任何东西）',hp_m6:'设置、关于、检查更新都在这里',hk_direct:'直达',hk_sort:'换排序',hk_clr:'清除',
-
-side_filter:'筛选',k_all:'全部',k_dir:'文件夹',k_file:'文件',k_doc:'文档',k_img:'图片',k_video:'视频',k_app:'应用',k_audio:'音频',k_zip:'压缩包',path_h:'路径过滤',recent_h:'最近修改',r_all:'全部',r_1d:'最近 1 天',r_7d:'最近 7 天',r_30d:'最近 30 天',r_365d:'最近 365 天',
-
-col_name:'名称',col_path:'路径',col_mtime:'修改时间',pv_loading:'缩略图生成中…',view_grid:'缩略图视图',view_list:'详情视图',view_menu:'视图',view_panel:'右侧详情面板',vmenu_sort:'排序',sort_rel:'相关度',sort_new:'最新',sort_old:'最早',sort_big:'最大',sort_name:'按名称',sort_now:'排序：',qsyn_tip:'也可以在搜索框里直接写：ext:pdf · size:>10m · dm:7d · -排除词 · 某文件夹/',n_items:'个项目',filter_empty:'这个筛选下没有结果 —— 点左边的「全部」看所有命中',
-
-f_doc:'文档',f_file:'文件名',pv_empty:'选中文件查看预览',pv_nosnip:'该文件无正文预览（仅命中文件名）',
-
-scope_expand:'点击展开',
-
-ph_q:'输入关键词，比如：项目方案 / 课程笔记 / 报销标准',
-
-ph_t:'类型：pdf / docx…',
-
-ph_d:'路径包含…',
-
-search:'搜 索',
-
-scope_h:'索引范围',maint_h:'维护工具',
-
-scope_tip:'下面这些文件夹里的文档会被收入索引。只扫描选定的文件夹，小说类目录永远自动跳过。',
-
-btn_scan:'🚀 智能扫描全盘（推荐）',
-
-btn_add:'➕ 手动添加文件夹',
-
-btn_save:'💾 保存并更新索引',
-
-btn_update:'🔄 按现有范围更新',
-
-btn_test:'🩺 引擎体检',
-
-btn_names:'🗂 重建文件名索引',
-
-tip_scan:'第一次用点这个：扫一遍电脑（只记文件名，不读内容），列出哪里有多少文档给您勾选，噪音目录自动不勾',
-
-tip_add:'自己挑要搜索的文件夹，精确控制范围',
-
-tip_save:'把勾选/添加的文件夹存为索引范围并开始收录（第一次全量较慢，之后增量很快）',
-
-tip_update:'日常维护：来了新文件点一下，只收新文件，约 1~3 分钟',
-
-tip_test:'给搜索引擎考试：用内置假图书馆测搜得准不准、OCR 错字率、坏文件崩不崩溃。约 1~2 分钟，不碰真实文档库',
-
-tip_names:'扫一遍全盘、只记文件名（不打开、不读内容），让「文件名命中」覆盖整个磁盘——安装包、图片、视频、压缩包都能按名字搜到。157 万个文件实测约 3 分钟',
-
-help_q:'❓ 这五个按钮分别是干嘛的？',
-
-help_1:'🚀 <b>智能扫描全盘</b>——第一次用点这个：扫一遍电脑（只记文件名、不读内容），列出「哪里有多少文档」给您勾选，疑似噪音自动不勾、小说目录直接排除',
-
-help_2:'➕ <b>手动添加文件夹</b>——想精确控制搜索范围时用，点一次弹一个目录选择框',
-
-help_3:'💾 <b>保存并更新索引</b>——把上面勾选/添加的范围生效并开始收录：第一次全量较慢，之后每次只收新文件',
-
-help_4:'🔄 <b>按现有范围更新</b>——日常维护按钮：电脑里来了新文档点一下，约 1~3 分钟',
-
-help_5:'🩺 <b>引擎体检</b>——给搜索引擎「考试」：用一份内置的假图书馆测它搜得准不准、排序对不对、OCR 错字率多少、坏文件崩不崩溃，约 1~2 分钟。<b>不碰您的真实文档库</b>，报告在 eval_report.txt',
-
-help_6:'🗂 <b>重建文件名索引</b>——扫一遍全盘但只记文件名，不打开任何文件，约 3 分钟（157 万个文件）。之后搜「文件名」能覆盖整个磁盘（安装包、视频、压缩包都算），不只是入库的那几千份文档。加了移动硬盘、换了大批文件后点一次',
-
-nstat_off:'全盘文件名索引：还没建立 · 现在只能搜到已入库的文档，点「🗂 重建文件名索引」扫一遍（约 3 分钟）',
-
-nstat_on:'全盘文件名索引：{n} 个文件（只记名字和路径，不读内容）',
-
-m_names:'建立全盘文件名索引中…',
-
-m_names_target:'扫描 {p}',
-
-m_names_progress:'扫描 {p}（已 {n} 个文件）',
-
-m_names_finish:'整理文件名索引…',
-
-m_names_done:'文件名索引完成：{n} 个文件',
-
-m_names_auto:'🗂 还差最后一步，正在自动建立文件名索引（第一次要几十秒）',
-
-cand_go:'✅ 就这些，开始建库',
-
-c_open:'打开',c_reveal:'在文件夹中显示',c_copy:'复制路径',c_zip:'打包这个文件',
-
-zip_ok:'已打包 __N__ 个文件，正在打开所在文件夹',zip_fail:'打包没成功',
-
-dym_prefix:'你是不是要找：',
-
-    'tl_cap':'只列前 __N__ 个',
-
-tl_more:'看更早的（30 天）',
-
-same_n:'同名版本 __N__ 个',same_none:'没有其他同名版本',
-
-rev_title:'反查这个文件',rev_in:'✓ 这个文件在索引里，入库时间',rev_out:'不在库内（还没被索引到）',
-
-rev_size:'一样大小、同类型',rev_sib:'同目录还有 __N__ 个文件',
-
-rev_none:'库里没有这个文件的相关记录',rev_pick:'粘贴文件完整路径（例如 D 盘某个文件夹里的 xxx.docx）',
-
-rev_need:'拖进来的文件只拿到名字、拿不到路径，帮你打开选择框：',
-
-e_names_busy:'已有任务在跑，等它跑完再点',
-
-empty_hint:'输入关键词开始搜索',
-
-empty_tip:'<b>小提示</b>：两个过滤框可以留空；点结果里的「打开」直接打开原文件',
-
-footer_mid:'· __FILES__ 个文件名 + __TOTAL__ 篇正文可搜',about_ok:'知道了',
-
-about_name:'第二大脑 · 本地搜索',
-
-about_docs:'正文可搜 <b>{t}</b> 篇 · 文件名可搜 <b>{n}</b> 个',
-
-about_build:'构建日期 <b>{b}</b>',
-
-about_note:'当前为 <b>0.x 预览版</b>：功能还在打磨，未达正式标准。<br>版本号到达 <b>1.0</b> 即视为正式版。',
-
-about_check:'检查更新',
-
-wel_title:'欢迎使用第二大脑',
-
-wel_c1:'搜索文件',wel_c1h:'双击 Ctrl 立刻弹出快搜窗，边打边出结果；也可以点托盘图标打开详细搜索。',
-
-wel_b1:'打开快搜窗口（双击 Ctrl）',
-
-wel_c2:'不打字也能用',wel_c2h:'首页列出最近改过的文件；右键有打开 / 定位 / 复制路径 / 打包；把文件拖进窗口可以反查它有没有被索引。',
-
-wel_b2:'开始搜索',
-
-fr_files:'__N__ 个文件',
-
-fr_bar_pause:'暂停',
-
-  fr_bar_resume:'继续',
-
-  fr_bar_eta:'预计还需 __M__ 分钟',
-
-  fr_bar_done:'✅ 已经能搜 __N__ 个文件了，全盘也在后台补完了',
-
-  fr_hint_ctrl:'随时双击 Ctrl 呼出快搜窗；右键托盘图标可以打开设置或禁用这个热键',
-
-  data_fallback:'程序目录写不进去，数据库改放到：__P__',
-
-  bg_done:'全盘也补完了，现在可搜 __N__ 个文件',
-
-bg_reading:'正文读取中 __N__ 篇',
-
-  fr_stage_names:'先建桌面 / 文档 / 下载的文件名…',
-
-  fr_start:'第一次打开，正在自动帮你把电脑上的文件建成索引（只读文件名和文档内容，不上传任何东西）。',
-
-fr_busy:'正在自动建库，你可以先去干别的，窗口最小化也没关系。',
-
-fr_skip:'先不要，我自己选文件夹',
-
-fr_done:'建好了，正在刷新…',
-
-fr_fail:'自动建库没成功：',
-
-fr_skipped:'好，那你自己选文件夹吧——点「＋ 添加文件夹」，选完点 🔄 更新。',
-
-about_checking:'正在连 GitHub 看看有没有新版本…',
-
-about_latest:'已经是最新的（线上 {v}）。',
-
-about_new:'有新版本 {v} 可以装上：',
-
-about_page:'打不开自动更新？去发布页手动下载',
-
-about_apply:'下载并安装（装完自动重开）',
-
-about_applying:'正在下载…下载完会自动关掉重开，大概十几秒。',
-
-about_fail:'连不上 GitHub（网络或代理的问题）。可以稍后再试，或去发布页手动下载。',
-
-upd_net:'下载没成功（网络断了或文件不对）。可以稍后再试，或在浏览器里手动下载。',
-
-upd_done:'✅ 已下载 {v}，正在关掉重开完成安装。',
-
-open:'打开',copy:'复制路径',copied:'已复制',
-
-found:'找到 <b>{n}</b> 条 · {ms} ms',
-
-searching:'搜索中…',
-
-need_kw:'请先输入关键词',
-
-no_hit:'没有找到「{q}」',
-
-ev_h:'📁 文件名命中',ev_sub:'全盘任意文件 · 本机文件名索引',ev_sub_off:'索引内已收录的文件',ev_tag:'全盘',
-
-ev_more:'还有更多 —— 再加一个关键词缩小范围',
-
-ev_only:'索引的内容里没有命中，但文件名有 <b>{n}</b> 条匹配：',
-
-no_hit_tip:'试试<b>换个词</b>、<b>少个过滤条件</b>，或先点「🔄 按现有范围更新」把新文件收进来',
-
-opened:'已打开',open_fail:'打开失败',
-
-file_gone:'这个文件搬走或删了。点一下「🔄 按现有范围更新」，几秒钟就能清掉这条记录（不会重扫整台电脑）',
-
-first_run:'首次使用：推荐点「🚀 智能扫描全盘」，它会列出电脑里哪里有文档给您勾选；也可以手动添加文件夹。',
-
-no_dir:'（还没有文件夹，点「添加文件夹」）',
-
-add_prompt:'输入要索引的文件夹完整路径：',
-
-scan_hint:'🧠 智能扫描全盘中（只记文件名不读内容，约 2~4 分钟）…',
-
-scan_fail:'❌ 智能扫描失败：',
-
-cand_msg:'共扫到 <b>{n}</b> 个文档，分布在 {g} 个顶层目录。<b>橙色「疑似噪音」默认不勾</b>；确认后点「💾 保存并更新索引」。',
-
-noise:'疑似噪音',
-
-cand_tail:'（小说类目录已自动排除，不会出现在这里）',
-
-cand_done:'勾选完成后点「💾 保存并更新索引」。',
-
-test_hint:'🩺 引擎体检进行中（独立子进程，不碰真实索引库）…',
-
-test_busy:'体检进行中…',
-
-test_ok:'✅ 体检通过：',test_bad:'❌ 体检未通过：',
-
-test_report:'（完整报告 eval_report.txt）',
-
-save_need:'请先至少添加一个文件夹',
-
-saving:'保存配置…',save_fail:'保存失败',
-
-upd_need:'请先添加或选择索引文件夹',
-
-started:'已开始，后台处理中…',
-
-ph_scan:'📂 扫描文件中',ph_scan_end:'📄 扫描完成，准备入库',ph_index:'🔎 建立索引中',ph_discover:'🧠 智能扫描中',ph_prune:'🧹 清理失效条目',ph_working:'⏳ 处理中',
-
-prog:'{ph} · 已处理 {d}/{t}，成功 {ok}，失败 {f}',
-
-done_reload:'✅ {m}，2 秒后自动刷新…',
-
-err_prefix:'❌ 出错了：',revealed:'已在文件夹里选中',no_hit_mini:'没有找到「{q}」。换个说法试试，或者按 Ctrl+Enter 去主窗口搜正文。',net_fail:'后台没回应（可能刚重启）。把窗口关掉重开，或双击 更新第二大脑.bat 再试。',
-
-m_scanning:'正在扫描 {p}',
-
-m_scan_end:'发现 {n} 个文档，准备入库',
-
-m_indexing:'正在建立索引（共 {n} 篇）',
-
-m_index_done:'完成，库内共 {n} 篇',
-
-m_pruning:'清理失效条目',
-
-m_pruned:'清理失效条目 {n} 条',
-
-m_update_done:'更新完成',
-
-m_discovering:'智能扫描中（只记文件名，不读内容）',
-
-m_discover_target:'智能扫描 {p}',
-
-m_discover_done:'智能扫描完成：{n} 个文档',
-
-m_selftest_busy:'质量自检进行中（检索评测/OCR 准确率/损坏文件 fuzz…）',
-
-m_selftest_done:'自检结束',
-
-e_no_scope:'找不到 scope.json —— 请先在设置里选择要索引的文件夹',
-
-e_no_scan:'扫描清单没生成，正文一篇都没读进来 —— 请确认程序目录可写，再点一次更新',
-
-e_bad_theme:'主题值不合法（只能是 跟随系统 / 浅色 / 深色）',
-
-e_bad_lang:'界面语言值不合法（只能是中文或英文）',
-
-cfg_unsaved:'设置里改的文件夹还没保存——点 🔄 更新会先保存再更新（也可以点 💾 只保存）',
-
-paused_prefix:'⏸ 已暂停（不是出错）：',
-
-repair_ask:'「__P__」找不到了，下面几个文件夹看起来像是它搬去的地方——是哪一个？',
-
-repair_ask_tail:'点一个就开始更新；都不是就点最下面那行，先别改。',
-
-repair_done:'好了，正在按新位置更新，等一小会儿…',
-
-repair_none:'都不是，先别改',
-
-e_prune_scope_loss:'文件夹「__P__」整个不见了，它名下有 __N__ 条记录同时找不到了，已暂停，一条都没删。多半是它被搬走或改名了——点一次更新让它自动认亲；确认是删掉了，再双击【强制清理.bat】。',
-
-e_scope_gone:'要索引的文件夹找不到了：{p}。已停止更新，索引一条没动。请确认它还在原处（是不是搬走了？），或在设置里把它从索引范围里去掉。',
-
-e_prune_bulk:'这次要清掉 {n} 条（库内共 {total} 条），已暂停，一条都没删。多半是索引范围失效、盘符变了或权限异常。请先确认索引范围里的文件夹都还在原处；如果确认这些文件是你真的删掉了，双击【强制清理.bat】再清一次。',
-
-e_need_dir:'至少要添加一个文件夹',
-
-e_discover_busy:'智能扫描正在进行',
-
-e_selftest_busy:'自检已在进行',
-
-e_update_busy:'已有更新在进行',
-
-e_scope_save:'索引范围没存进 scope.json（磁盘只读/被占用/路径写错），这次更新没有开始',
-
-e_busy:'已经有一个任务在跑了（更新/建索引/扫描/自检），等它跑完再点',
-
-e_bad_body:'请求格式不正确',
-
-e_query:'查询出错（关键词至少 3 个字符效果最佳）: {e}'
-
-},
-
-en:{
-
-title:'Second Brain · Local Document Search',
-
-brand:'Second Brain',
-
-sub:'Search document contents and file names — __FILES__ file names + __TOTAL__ documents · 100% local & offline · best with 3+ characters',
-
-hk:'Double-tap <kbd>Ctrl</kbd> for quick search — closing this window keeps it running in the tray',
-
-settings:'⚙ Settings',
-
-d_general:'General',d_autostart:'Start at boot',d_autostart_tip:'Auto-start in background on boot',
-
-d_hotkey:'Double Ctrl to summon',d_hotkey_tip:'Global hotkey, always available',
-
-d_autostart_on:'Will start at boot',d_autostart_off:'Removed from startup',d_hotkey_change:'Hotkey toggled',
-
-d_hotkey_on:'Double-Ctrl enabled',d_hotkey_off:'Double-Ctrl disabled',
-
-d_lang:'Language',d_theme:'Theme',d_theme_tip:'System / Light / Dark',
-
-th_auto:'System',th_light:'Light',th_dark:'Dark',
-
-hk_sel:'Select',hk_open:'Open',hk_loc:'Locate',hp_title:'Help',hp_foot:'Nothing here needs memorizing. Forgot one? Right-click the tray icon and pick Help.',hp_s_kb:'Shortcuts',hp_s_q:'Type filters in the search box',hp_s_more:'Other things that help',hp_kb1:'Move up / down',hp_kb2:'Open',hp_kb3:'Show in folder',hp_kb4:'Open item 1~9',hp_kb5:'Cycle sort: relevance / newest / oldest / largest / name',hp_kb6:'Back to the search box',hp_kb7:'Clear the search / close this panel',hp_kb8:'Summon the quick window (the tray keeps running)',hp_q1:'PDFs only; ext:pdf,docx for two kinds',hp_q2:'By size; also ranges like 1k-2m',hp_q3:'Changed in the last 7 days; 2w and 1m work too',hp_q4:'Exclude paths containing this word',hp_q5:'Only this folder (trailing slash)',hp_q6:'Body text only, no file-name padding',hp_m1:'Home timeline: recently changed files while the box is empty',hp_m2:'Open / reveal / copy path / zip them together',hp_m3:'Drop a file here to see whether it is indexed and how many versions exist',hp_m4:'List / thumbnails / details panel',hp_m5:'Pick a file to look up (nothing is uploaded)',hp_m6:'Settings, about and update checks live here',hk_direct:'open 1~9',hk_sort:'sort',hk_clr:'Clear',
-
-side_filter:'Filter',k_all:'All',k_dir:'Folders',k_file:'Files',k_doc:'Documents',k_img:'Images',k_video:'Videos',k_app:'Apps',k_audio:'Audio',k_zip:'Archives',path_h:'Path filter',recent_h:'Modified',r_all:'Any time',r_1d:'Last 1 day',r_7d:'Last 7 days',r_30d:'Last 30 days',r_365d:'Last 365 days',
-
-col_name:'Name',col_path:'Path',col_mtime:'Modified',pv_loading:'Rendering thumbnail…',view_grid:'Thumbnail view',view_list:'Detail view',view_menu:'View',view_panel:'Details panel',vmenu_sort:'Sort',sort_rel:'Relevance',sort_new:'Newest',sort_old:'Oldest',sort_big:'Largest',sort_name:'Name',sort_now:'Sort: ',qsyn_tip:'You can also type filters: ext:pdf · size:>10m · dm:7d · -exclude · somefolder/',n_items:'items',filter_empty:'Nothing matches this filter — click “All” to see every hit',
-
-f_doc:'Docs',f_file:'Files',pv_empty:'Select a file to preview',pv_nosnip:'No content preview (filename match only)',
-
-scope_expand:'Click to expand',
-
-ph_q:'Keywords, e.g. project plan / lecture notes / expense policy',
-
-ph_t:'Type: pdf / docx…',
-
-ph_d:'Path contains…',
-
-search:'Search',
-
-scope_h:'Index scope',maint_h:'Maintenance',
-
-scope_tip:'Documents inside these folders are indexed. Only the folders you pick are scanned; fiction/novel folders are always skipped.',
-
-btn_scan:'🚀 Smart scan (recommended)',
-
-btn_add:'➕ Add folder',
-
-btn_save:'💾 Save & build index',
-
-btn_update:'🔄 Update index',
-
-btn_test:'🩺 Health check',
-
-btn_names:'🗂 Rebuild name index',
-
-tip_scan:'First run: scans the whole computer (file names only, never contents), then lists candidate folders with document counts. Noisy folders stay unchecked.',
-
-tip_add:'Pick the folders you want to search, one by one',
-
-tip_save:'Save the selected folders as the index scope and start indexing (the first full build is slow, later runs are incremental)',
-
-tip_update:'Routine maintenance: pick up newly added documents, usually 1-3 minutes',
-
-tip_test:'Exams for the search engine: measures ranking quality, OCR error rate and crash-resistance on corrupted files. About 1-2 minutes, never touches your real library.',
-
-tip_names:'Walks every disk but records file names only — nothing is opened or read. Lets the filename column cover the whole machine (installers, images, videos, archives), not just indexed documents. About 3 minutes for 1.57M files.',
-
-help_q:'❓ What do these five buttons do?',
-
-help_1:'🚀 <b>Smart scan</b> — first run: walks your disks (file names only), lists folder candidates with counts. Likely-noise folders are unchecked, fiction folders are excluded entirely.',
-
-help_2:'➕ <b>Add folder</b> — use when you want precise control over the search scope; opens a folder picker.',
-
-help_3:'💾 <b>Save & build index</b> — applies the selected scope and starts indexing. Slow the first time, incremental afterwards.',
-
-help_4:'🔄 <b>Update index</b> — everyday maintenance: click when new documents arrive, about 1-3 minutes.',
-
-help_5:'🩺 <b>Health check</b> — runs an exam on a synthetic library: ranking quality, OCR error rate, robustness against corrupted files. Takes 1-2 minutes and <b>never touches your real library</b>. Report saved to eval_report.txt',
-
-help_6:'🗂 <b>Rebuild name index</b> — walks every disk but records file names only, nothing is opened. Afterwards filename search covers the whole machine (installers, videos, archives), not just the few thousand indexed documents. Run it after adding a drive or moving a lot of files.',
-
-nstat_off:'Disk-wide name index: not built yet · only indexed documents can be matched — click 🗂 Rebuild name index (about 3 minutes)',
-
-nstat_on:'Disk-wide name index: {n} files (names and paths only, contents never read)',
-
-m_names:'Building the disk-wide name index…',
-
-m_names_target:'Scanning {p}',
-
-m_names_progress:'Scanning {p} ({n} files so far)',
-
-m_names_finish:'Sorting the name index…',
-
-m_names_done:'Name index complete: {n} files',
-
-m_names_auto:'🗂 One last step: building the file-name index automatically (takes a while the first time)',
-
-cand_go:'✅ That’s it — start indexing',
-
-c_open:'Open',c_reveal:'Show in folder',c_copy:'Copy path',c_zip:'Zip this file',
-
-zip_ok:'Zipped __N__ file(s) — opening the folder',zip_fail:'Could not create the zip',
-
-dym_prefix:'Did you mean:',
-
-    tl_cap:'first __N__ shown',
-
-tl_more:'Show earlier (30 days)',
-
-same_n:'__N__ other version(s) of this name',same_none:'No other versions with this name',
-
-rev_title:'Look up this file',rev_in:'✓ This file is indexed, added on',rev_out:'Not in the index (not indexed yet)',
-
-rev_size:'Same size, same type',rev_sib:'__N__ more files in the same folder',
-
-rev_none:'Nothing about this file in the index',rev_pick:'Paste the full path (for example, xxx.docx inside a folder on drive D)',
-
-rev_need:'A dropped file gives us only its name, not its path — opening a picker:',
-
-e_names_busy:'Another task is running — wait for it to finish',
-
-empty_hint:'Type a keyword to start searching',
-
-empty_tip:'<b>Tip</b>: the two filter boxes are optional; hit “Open” on a result to launch the original file',
-
-footer_mid:'· __FILES__ file names + __TOTAL__ documents searchable',about_ok:'Got it',
-
-about_name:'Second Brain · local search',
-
-about_docs:'<b>{t}</b> documents · <b>{n}</b> file names searchable',
-
-about_build:'Built <b>{b}</b>',
-
-about_note:'This is a <b>0.x preview</b>: still being polished.<br>Version <b>1.0</b> will be the stable release.',
-
-about_check:'Check for updates',
-
-wel_title:'Welcome to Second Brain',
-
-wel_c1:'Find files',wel_c1h:'Press Ctrl twice to pop up the quick search — results appear as you type. You can also click the tray icon.',
-
-wel_b1:'Open quick search (double Ctrl)',
-
-wel_c2:'Works without typing',wel_c2h:'The home screen lists recently changed files; right-click for open / reveal / copy path / zip; drop a file on the window to look it up.',
-
-wel_b2:'Start searching',
-
-fr_files:'__N__ files',
-
-fr_bar_pause:'Pause',
-
-  fr_bar_resume:'Resume',
-
-  fr_bar_eta:'about __M__ min left',
-
-  fr_bar_done:'✅ __N__ file names are searchable now, and the rest is done too',
-
-  fr_hint_ctrl:'Double-tap Ctrl any time for quick search; right-click the tray icon for settings or to turn it off',
-
-  data_fallback:'Install folder is not writable — database moved to: __P__',
-
-  bg_done:'Full-disk pass finished — __N__ file names searchable now',
-
-bg_reading:'reading text — __N__ so far',
-
-  fr_stage_names:'Indexing Desktop / Documents / Downloads first…',
-
-  fr_start:'First run: automatically indexing the files on this PC (file names and document text stay on your machine).',
-
-fr_busy:'Building the index automatically. You can keep working; minimising the window is fine.',
-
-fr_skip:'Not now, I will pick folders myself',
-
-fr_done:'Done. Refreshing…',
-
-fr_fail:'Automatic setup failed: ',
-
-fr_skipped:'Fine — add folders with “+ Add folder”, then press 🔄 Update.',
-
-about_checking:'Asking GitHub whether there is a newer version…',
-
-about_latest:'Already up to date (online: {v}).',
-
-about_new:'Version {v} is available:',
-
-about_page:'Auto-update failed? Download from the release page',
-
-about_apply:'Download and install (restarts itself)',
-
-about_applying:'Downloading… the app will close and reopen by itself, about ten seconds.',
-
-about_fail:'Cannot reach GitHub (network or proxy). Try again later, or download from the release page.',
-
-upd_net:'Download failed (network error or bad file). Try again, or download in your browser.',
-
-upd_done:'✅ Downloaded {v}. Restarting to finish the install.',
-
-open:'Open',copy:'Copy path',copied:'Copied',
-
-found:'<b>{n}</b> results · {ms} ms',
-
-searching:'Searching…',
-
-need_kw:'Please type a keyword first',
-
-no_hit:'Nothing found for “{q}”',
-
-ev_h:'📁 Filename matches',ev_sub:'any file on disk · built-in name index',ev_sub_off:'files already in the index',ev_tag:'disk',
-
-ev_more:'more matches — add a keyword to narrow it down',
-
-ev_only:'Nothing in the index matched, but <b>{n}</b> filenames do:',
-
-no_hit_tip:'Try <b>another keyword</b>, <b>fewer filters</b>, or run the updater to index new files first.',
-
-opened:'Opened',open_fail:'Failed to open',
-
-file_gone:'Moved or deleted — click “🔄 Update current scope” to clear this row in seconds (no full rescan)',
-
-first_run:'First run: click “🚀 Smart scan” to see where your documents live, then tick the folders you want. You can also add folders manually.',
-
-no_dir:'(no folders yet — click “Add folder”)',
-
-add_prompt:'Full path of the folder to index:',
-
-scan_hint:'🧠 Smart scan running (file names only, no contents; about 2-4 minutes)…',
-
-scan_fail:'❌ Smart scan failed: ',
-
-cand_msg:'Found <b>{n}</b> documents across {g} top-level folders. Orange “likely noise” ones are unchecked by default; tick what you want and click “💾 Save & build index”.',
-
-noise:'likely noise',
-
-cand_tail:'(fiction/novel folders are excluded automatically and never listed here)',
-
-cand_done:'Tick the folders you want, then click “💾 Save & build index”.',
-
-test_hint:'🩺 Health check running (separate process, your real library is untouched)…',
-
-test_busy:'Health check running…',
-
-test_ok:'✅ Health check passed: ',test_bad:'❌ Health check failed: ',
-
-test_report:' (full report in eval_report.txt)',
-
-save_need:'Add at least one folder first',
-
-saving:'Saving…',save_fail:'Save failed',
-
-upd_need:'Add or select a folder to index first',
-
-started:'Started, working in the background…',
-
-ph_scan:'📂 Scanning files',ph_scan_end:'📄 Scan complete',ph_index:'🔎 Building index',ph_discover:'🧠 Discovering',ph_prune:'🧹 Removing stale entries',ph_working:'⏳ Working',
-
-prog:'{ph} · {d}/{t} processed, {ok} ok, {f} failed',
-
-done_reload:'✅ {m} — refreshing in 2 s…',
-
-err_prefix:'❌ Error: ',revealed:'Selected in Explorer',no_hit_mini:'Nothing found for “{q}”. Try different words, or press Ctrl+Enter to search document contents.',net_fail:'The background service did not answer (it may have just restarted). Reopen the window, or run the update script and try again.',
-
-m_scanning:'scanning {p}',
-
-m_scan_end:'found {n} documents, indexing…',
-
-m_indexing:'building index ({n} documents)',
-
-m_index_done:'done — {n} documents in library',
-
-m_pruning:'removing stale entries',
-
-m_pruned:'removed {n} stale entries',
-
-m_update_done:'update complete',
-
-m_discovering:'discovering (file names only, no contents)',
-
-m_discover_target:'discovering {p}',
-
-m_discover_done:'discovery complete: {n} documents',
-
-m_selftest_busy:'health check running (retrieval / OCR accuracy / corrupted-file fuzz)…',
-
-m_selftest_done:'health check finished',
-
-e_no_scope:'scope.json not found — pick the folders to index in settings first',
-
-e_no_scan:'The scan manifest was not written, so no document text was indexed — make sure the app folder is writable and update again',
-
-e_bad_theme:'Invalid theme value (auto / light / dark only)',
-
-e_bad_lang:'Invalid language value (zh / en only)',
-
-cfg_unsaved:'Folders changed in settings are not saved yet — the 🔄 update button saves them first (or 💾 to only save)',
-
-paused_prefix:'⏸ Paused (not an error): ',
-
-repair_ask:'"__P__" is gone. These folders look like where it moved — which one?',
-
-repair_ask_tail:'Click one to update; if none of them, use the line below to skip.',
-
-repair_done:'Done — updating from the new location, one moment…',
-
-repair_none:'None of these — leave it for now',
-
-e_prune_scope_loss:'The whole folder “__P__” is gone and __N__ indexed files under it vanished too — paused, nothing deleted. It was probably moved or renamed: run an update to let it find the new location; if you really deleted it, run 【强制清理.bat】.',
-
-e_scope_gone:'The folders to index are missing: {p}. Update stopped, nothing in the index was touched. Check that the folder is still where it was (moved it?), or remove it from the index scope in settings.',
-
-e_prune_bulk:'About to remove {n} of {total} entries — paused, nothing deleted. This usually means the index scope is stale, the drive letter changed, or permissions failed. Check the folders in your scope first; if you really deleted these files, run 【强制清理.bat】 to clean anyway.',
-
-e_need_dir:'At least one folder is required',
-
-e_discover_busy:'A scan is already running',
-
-e_selftest_busy:'A health check is already running',
-
-e_update_busy:'An update is already running',
-
-e_scope_save:'Could not save scope.json (read-only / locked / bad path) — update did not start',
-
-e_busy:'Another task is already running (update / names / scan / selftest) — wait for it',
-
-e_bad_body:'Malformed request body',
-
-e_query:'Query error (3+ characters works best): {e}'
-
-}};
-
-const $=id=>document.getElementById(id);
-
-const qEl=$('q'),dEl=$('dp'),rEl=$('r'),pvEl=$('pv'),fEl=$('fbar');
-
-/* 顶部原来那两个「类型 / 路径」输入框并进了左侧栏：类型 = 左边的分类（带计数），
-
-   路径 = 侧栏底部这一个输入框。这里保留 tEl=null，go() 里 tv 恒为空。 */
-
-const tEl=null;
-
-let PATH_T=null;
-
-function onPathInput(){
-
-  const c=$('dpclr'); if(c) c.style.visibility=dEl.value.trim()?'visible':'hidden';
-
-  clearTimeout(PATH_T); PATH_T=setTimeout(()=>{ if(qEl.value.trim()) go(); },350);
-
-}
-
-function clearPath(){ dEl.value=''; onPathInput(); }
-
-let RLIST=[],RCUR=-1,MASTER=[],KIND='all',DAYS=0,PV_ON=false;
-
-let LANG=(function(){
-
-const q=(new URLSearchParams(location.search)).get('lang');   // ?lang=en 可强制指定语言
-
-if(q==='zh'||q==='en')return q;
-
-try{const v=localStorage.getItem('sb_lang');if(v==='zh'||v==='en')return v}catch(e){}
-
-return (navigator.language||'zh').toLowerCase().indexOf('zh')===0?'zh':'en'})();
-
-const T=k=>{const d=DICT[LANG];return d[k]!==undefined?d[k]:(DICT.zh[k]!==undefined?DICT.zh[k]:k)};
-
-const F=(s,a)=>String(s).replace(/\{(\w+)\}|__(\w+)__/g,(m,k,k2)=>{
-
-  const kk=(k||k2); if(!a)return m;
-
-  if(a[kk]!==undefined)return a[kk];
-
-  const lo=kk.toLowerCase(); return a[lo]!==undefined?a[lo]:m});
-
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-let HAS_RESULT=0;
-
-let AT_HOME=0;
-
-let SEQ=0;   // 输入序号：晚到的旧结果直接丢掉
-
-let SORT='rel';   // 排序：rel/new/old/big/name —— Ctrl+S 循环，▦ 菜单里也能点
-
-const SORT_SEQ=['rel','new','old','big','name'];
-
-   // 首页时间轴模式：applyLang 重跑时不要把它冲掉
-
-function applyLang(){
-
-document.documentElement.lang=(LANG==='zh'?'zh-CN':'en');
-
-document.title=T('title');
-
-document.querySelectorAll('[data-i18n]').forEach(el=>{el.innerHTML=T(el.dataset.i18n)});
-
-document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=T(el.dataset.i18nPh)});
-
-document.querySelectorAll('[data-i18n-title]').forEach(el=>{el.title=T(el.dataset.i18nTitle)});
-
-const sl=$('sel_lang');if(sl)sl.value=LANG;
-
-draw();
-
-if(HAS_RESULT&&qEl.value.trim())go(); else if(!HAS_RESULT&&!AT_HOME)showEmpty();
-
-if($('pm').textContent&&DIRS.length)pm.textContent='';
-
-fillAbout();
-
-}
-
-function toggleLang(){LANG=(LANG==='zh'?'en':'zh');try{localStorage.setItem('sb_lang',LANG)}catch(e){}
-
-applyLang();try{if(PROG_CACHE)renderProg(PROG_CACHE)}catch(e){}loadNames()}
-
-function showEmpty(){rEl.innerHTML='<div class=empty>'+esc(T('empty_hint'))+'<br>'+T('empty_tip')+'</div>';pvEmpty();updateCount(0)}
-
-// —— 首页时间轴：不打字也能看见「今天/昨天动过什么」。用户真正的问题是「我的东西去哪了」。
-
-let TLINE=[];
-
-async function goHome(days){
-
-AT_HOME=1;HAS_RESULT=0;RLIST=[];RCUR=-1;fEl.innerHTML='';updateCount(0);
-
-const my=++SEQ;
-
-rEl.innerHTML='<div class=empty>'+esc(T('searching'))+'</div>';
-
-let d;
-
-try{d=await(await fetch('/api/timeline?days='+(days||7))).json()}catch(e){if(my===SEQ&&AT_HOME)showEmpty();return}
-
-// 晚到的时间轴不许盖掉已经打出来的搜索结果：以前启动那一刻打字，半秒后结果被时间轴冲掉。
-
-if(my!==SEQ||!AT_HOME)return;
-
-const gs=(d&&d.groups)||[];
-
-if(!gs.length){showEmpty();return}
-
-TLINE=[];
-
-let h='<div class=tlwrap>';
-
-gs.forEach(g=>{
-
-h+='<div class=tlhead>'+esc(g.label)+'<span class=tln>'+g.n+(g.more?' · '+esc(T('tl_cap').replace('__N__',String(g.items.length))):'')+'</span></div>';
-
-g.items.forEach(it=>{
-
-const i=TLINE.length;
-
-TLINE.push({ty:'file',name:it.n,dn:it.n,path:it.p,dir:it.d||'',e:it.e||'',
-
-ext:(it.e||'').replace('.','').toUpperCase().slice(0,4),snip:'',
-
-k:kindOf(it.p,it.e||'',false),mt:it.m||0,s:it.s});
-
-h+='<div class=tlrow data-i="'+i+'" onclick="tlPick('+i+')" ondblclick="openF(\''+enc(it.p)+'\')">'+
-
-'<div class=tlic>'+esc((it.e||'').replace('.','').toUpperCase().slice(0,4)||'FILE')+'</div>'+
-
-'<div class=tlnm title="'+esc(it.n)+'">'+esc(it.n)+'</div>'+
-
-'<div class=tldir title="'+esc(it.d)+'">'+esc(it.d)+'</div>'+
-
-'<div class=tlt>'+(it.m?esc(fmtT(it.m)):'')+'</div></div>'});
-
-});
-
-h+='<div class=tlmore onclick="goHome(30)">'+esc(T('tl_more'))+'</div>';
-
-h+='</div>';
-
-rEl.innerHTML=h}
-
-function tlPick(i){const r=TLINE[i];if(!r)return;
-
-rEl.querySelectorAll('.tlrow').forEach(el=>el.classList.toggle('on',+el.dataset.i===i));
-
-pvRender(r)}
-
-// —— 右键菜单：打开 / 定位 / 复制路径 / 打包
-
-let CTX_I=-1;
-
-function ctxHide(){const m=document.getElementById('ctxm');if(m)m.remove()}
-
-function ctxShow(i,x,y){
-
-ctxHide();CTX_I=i;const r=RLIST[i];if(!r)return;
-
-const m=document.createElement('div');m.id='ctxm';m.className='ctxm';
-
-const it=(t,fn)=>'<div class=ctxi onclick="'+fn+'">'+esc(t)+'</div>';
-
-m.innerHTML=it(T('c_open'),'ctxAct(0)')+it(T('c_reveal'),'ctxAct(1)')+
-
-it(T('c_copy'),'ctxAct(2)')+it(T('c_zip'),'ctxAct(3)');
-
-m.style.left=Math.max(4,Math.min(x,innerWidth-190))+'px';
-
-m.style.top=Math.max(4,Math.min(y,innerHeight-170))+'px';
-
-document.body.appendChild(m);
-
-setTimeout(()=>document.addEventListener('click',ctxHide,{once:true}),0)}
-
-function ctxAct(k){
-
-const r=RLIST[CTX_I];ctxHide();if(!r)return;
-
-if(k===0){openF(enc(r.path))}
-
-else if(k===1){revealPath(r.path)}
-
-else if(k===2){copyPath(r.path)}
-
-else if(k===3){zipPaths([r.path])}}
-
-function revealPath(p){
-
-try{if(window.pywebview&&window.pywebview.api&&window.pywebview.api.reveal){
-
-window.pywebview.api.reveal(p).then(ok=>toast(ok?T('revealed'):T('open_fail')));return}}catch(e){}
-
-toast(T('open_fail'))}
-
-function copyPath(p){
-
-try{navigator.clipboard.writeText(p).then(()=>toast(T('copied')));return}catch(e){}
-
-toast(p)}
-
-async function zipPaths(ps){
-
-try{const r=await(await fetch('/api/zip',{method:'POST',headers:{'Content-Type':'application/json'},
-
-body:JSON.stringify({paths:ps})})).json();
-
-toast(r&&r.ok?F(T('zip_ok'),{n:r.n}):T('zip_fail'))}catch(e){toast(T('zip_fail'))}}
-
-rEl.addEventListener('contextmenu',e=>{
-
-const el=e.target.closest&&e.target.closest('[data-i]');if(!el)return;
-
-e.preventDefault();const i=+el.dataset.i;
-
-if(i>=0&&i<RLIST.length){selectRow(i,false);ctxShow(i,e.clientX,e.clientY)}});
-
-// —— 反查：拖进来的文件在库里是什么情况（几份、同名版本在哪、同目录还有谁）
-
-async function doReverse(p){
-
-if(!p)return;
-
-let d;
-
-try{d=await(await fetch('/api/reverse',{method:'POST',headers:{'Content-Type':'application/json'},
-
-body:JSON.stringify({p:p})})).json()}catch(e){d={ok:false}}
-
-if(!d||!d.ok){toast(T('rev_none'));return}
-
-PV_ON=1;const b=$('pvbtn');if(b)b.classList.add('on');
-
-pvEl.className='preview on';
-
-let h='<div class=pv-title>'+esc(T('rev_title'))+'</div>'; 
-
-h+='<div class=pv-meta><b>'+esc(d.n||'')+'</b><br>'+esc(d.p||'')+'</div>';
-
-h+='<div class=pv-snip>'+(d.in_index
-
-?esc(T('rev_in'))+'<br>'+esc(String(d.idx||'').replace('T',' '))
-
-:T('rev_out'))+'</div>';
-
-if(d.same&&d.same.length){
-
-h+='<div class=revsec>'+F(T('same_n'),{n:d.same.length})+'</div>';
-
-d.same.forEach(x=>{h+='<div class=revrow onclick="openF(\''+enc(x.p)+'\')"><b>'+esc(x.n)+
-
-'</b><span class=revdir>'+esc(x.d)+'</span><span class=revt>'+(x.m?esc(fmtT(x.m)):'')+'</span></div>'})}
-
-if(d.same_size&&d.same_size.length){
-
-h+='<div class=revsec>'+esc(T('rev_size'))+'</div>';
-
-d.same_size.forEach(x=>{h+='<div class=revrow onclick="openF(\''+enc(x.p)+'\')"><b>'+esc(x.n)+
-
-'</b><span class=revdir>'+esc(x.p)+'</span></div>'})}
-
-if(d.siblings)h+='<div class=revsec>'+F(T('rev_sib'),{n:d.siblings})+'</div>';
-
-h+='<div class=pv-actions><button class="btn primary" onclick="revealPath(\''+enc(d.p||'')+'\')">'+
-
-esc(T('c_reveal'))+'</button><button class=btn onclick="copyPath(\''+enc(d.p||'')+'\')">'+
-
-esc(T('copy'))+'</button></div>';
-
-pvEl.innerHTML=h}
-
-async function pickReverse(){
-
-try{if(window.pywebview&&window.pywebview.api&&window.pywebview.api.pick_file){
-
-const p=await window.pywebview.api.pick_file();if(p){doReverse(p)}return}}catch(e){}
-
-const p=prompt(T('rev_pick'));if(p&&p.trim()){doReverse(p.trim())}}
-
-window.addEventListener('dragover',e=>{e.preventDefault()});
-
-window.addEventListener('drop',e=>{
-
-e.preventDefault();let p='';
-
-try{const f=e.dataTransfer.files&&e.dataTransfer.files[0];if(f){p=f.path||f.fullPath||''}}catch(err){}
-
-if(!p){try{p=e.dataTransfer.getData('text/plain')||''}catch(err){}}
-
-p=p.replace(/^file:\/\/\//,'');
-
-if(p&&/^[a-zA-Z]:[\\/]/.test(p)){doReverse(p)}
-
-else{toast(T('rev_need'));pickReverse()}});
-
-// —— 预览里的「同名版本」链（简历 / 简历(1) / 简历-最终版）
-
-let SAME_C={};
-
-function loadSame(p){
-
-const box=document.getElementById('pvsame');if(!box)return;
-
-const hit=SAME_C[p];
-
-if(hit){box.innerHTML=hit;return}
-
-fetch('/api/same?p='+enc(p)).then(r=>r.json()).then(d=>{
-
-const its=(d&&d.items)||[],box2=document.getElementById('pvsame');if(!box2)return;
-
-if(!its.length){box2.innerHTML='<div class=pvsame-h>'+esc(T('same_none'))+'</div>';return}
-
-let h='<div class=pvsame-h>'+F(T('same_n'),{n:its.length})+'</div>';
-
-its.forEach(x=>{h+='<div class=pvsame-row onclick="openF(\''+enc(x.p)+'\')"><span class=pvsame-n>'+
-
-esc(x.n)+'</span><span class=pvsame-t>'+esc(fmtT(x.m))+'</span></div>'});
-
-if(Object.keys(SAME_C).length>300)SAME_C={};
-
-SAME_C[p]=h;box2.innerHTML=h}).catch(()=>{})}
-
-function dymPick(n){qEl.value=String(n||'').replace(/\.[^.]+$/,'');go()}
-
-let TOAST_T=0;
-
-function toast(m){const el=$('toast');el.textContent=m;el.classList.add('on');clearTimeout(TOAST_T);TOAST_T=setTimeout(()=>el.classList.remove('on'),1800)}
-
-function hl(s,qv){
-
-const parts=String(s).split(/(\u0001[^\u0002]*\u0002)/);
-
-const hasMark=parts.length>1;
-
-return parts.map(p=>{
-
-if(p.charAt(0)==='\u0001'&&p.charAt(p.length-1)==='\u0002')return '<mark>'+esc(p.slice(1,-1))+'</mark>';
-
-let t=esc(p);
-
-if(!hasMark&&qv){const ws=qv.trim().split(/\s+/).filter(x=>x.length>0);
-
-for(const w of ws){try{t=t.replace(new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi'),m=>'<mark>'+m+'</mark>')}catch(e){}}}
-
-return t}).join('')}
-
-function enc(p){return encodeURIComponent(p).replace(/'/g,'%27')}
-
-async function go(){
-
-AT_HOME=0;
-
-const my=++SEQ;
-
-const qv=qEl.value.trim(),tv='',dv=(dEl&&dEl.value.trim())||'';
-
-if(!qv){HAS_RESULT=0;RLIST=[];RCUR=-1;goHome();pvEmpty();fEl.innerHTML='';return}
-
-rEl.innerHTML='<div class=empty>'+esc(T('searching'))+'</div>';
-
-const t0=performance.now();
-
-// 两段式：文件名索引几毫秒就回来，先把这部分画出来；正文检索慢（几百毫秒），
-
-// 回来了再补上。以前两件事 Promise.all 一起等，用户敲完字要盯着空白等半秒，
-
-// 就会觉得「主窗口不会边打边搜」——快搜窗因为只查文件名，反而显得很灵。
-
-const pFiles=fetch('/api/files?q='+encodeURIComponent(qv)+'&s='+SORT).then(r=>r.json()).catch(()=>({items:[],st:'off'}));
-
-const pBody=fetch('/api?q='+encodeURIComponent(qv)+'&t='+encodeURIComponent(tv)+'&d='+encodeURIComponent(dv)+'&name=0&s='+SORT).then(r=>r.json());
-
-let fx,filesMs=0,x=null,err=null;
-
-try{fx=await pFiles}catch(e){fx={items:[],st:'off'}}
-
-if(my!==SEQ)return;                      // 已经有更新的输入了，这份结果作废
-
-filesMs=performance.now()-t0;
-
-paintRes(null,fx,filesMs);
-
-try{x=await pBody}catch(e){err=e}
-
-if(my!==SEQ)return;
-
-if(err){HAS_RESULT=0;rEl.innerHTML='<div class=empty>'+esc(String(err))+'</div>';return}
-
-paintRes(x,fx,performance.now()-t0);
-
-}
-
-// 把「文件名结果」与「正文结果」画到同一张表上。x 为 null 表示正文还没回来，
-
-// 这时只画文件名部分；正文到了再整体重画一次（纯内存操作，不会闪）。
-
-function paintRes(x,fx,ms){
-
-if(x&&x.err){HAS_RESULT=0;rEl.innerHTML='<div class=empty>'+esc(x.k?F(T(x.k),x.a||{e:x.err}):x.err)+'</div>';return}
-
-HAS_RESULT=1;
-
-const hits=(x&&x.hits)||[];
-
-const hp=new Set(hits.map(h=>String(h.p).toLowerCase()));
-
-const files=(fx&&fx.items)?fx.items.filter(f=>!hp.has(String(f.p).toLowerCase())):[];
-
-MASTER=[];
-
-const fxSt=fx&&fx.st;
-
-if(files.length){MASTER.push({ty:'head',text:hits.length
-
- ? esc(T('ev_h'))+'<em>'+esc(T(fxSt==='ok'?'ev_sub':'ev_sub_off'))+'</em>'
-
- : F(T('ev_only'),{n:files.length})});
-
-files.forEach(f=>{const isDir=f.t==='dir'||f.t==='folder';
-
-const e=isDir?'':(f.e||('.'+((f.n.split('.').pop()||'').toLowerCase()))||'');
-
-MASTER.push({ty:'file',name:f.n,dn:f.dn||f.n,path:f.p,dir:f.d||'',e:e,t:isDir?'dir':'',
-
-ext:isDir?'DIR':e.slice(1).toUpperCase().slice(0,4),snip:'',src:f.src==='ev'?'ev':'',
-
-k:kindOf(f.p,e,isDir),mt:f.m||0})});
-
-if(fx.more)MASTER.push({ty:'more',text:T('ev_more')})}
-
-if(files.length&&hits.length)MASTER.push({ty:'head',text:'📄 '+esc(T('f_doc'))+' <em>'+hits.length+'</em>'});
-
-hits.forEach(h=>{const i=h.p.lastIndexOf('\\'),nm=i<0?h.p:h.p.slice(i+1),pt=i<0?'':h.p.slice(0,i),
-
-e='.'+(h.p.split('.').pop()||'').toLowerCase();
-
-MASTER.push({ty:'hit',name:nm,dn:nm,path:h.p,dir:pt,e:e,t:'',ext:e.slice(1).toUpperCase().slice(0,4),
-
-snip:h.s,src:'',k:'doc',mt:h.m||0})});
-
-const rows=MASTER.filter(r=>r.ty==='file'||r.ty==='hit').length;
-
-if(!rows){
-
-if(x){                                   // 正文也回来了，才算「真的没有」
-
-const dym=(x&&x.dym)||[];
-
-rEl.innerHTML='<div class=empty>'+F(T('no_hit'),{q:esc((x&&x.q)||qEl.value.trim())})+'<br>'+T('no_hit_tip')+'<div class=qsyn>'+esc(T('qsyn_tip'))+'</div></div>'+
-
-(dym.length?'<div class=dym><div class=dymh>'+esc(T('dym_prefix'))+'</div>'+
-
-dym.map(d=>'<span class=dymc onclick="dymPick(\''+enc(d.n)+'\')">'+esc(d.n)+'</span>').join('')+'</div>':'');
-
-RCUR=-1;pvEmpty();updateCount(0);return}
-
-return                                // 文件名没命中、正文还在路上：先留着「正在搜索」，别急着报空
-
-}
-
-renderFilter(hits.length,files.length,ms?ms.toFixed(0):'—');rebuild()}
-
-// 服务端拿系统图标失败时回 204（不缓存失败，等下次请求再试），可 <img> 自己不会重试，
-
-// 于是首屏刚起来那一下会满屏兜底图标。这里补两次带时间戳的重试，还取不到就留着兜底。
-
-let ICON_RETRY_T=0;
-
-function iconRetry(root,delays){
-
-clearTimeout(ICON_RETRY_T);
-
-let i=0;
-
-const tick=function(){
-
-const bad=[].slice.call(root.querySelectorAll('img.ic')).filter(function(im){
-
-return im.parentNode&&im.parentNode.classList.contains('noic')});
-
-bad.forEach(function(im){
-
-const s=im.getAttribute('src');
-
-if(!s)return;
-
-im.onload=function(){im.parentNode.classList.remove('noic')};
-
-im.src=s+(s.indexOf('?')>=0?'&':'?')+'r='+(Date.now()%1e6)});
-
-if(++i<delays.length)ICON_RETRY_T=setTimeout(tick,delays[i])};
-
-ICON_RETRY_T=setTimeout(tick,delays[0])}
-
-let VIEW=(function(){try{return localStorage.getItem('sb_view')||'list'}catch(e){return 'list'}})();
-
-function viewMenu(ev){
-
-  const m=$('vmenu'),b=$('viewbtn');if(!m||!b)return;
-
-  if(m.classList.contains('on')){m.classList.remove('on');return}
-
-  const r=b.getBoundingClientRect();vSync();
-
-  m.style.left=Math.max(8,Math.min(window.innerWidth-196,r.right-172))+'px';
-
-  m.style.top=(r.bottom+6)+'px';m.classList.add('on');
-
-  setTimeout(()=>document.addEventListener('click',vCloseOnce,{once:true}),0);
-
-}
-
-function vCloseOnce(e){const m=$('vmenu');if(m&&!m.contains(e.target))m.classList.remove('on')}
-
-function vSync(){
-
-  const a=$('vm_list'),b=$('vm_grid'),c=$('vm_pv');
-
-  if(a)a.textContent=VIEW==='list'?'✓':'';
-
-  if(b)b.textContent=VIEW==='grid'?'✓':'';
-
-  if(c)c.textContent=PV_ON?'✓':'';
-
-  const t=$('vm_sortt');
-
-  if(t)t.textContent=T('vmenu_sort')+'：'+T('sort_'+SORT);
-
-}
-
-function cycleSort(){
-
-  SORT=SORT_SEQ[(SORT_SEQ.indexOf(SORT)+1)%SORT_SEQ.length];
-
-  vSync();
-
-  try{localStorage.setItem('sb_sort',SORT)}catch(e){}
-
-  if(HAS_RESULT)go();
-
-  else toast(T('sort_now')+T('sort_'+SORT));
-
-}
-
-function vPick(k){
-
-  const m=$('vmenu');if(m)m.classList.remove('on');
-
-  if(k==='pv'){togglePv();return}
-
-  if(k==='sort'){cycleSort();return}
-
-  setView(k);
-
-}
-
-// 长文件名中间省略、保留扩展名：「…项目周报-第二版.xlsx」比「…周报-第二版.xl…」有用得多
-
-function midName(str,max){
-
-  str=String(str||'');max=max||44;
-
-  if(str.length<=max)return str;
-
-  const dot=str.lastIndexOf('.');
-
-  const ext=(dot>0&&str.length-dot<=6)?str.slice(dot):'';
-
-  const base=ext?str.slice(0,dot):str;
-
-  const keep=Math.max(10,max-ext.length-1);
-
-  const head=Math.max(6,Math.ceil(keep*0.62)), tail=Math.max(3,keep-head);
-
-  return base.slice(0,head)+'…'+base.slice(base.length-tail)+ext;
-
-}
-
-// Ctrl+1..9：直接打开当前列表第 N 项（WinShun / Listary 都这么做）
-
-function openRowN(n){
-
-  const rows=RLIST.filter(r=>r.ty==='file'||r.ty==='hit');
-
-  const r=rows[n-1];
-
-  if(r&&r.path)openF(r.path);
-
-}
-
-function setView(v){
-
-VIEW=v==='grid'?'grid':'list';
-
-document.body.classList.toggle('gridmode',VIEW==='grid');
-
-try{localStorage.setItem('sb_view',VIEW)}catch(e){}
-
-const b=$('viewbtn');
-
-vSync();
-
-rebuild()}
-
-function renderGrid(){
-
-const qv=qEl.value.trim();
-
-let html='<div class=rgrid>';
-
-RLIST.forEach((r,i)=>{
-
-const on=i===RCUR?' on':'';
-
-const isDir=r.t==='dir';
-
-const e=(r.e||'').toLowerCase();
-
-const thumbable=!isDir&&/^\.(jpg|jpeg|png|gif|webp|bmp|tif|tiff|pdf|mp4|mkv|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg)$/.test(e);
-
-let media;
-
-const icq=isDir?'d=1':'e='+encodeURIComponent(r.e||'')+((r.e==='.exe'||r.e==='.lnk')&&r.path?'&p='+encodeURIComponent(r.path):'');
-
-const iconImg='<img loading=lazy class=gic src="/api/icon?'+icq+'" alt="" onerror="this.style.display=\'none\'">';
-
-if(thumbable){
-
-// 缩略图叠在类型图标上：取到了就把下面的图标藏起来；取不到（手机存储没挂、缺 codec）
-
-// 至少显示类型图标，不至于留一个空白框
-
-media=iconImg+'<img loading=lazy class=gthumbimg src="/api/thumb?s=1&p='+enc(r.path)+'" alt=""'
-
-+' onload="this.previousElementSibling&&(this.previousElementSibling.style.display=\'none\')"'
-
-+' onerror="this.style.display=\'none\'">';
-
-}else{
-
-media=iconImg;
-
-}
-
-html+='<div class="gitem'+on+'" data-i="'+i+'" onclick="clickRow('+i+')" ondblclick="openF(\''+enc(r.path)+'\')" title="'+esc(r.path)+'">'+
-
-'<div class=gthumb>'+media+'</div>'+
-
-'<div class=gname>'+(()=>{const g=String(r.dn||r.name);return g.length>24?esc(midName(g,24)):hl(g,qv)})()+'</div>'+
-
-'<div class=gpath>'+esc(r.dir||'')+'</div></div>'});
-
-rEl.innerHTML=html+'</div>'}
-
-function renderList(){
-
-let html='';
-
-RLIST.forEach((r,i)=>{
-
-if(r.ty==='head'){html+='<div class=evhead>'+r.text+'</div>';return}
-
-if(r.ty==='more'){html+='<div class=evmore>'+esc(r.text)+'</div>';return}
-
-const on=i===RCUR?' on':'';
-
-const qv=qEl.value.trim();
-
-const rn=String(r.dn||r.name);const nm=rn.length>36?esc(midName(rn,36)):hl(rn,qv);
-
-const isDir=r.t==='dir';
-
-const icq=isDir?'d=1':'e='+encodeURIComponent(r.e||'')
-
-+((r.e==='.exe'||r.e==='.lnk')&&r.path?'&p='+encodeURIComponent(r.path):'');
-
-const snipHtml=r.snip?'<div class=sub>'+hl(r.snip,qv)+'</div>':'';
-
-// ico HTML：真图标 + SVG 兜底（学快搜窗的做法，避免单纯 <img> 失败留空白）
-
-const fbSvg=isDir
-
-?'<svg class=fic viewBox="0 0 24 24"><path d="M2.6 7.1c0-1 .8-1.8 1.8-1.8h4c.5 0 1 .2 1.3.6l1.3 1.5h8.7c1 0 1.8.8 1.8 1.8v9.4c0 1-.8 1.8-1.8 1.8H4.4c-1 0-1.8-.8-1.8-1.8z" fill="#f4bd4e"/></svg>'
-
-:(function(){var c='#a3a9b6';var tc={'.pdf':'#e9573f','.docx':'#2b579a','.doc':'#2b579a','.xlsx':'#107c41','.xls':'#107c41','.pptx':'#d24726','.zip':'#f0a020','.txt':'#7a8294'};if(tc[r.e])c=tc[r.e];return '<svg class=fic viewBox="0 0 24 24"><path d="M4.8 2.6h8.4L18.8 8.3v13.1H4.8z" fill="#fff" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><path d="M13.2 2.6v5.7h5.6" fill="none" stroke="#c9cfdb" stroke-width="1.15" stroke-linejoin="round"/><rect x="7.2" y="11.7" width="9" height="2.6" rx="1.3" fill="'+c+'" opacity=".92"/><rect x="7.2" y="16" width="5.8" height="2.6" rx="1.3" fill="'+c+'" opacity=".45"/></svg>';})();
-
-// 注意：外层这层 .ritem 是行的「容器」，CSS 全是按 .ritem 后代写的，
-
-// 少这一层整行会塌成裸的图标+文字（0.7 开发期踩过：列表变成一张巨型文件图标）
-
-const mt=r.mt?fmtT(r.mt):'';
-
-html+='<div class="ritem'+on+'" data-i="'+i+'" onclick="clickRow('+i+')"'+' ondblclick="openF(\''+enc(r.path)+'\')">'+
-
-'<div class=ico><img class=ic src="/api/icon?'+icq+'" alt="" onerror="this.parentNode.classList.add(\'noic\')">'+fbSvg+'</div>'+
-
-'<div class=nm title="'+esc(r.name)+'">'+nm+(r.src==='ev'?' <span class=evtag>'+esc(T('ev_tag'))+'</span>':'')+'</div>'+
-
-'<div class=pp title="'+esc(r.path)+'">'+esc(r.dir)+'</div>'+
-
-'<div class="mt'+(mt?'':' none')+'">'+esc(mt||'—')+'</div>'+
-
-snipHtml+'</div>'});
-
-rEl.innerHTML=html;
-
-iconRetry(rEl,[260,700,1500,2800,4600])}
-
-const KIND_TBL={
-
-dir:['.dir'],
-
-doc:['.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.md','.csv','.rtf','.epub','.wps','.et','.dps','.ofd'],
-
-img:['.jpg','.jpeg','.png','.gif','.webp','.bmp','.tif','.tiff','.heic','.svg'],
-
-audio:['.mp3','.wav','.flac','.aac','.m4a','.ogg','.wma','.ape','.amr'],
-
-zip:['.zip','.rar','.7z','.tar','.gz','.bz2','.iso','.cab'],
-
-video:['.mp4','.mkv','.avi','.mov','.wmv','.flv','.m4v','.ts','.webm','.rmvb','.mpg','.mpeg'],
-
-app:['.exe','.lnk','.bat','.cmd','.ps1','.appref-ms','.msi','.com']};
-
-function kindOf(p,e,isDir){
-
-if(isDir)return 'dir';e=(e||'').toLowerCase();
-
-for(const k in KIND_TBL){if(KIND_TBL[k].indexOf(e)>=0)return k}
-
-return 'file'}
-
-function fmtT(ts){if(!ts)return '';const d=new Date(ts*1000),z=n=>String(n).padStart(2,'0');
-
-return d.getFullYear()+'/'+(d.getMonth()+1)+'/'+d.getDate()+' '+z(d.getHours())+':'+z(d.getMinutes())}
-
-function pickKind(k,el){KIND=k;document.querySelectorAll('[data-kind]').forEach(x=>x.classList.toggle('on',x===el));rebuild()}
-
-function pickDays(n,el){DAYS=n;document.querySelectorAll('[data-days]').forEach(x=>x.classList.toggle('on',x===el));rebuild()}
-
-function togglePv(){PV_ON=!PV_ON;const b=$('pvbtn');if(b)b.classList.toggle('on',PV_ON);
-
-  vSync();
-
-if(PV_ON&&RCUR>=0)showPreview(RCUR);else pvEmpty()}
-
-function updateCount(n){const el=$('nitems');if(el&&el.firstChild)el.firstChild.nodeValue=String(n)+' '}
-
-function rebuild(){
-
-const all=MASTER.filter(r=>r.ty==='file'||r.ty==='hit');
-
-document.querySelectorAll('[data-kind]').forEach(el=>{const k=el.dataset.kind,b=$('ck_'+k);
-
-if(!b)return;const n=k==='all'?all.length:all.filter(r=>r.k===k).length;b.textContent=n||''});
-
-const now=Date.now()/1000;
-
-let rows=all;
-
-if(KIND!=='all')rows=rows.filter(r=>r.k===KIND);
-
-if(DAYS>0)rows=rows.filter(r=>r.mt&&(now-r.mt)<=DAYS*86400);
-
-// 没加筛选时保留「文件名命中 / 文档」两段分区头；一旦筛选就只列结果
-
-RLIST=(KIND==='all'&&DAYS===0&&VIEW!=='grid')?MASTER.slice():rows;
-
-RCUR=RLIST.findIndex(r=>r.ty==='file'||r.ty==='hit');
-
-updateCount(rows.length);
-
-if(!rows.length){rEl.innerHTML='<div class=empty>'+esc(T('filter_empty'))+'</div>';RCUR=-1;pvEmpty();return}
-
-if(VIEW==='grid')renderGrid();else renderList();
-
-if(RCUR>=0&&PV_ON)showPreview(RCUR)}
-
-(function(){const b=$('viewbtn');if(b){b.title=T('view_menu')}
-
-document.body.classList.toggle('gridmode',VIEW==='grid')})();
-
-function renderFilter(hits,files,ms){
-
-const chips=[];
-
-if(hits)chips.push(esc(T('f_doc'))+' <b>'+hits+'</b>');
-
-if(files)chips.push(esc(T('f_file'))+' <b>'+files+'</b>');
-
-fEl.innerHTML=chips.length?'<span class=fchip>'+chips.join('</span><span class=fchip>')+'</span>'+
-
-'<span class=fchip style="cursor:default">'+esc(ms)+'ms</span>':''}
-
-function clickRow(i){selectRow(i,true)}
-
-function selectRow(i,scroll){
-
-if(i<0||i>=RLIST.length)return;RCUR=i;
-
-rEl.querySelectorAll('[data-i]').forEach(el=>el.classList.toggle('on',+el.dataset.i===i));
-
-const el=rEl.querySelector('[data-i="'+i+'"]');
-
-if(el&&scroll)el.scrollIntoView({block:'nearest'});showPreview(i)}
-
-function showPreview(i){
-
-const r=RLIST[i];if(!r||r.ty==='head'||r.ty==='more'){pvEmpty();return}
-
-pvRender(r)}
-
-function pvRender(r){
-
-pvEl.className='preview'+(PV_ON?' on':'');const qv=qEl.value.trim();
-
-const isThumb=/^\.(jpg|jpeg|png|gif|webp|bmp|tif|tiff|pdf|mp4|mkv|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg)$/i.test(r.e||'');
-
-const thumbHtml=isThumb?'<div class=pv-thumb><span class=pv-loading>'+esc(T('pv_loading'))+'</span>'
-
-+'<img src="/api/thumb?p='+enc(r.path)+'" onload="var s=this.previousElementSibling;if(s)s.style.display=\'none\'"'
-
-+' onerror="this.parentNode.style.display=\'none\'"></div>':'';
-
-pvEl.innerHTML=thumbHtml+
-
-'<div class=pv-title>'+hl(r.dn||r.name,qv)+'</div>'+
-
-'<div class=pv-meta><b>'+esc(r.ext)+'</b> · '+esc(r.dir)+'</div>'+
-
-(r.snip?'<div class=pv-snip>'+hl(r.snip,qv)+'</div>':'<div class=pv-empty>'+esc(T('pv_nosnip'))+'</div>')+
-
-'<div class=pv-actions><button class="btn primary" onclick="openF(\''+enc(r.path)+'\')">'+esc(T('open'))+'</button>'+
-
-'<button class=btn onclick="copyP(this,\''+enc(r.path)+'\')">'+esc(T('copy'))+'</button>'+
-
-'<button class=btn onclick="zipPaths([\''+enc(r.path)+'\'])">'+esc(T('c_zip'))+'</button></div>'+
-
-'<div id=pvsame class=pvsame></div>';
-
-if(r.ty==='file'||r.ty==='hit'){loadSame(r.path)}}
-
-function pvEmpty(){pvEl.className='preview';pvEl.innerHTML='<div class=pv-empty>'+esc(T('pv_empty'))+'</div>'}
-
-async function openF(p){
-
-// 桌面版优先走原生桥：HTTP 的 /open 只放行文档/媒体类（对 .exe/.lnk 一律 deny，
-
-// 因为 Host/Sec-Fetch-Site 这两道门本机进程都能伪造）。启动应用、打开快捷方式必须
-
-// 走这里 —— window.pywebview.api.open_path 内部同样要过 ev_recent 白名单。
-
-try{
-
-if(window.pywebview&&window.pywebview.api&&window.pywebview.api.open_path){
-
-const ok=await window.pywebview.api.open_path(decodeURIComponent(p));
-
-toast(ok?T('opened'):T('open_fail'));return}}catch(e){}
-
-try{const x=await(await fetch('/open?p='+p)).json();
-
-if(x.ok){toast(T('opened'));return}
-
-if(x.reason==='gone'){toast(T('file_gone'));return}
-
-toast(T('open_fail'))}
-
-catch(e){toast(T('open_fail'))}}
-
-async function copyP(b,p){try{await navigator.clipboard.writeText(decodeURIComponent(p));b.textContent=T('copied');setTimeout(()=>{b.textContent=T('copy')},1200)}
-
-catch(e){toast(decodeURIComponent(p))}}
-
-function moveCur(d){
-
-if(!RLIST.length)return;let i=RCUR;
-
-do{i+=d}while(i>=0&&i<RLIST.length&&(RLIST[i].ty==='head'||RLIST[i].ty==='more'));
-
-if(i>=0&&i<RLIST.length)selectRow(i,true)}
-
-function openCur(){const r=RLIST[RCUR];if(r&&(r.ty==='file'||r.ty==='hit'))openF(enc(r.path))}
-
-async function revealCur(){const r=RLIST[RCUR];if(!r||(r.ty!=='file'&&r.ty!=='hit'))return;
-
-try{if(window.pywebview&&window.pywebview.api&&window.pywebview.api.reveal){
-
-const ok=await window.pywebview.api.reveal(r.path);toast(ok?T('revealed'):T('open_fail'));return}}catch(e){}
-
-toast(T('open_fail'))}
-
-qEl.addEventListener('keydown',e=>{
-
-// 输入法正在拼字时的 Enter 是「上屏」，不是「搜索」——不挡会直接执行第一个结果
-
-if(e.isComposing||e.keyCode===229)return;
-
-if((e.ctrlKey||e.metaKey)&&(e.key==='s'||e.key==='S')){e.preventDefault();cycleSort();return}
-
-if((e.ctrlKey||e.metaKey)&&/^[1-9]$/.test(e.key)){e.preventDefault();openRowN(+e.key);return}
-
-if(e.key==='Enter'){e.preventDefault();if(e.ctrlKey||e.metaKey){revealCur()}else if(HAS_RESULT&&RCUR>=0){openCur()}else{go()}return}
-
-if(e.key==='ArrowDown'){e.preventDefault();moveCur(1);return}
-
-if(e.key==='ArrowUp'){e.preventDefault();moveCur(-1);return}});
-
-// 边打边搜：以前主窗口只在 Enter 时查，快搜窗却实时出结果，两个窗口像两套软件。
-
-// 这里补一个 180ms 防抖；中文输入法拼字期间（composition）不触发，避免拿拼音去搜。
-
-let QDT=0,QCOMP=0;
-
-qEl.addEventListener('compositionstart',()=>{QCOMP=1});
-
-qEl.addEventListener('compositionend',()=>{QCOMP=0;clearTimeout(QDT);QDT=setTimeout(liveSearch,120)});
-
-qEl.addEventListener('input',()=>{
-
-if(QCOMP)return;
-
-clearTimeout(QDT);
-
-QDT=setTimeout(liveSearch,180)});
-
-function liveSearch(){
-
-const qv=qEl.value.trim();
-
-if(!qv){SEQ++;HAS_RESULT=0;RLIST=[];RCUR=-1;goHome();pvEmpty();fEl.innerHTML='';return}
-
-if(!HAS_RESULT&&!qEl.value)return;
-
-go()}
-
-document.addEventListener('keydown',e=>{
-
-if(e.key==='Escape'){if($('help').classList.contains('on')){hideHelp()}}if(e.key==='Escape'){if($('cfg').classList.contains('on')){hideCfg()}else if(document.activeElement===qEl){qEl.value='';HAS_RESULT=0;RLIST=[];RCUR=-1;goHome();pvEmpty();fEl.innerHTML=''}}
-
-if((e.ctrlKey||e.metaKey)&&e.key==='f'){e.preventDefault();qEl.focus();qEl.select()}
-
-if((e.ctrlKey||e.metaKey)&&(e.key==='s'||e.key==='S')){e.preventDefault();cycleSort()}
-
-// 键盘契约：页脚写着「↑↓ 选择 · Enter 打开」，可这两个键以前只绑在搜索框上——
-
-// 鼠标点过一行、焦点离开输入框之后，键位就全失效了。这里补一条全局兜底。
-
-const _inp=(document.activeElement&&/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName));
-
-if(!_inp&&HAS_RESULT&&RLIST.length){
-
- if(e.key==='ArrowDown'){e.preventDefault();moveCur(1);return}
-
- if(e.key==='ArrowUp'){e.preventDefault();moveCur(-1);return}
-
- if(e.key==='Enter'){e.preventDefault();if(e.ctrlKey||e.metaKey){revealCur()}else{openCur()}return}
-
- if((e.ctrlKey||e.metaKey)&&/^[1-9]$/.test(e.key)){e.preventDefault();openRowN(+e.key);return}}});
-
-let DIRS=[],EXC=[],tid=0,PROG_CACHE=null,CFG_DIRTY=false;
-
-async function cfgLoad(){try{const c=await(await fetch('/api/config')).json();DIRS=c.include_dirs||[];EXC=c.exclude_dirs||[];
-
-if(!c.exists){showCfg(1);pm.textContent=T('first_run');
-
-// 首启的两个坑：①🚀 智能扫描藏在「维护工具」折叠区里，新人根本看不到；
-
-// ②「索引范围」也收着，看到一片空白不知道下一步做什么。首启把两个都展开，并给 🚀 加呼吸高亮。
-
-try{$('scope_details').open=true;$('maint_details').open=true;const _sb=$('smartbtn');if(_sb)_sb.classList.add('hot')}catch(e){}
-
-draw()}}catch(e){}loadNames();loadAutostart();loadSettings();setTimeout(maybeFirstRun,600);setTimeout(maybeWelcome,1100);
-
-setTimeout(()=>{try{fetch('/api/ping').then(r=>r.json()).then(v=>{
-
-  if(v&&v.fallback&&v.dir)toast(F(T('data_fallback'),{p:v.dir}));
-
-}).catch(function(){})}catch(e){}},1800)}
-
-async function loadAutostart(){try{const r=await(await fetch('/api/autostart')).json();
-
-$('tg_auto').classList.toggle('on',!!r.on)}catch(e){}}
-
-async function loadSettings(){try{const r=await(await fetch('/api/settings')).json();
-
-$('tg_hotkey').classList.toggle('on',r.hotkey!==false);
-
-const st=$('sel_theme');if(st)st.value=r.theme||'auto';
-
-THEME=r.theme||'auto';
-
-applyTheme(r.theme||'auto');
-
-if(r.lang){LANG=r.lang;try{localStorage.setItem('sb_lang',LANG)}catch(e){}applyLang()}
-
-else{applyLang()}}catch(e){applyLang()}}
-
-function showCfg(wizard){$('cfg').classList.add('on');$('mask').classList.add('on');if(wizard)$('gear').style.display='none'}
-
-function hideCfg(){$('cfg').classList.remove('on');$('mask').classList.remove('on');$('gear').style.display='';
-
-// 关抽屉时把没保存的改动说出来（以前这行写在函数体外面，等于永远不提醒）
-
-if(CFG_DIRTY){CFG_DIRTY=false;toast(T('cfg_unsaved'))}}
-
-function showAbout(){$('help').classList.remove('on');$('hmask').classList.remove('on');try{hideWelcome(0)}catch(e){};$('about').classList.add('on');$('amask').classList.add('on')}
-
-function hideAbout(){$('about').classList.remove('on');$('amask').classList.remove('on')}
-
-function showHelp(){$('about').classList.remove('on');$('amask').classList.remove('on');try{hideWelcome(0)}catch(e){};$('help').classList.add('on');$('hmask').classList.add('on')}
-
-function hideHelp(){$('help').classList.remove('on');$('hmask').classList.remove('on')}
-
-function showPanel(n){try{if(n==='help')showHelp();else if(n==='about')showAbout();else if(n==='cfg'){loadSettings();showCfg()}}catch(e){}}
-
-// —— 关于弹窗里的三件事：数字跟着语言走、检查更新
-
-function tOf(o,k){const en=(LANG==='en');const v=(en&&o[k+'_en'])?o[k+'_en']:o[k];return v||''}
-
-function openDataDir(){try{fetch('/api/open_dir',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){}}
-
-function fillAbout(){
-
-  const m=$('ab_meta')||$('ab_meta_s');if(!m)return;
-
-  const nf=m.dataset.nf||'',nt=m.dataset.nt||'',bd=m.dataset.build||'';
-
-  const d=$('ab_docs');if(d)d.innerHTML=F(T('about_docs'),{t:nt,n:nf});
-
-  const b=$('ab_build');if(b)b.innerHTML=F(T('about_build'),{b:bd});
-
-  const dp=$('ab_dirp');
-
-  if(dp&&!dp.textContent)try{fetch('/api/ping').then(r=>r.json()).then(v=>{
-
-    if(v&&v.dir){dp.textContent=v.dir;dp.style.fontWeight='400';}
-
-  }).catch(function(){})}catch(e){}
-
-}
-
-let UPD=null;
-
-async function checkUpdate(){
-
-  const msg=$('ab_msg');if(!msg)return;
-
-  msg.innerHTML=esc(T('about_checking'));
-
-  let d=null;
-
-  try{d=await(await fetch('/api/update_check',{cache:'no-store'})).json()}catch(e){d=null}
-
-  if(!d||!d.ok){msg.innerHTML=esc(T('about_fail'));return}
-
-  UPD=d;
-
-  if(!d.newer||d.legacy){
-
-    msg.innerHTML=esc(F(T('about_latest'),{v:(d.latest||'?')}));
-
-    return;
-
-  }
-
-  let h=esc(F(T('about_new'),{v:(d.latest||'?')}));
-
-  if(d.notes)h+='<div class=upd>'+esc(String(d.notes).slice(0,1200))+'</div>';
-
-  h+='<button class="pbtn" id=ab_do onclick=applyUpdate()>'+esc(T('about_apply'))+'</button>';
-
-  var _pg=String(d.page||'');var _okp=/^https:\/\/[A-Za-z0-9._~:\/?#\[\]@!$&'()*+,;=%-]+$/.test(_pg);
-
-  if(_okp)h+='<div style="margin-top:7px"><a href="'+esc(_pg)+'" target="_blank" rel="noreferrer" style="color:var(--acc)">'+esc(T('about_page'))+'</a></div>';
-
-  msg.innerHTML=h;
-
-}
-
-async function applyUpdate(){
-
-  const msg=$('ab_msg');if(!msg)return;
-
-  msg.innerHTML=esc(T('about_applying'));
-
-  let d=null;
-
-  try{
-
-    d=await(await fetch('/api/update_apply',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
-
-  }catch(e){d=null}
-
-  if(!d){msg.innerHTML=esc(T('upd_net'));return}
-
-  if(!d.ok){msg.innerHTML=esc(T(d.k||'upd_net'));return}
-
-  msg.innerHTML=esc(F(T('upd_done'),{v:(d.version||'')}));
-
-}
-
-async function toggleAuto(){const el=$('tg_auto');const on=!el.classList.contains('on');
-
-try{const r=await(await fetch('/api/autostart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:on})})).json();
-
-if(r.ok){el.classList.toggle('on',on);toast(on?T('d_autostart_on'):T('d_autostart_off'))}else{toast(r.err||'failed')}}catch(e){toast('failed')}}
-
-async function toggleHotkey(){const el=$('tg_hotkey');const on=!el.classList.contains('on');
-
-try{const r=await(await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hotkey:on})})).json();
-
-if(r.ok){el.classList.toggle('on',on);toast(on?T('d_hotkey_on'):T('d_hotkey_off')+' (重启生效)')}}catch(e){toast('failed')}}
-
-async function changeLang(l){LANG=l;try{localStorage.setItem('sb_lang',l)}catch(e){}
-
-try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lang:l})})}catch(e){}
-
-applyLang()}
-
-function changeTheme(t){THEME=t;applyTheme(t);
-
-try{fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({theme:t})})}catch(e){}}
-
-let THEME='auto';
-
-let _TB_DARK=null,_TB_TRIES=0;
-
-function syncTitlebar(dark){
-
-  _TB_DARK=dark;_TB_TRIES=0;
-
-  const tick=()=>{
-
-    const api=window.pywebview&&window.pywebview.api;
-
-    if(api&&api.set_dark){try{api.set_dark(dark)}catch(e){}return}
-
-    if(_TB_TRIES++<20)setTimeout(tick,250);
-
-  };
-
-  tick();
-
-}
-
-function applyTheme(t){
-
-const dark=(t==='dark')||(t==='auto'&&matchMedia('(prefers-color-scheme:dark)').matches);
-
-document.documentElement.setAttribute('data-theme',dark?'dark':'light');
-
-syncTitlebar(dark);
-
-// 系统主题变化（auto 模式）也要跟着变，不然标题栏一天都不会自己刷新
-
-try{_darkMQ=_darkMQ||matchMedia('(prefers-color-scheme:dark)');_darkMQ.onchange=()=>{if((THEME||'auto')==='auto')applyTheme('auto')}}catch(e){}
-
-}
-
-let _darkMQ=null;
-
-function draw(){const el=$('dirs');if(!el)return;
-
-el.innerHTML=DIRS.map((d,i)=>'<span class=chip>'+esc(d)+' <b onclick=delD('+i+')>✕</b></span>').join('')
-
-||'<span class=pmsg>'+esc(T('no_dir'))+'</span>'}
-
-async function addDir(){let p=null;
-
-// 桌面窗口模式下才有原生文件夹选择器。注意不能用一个全局常量来判断：
-
-// pywebview 注入 window.pywebview 的时机晚于本脚本执行，那时常量还是 false。
-
-const api=window.pywebview&&window.pywebview.api;
-
-if(api&&api.pick_folder){try{p=await api.pick_folder()}catch(e){p=null}}
-
-if(!p)p=prompt(T('add_prompt'));
-
-if(p){p=String(p).replace(/[\\/]+$/,'');if(!DIRS.includes(p))DIRS.push(p);CFG_DIRTY=true;draw()}}
-
-function delD(i){DIRS.splice(i,1);CFG_DIRTY=true;draw()}
-
-let CAND=[];
-
-// —— 欢迎页（只出现一次，学 Listary 那种"刚装好先告诉你两句"） ——
-
-async function maybeWelcome(force){
-
-  if(FR_ACTIVE&&!force)return;   // 首启正在建库：先让人能搜，别用欢迎页盖住
-
-  let r;try{r=await(await fetch('/api/settings')).json()}catch(e){return}
-
-  if(!r||r.welcome_seen)return;
-
-  // 装好那一刻，帮助/关于/设置可能正开着：先收掉，别两层叠在一起
-
-  try{hideHelp();hideAbout();$('cfg').classList.remove('on');$('mask').classList.remove('on')}catch(e){}
-
-  $('welcome').classList.add('on');$('wmask').classList.add('on');
-
-}
-
-function hideWelcome(mark){
-
-  $('welcome').classList.remove('on');$('wmask').classList.remove('on');
-
-  if(mark){try{fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-
-    body:JSON.stringify({welcome_seen:true})})}catch(e){}}
-
-}
-
-function welcomeMini(){
-
-  hideWelcome(1);
-
-  try{if(window.pywebview&&pywebview.api&&pywebview.api.open_mini)pywebview.api.open_mini()}catch(e){}
-
-}
-
-// —— 首次运行：不用找按钮，打开就开始建库 ——
-
-// 以前要用户自己钻进设置 → 维护工具 → 🚀 智能扫描，还要在候选目录里勾选。
-
-// 新人十有八九在这一步就以为"这软件搜不到东西"。
-
-let FR_ACTIVE=0,FR_PAUSED=0,FR_TID=0,FR_SHOWN=0;
-
-function frShow(){const b=$('frbar');if(b)b.classList.remove('hide')}
-
-function frHide(){const b=$('frbar');if(b)b.classList.add('hide')}
-
-function frSet(msg,n,pct,ok){
-
-  const b=$('frbar');if(!b)return;
-
-  b.classList.toggle('ok',!!ok);
-
-  $('frmsg').textContent=msg||'';
-
-  if(n!==null&&n!==undefined)$('frn').textContent=Number(n)>0?F(T('fr_files'),{n:Number(n).toLocaleString()}):'';
-
-  $('frpi').style.width=Math.max(0,Math.min(100,pct||0))+'%';
-
-  const pb=$('frpb'); if(pb)pb.style.display=ok?'none':'';
-
-}
-
-async function frToggle(){
-
-  const want=FR_PAUSED?0:1;
-
-  try{const r=await(await fetch('/api/firstrun',{method:'POST',headers:{'Content-Type':'application/json'},
-
-    body:JSON.stringify(want?{pause:1}:{resume:1})})).json();
-
-    if(r&&r.ok!==false){FR_PAUSED=want;$('frpb').textContent=T(want?'fr_bar_resume':'fr_bar_pause')}}
-
-  catch(e){toast(T('net_fail'))}
-
-}
-
-async function maybeFirstRun(){
-
-  try{hideCfg()}catch(e){}
-
-  try{$('mask').classList.remove('on')}catch(e){}
-
-  let r;try{r=await(await fetch('/api/firstrun')).json()}catch(e){return}
-
-  if(!r||!r.need)return;
-
-  FR_ACTIVE=1;frShow();frSet(T('fr_stage_names'),0,2,0);
-
-  $('frpb').textContent=T('fr_bar_pause');
-
-  try{const s0=await(await fetch('/api/firstrun',{method:'POST',headers:{'Content-Type':'application/json'},
-
-    body:'{}'})).json();
-
-    if(s0&&s0.ok===false){frSet(smsg(s0),0,0,0);return}}
-
-  catch(e){frSet(T('net_fail'),0,0,0);return}
-
-  clearInterval(FR_TID);
-
-  FR_TID=setInterval(async()=>{
-
-    let d;try{d=await(await fetch('/api/firstrun')).json()}catch(e){return}
-
-    let st={};try{st=await(await fetch('/api/status')).json()}catch(e){}
-
-    const pct=st&&st.total>0?Math.round(st.done/st.total*100):(d.stage==='names'?8:30);
-
-    const mins=d.eta>0?Math.ceil(d.eta/60):0;
-
-    let line=d.msg||T('fr_busy');
-
-    if(mins>0)line+=' · '+F(T('fr_bar_eta'),{m:mins});
-
-    frSet(line,d.files||0,pct,d.state==='done');
-
-    // 文件名一进库就先把「最近的文件」摆出来：用户在等的时候能看见东西，
-
-    // 也知道这个软件确实在工作，而不是一片空白。
-
-    if(!FR_SHOWN&&(d.files||0)>0&&!qEl.value.trim()){
-
-      FR_SHOWN=1;try{goHome()}catch(e){}
-
-      // 欢迎页不要等到「全盘 + 正文都补完」才弹：那时可能已经几分钟过去了。
-
-      // 文件名一入库（通常十几秒）就让人知道怎么用。
-
-      setTimeout(()=>{try{maybeWelcome(1)}catch(e){}},900);
-
-      setTimeout(()=>{try{toast(T('fr_hint_ctrl'))}catch(e){}},2000);
-
-    }
-
-    if(d.state==='done'){clearInterval(FR_TID);FR_ACTIVE=0;
-
-      frSet(F(T('fr_bar_done'),{n:Number(d.files||0).toLocaleString()}),d.files,pct,1);
-
-      try{fetch('/api/stats').then(r=>r.json()).then(s=>{const el=$('fmid');if(!el||!s)return;el.innerHTML=T('footer_mid').replace('__FILES__',Number(s.files||0).toLocaleString()).replace('__TOTAL__',Number(s.docs||0).toLocaleString())}).catch(function(){})}catch(e){}
-
-      // 扫完了要让人看见「扫到了什么」，不是停在一片空白上
-
-      setTimeout(()=>{try{goHome()}catch(e){}},300);
-
-      // 第一面欢迎页应该在「装好、扫好」之后自动出现，而不是藏在帮助里
-
-      if(!FR_SHOWN){setTimeout(()=>{try{maybeWelcome(1)}catch(e){}},1100);
-
-        setTimeout(()=>{try{toast(T('fr_hint_ctrl'))}catch(e){}},2200);}
-
-      setTimeout(()=>frHide(),8000);
-
-      setTimeout(()=>watchBg(),12000);}
-
-    else if(d.state==='error'){clearInterval(FR_TID);FR_ACTIVE=0;
-
-      frSet(T('fr_fail')+(d.msg||''),d.files,0,0);}
-
-  },1200);
-
-}
-
-async function watchBg(tries){
-
-  tries=tries||0;
-
-  if(tries>40)return;
-
-  let d;try{d=await(await fetch('/api/firstrun')).json()}catch(e){return}
-
-  if(d&&d.bg==='busy'){
-
-    try{const s=await(await fetch('/api/stats')).json();
-
-      if(s)$('fmid')&&($('fmid').textContent=T('footer_mid').replace('__FILES__',Number(s.files||0).toLocaleString())
-
-        .replace('__TOTAL__',Number(s.docs||0).toLocaleString())+' · '+F(T('bg_reading'),{n:Number(s.docs||0).toLocaleString()}));
-
-    }catch(e){}
-
-    setTimeout(()=>watchBg(tries+1),15000);return}
-
-  if(d&&d.bg==='done'){
-
-    try{const s=await(await fetch('/api/stats')).json();
-
-      const el=$('fmid');
-
-      if(el&&s)el.innerHTML=T('footer_mid').replace('__FILES__',Number(s.files||0).toLocaleString())
-
-        .replace('__TOTAL__',Number(s.docs||0).toLocaleString());
-
-      if(s)toast(F(T('bg_done'),{n:Number(s.files||0).toLocaleString()}));
-
-    }catch(e){}
-
-    try{goHome()}catch(e){}
-
-  }
-
-}
-
-async function firstRunSkip(){
-
-  try{await fetch('/api/firstrun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cancel:1})})}catch(e){}
-
-  clearInterval(tid);$('pw').style.display='none';
-
-  const t=$('frtip');if(t)t.textContent=T('fr_skipped');
-
-}
-
-async function smartScan(b){b.disabled=1;$('pw').style.display='';$('pi').style.width='3%';
-
-pm.textContent=T('scan_hint');
-
-try{const r=await(await fetch('/api/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
-
-if(r&&r.ok===false){b.disabled=0;$('pw').style.display='none';pm.textContent=smsg(r);return}}
-
-catch(e){b.disabled=0;$('pw').style.display='none';pm.textContent=T('err_prefix')+T('net_fail');return}
-
-clearInterval(tid);tid=setInterval(async()=>{let d;
-
-try{d=await(await fetch('/api/discover')).json()}catch(e){return}
-
-if(d.state==='busy'){try{const s=await(await fetch('/api/status')).json();
-
-const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):10;$('pi').style.width=pc+'%';
-
-pm.textContent='📂 '+(smsg(s)||T('ph_discover'));}catch(e){}}
-
-else{clearInterval(tid);b.disabled=0;$('pw').style.display='none';
-
-if(d.state==='ready')renderCand(d.groups);
-
-else pm.textContent=T('scan_fail')+d.err}},1000)}
-
-function renderCand(gs){CAND=gs;cfg.classList.add('on');
-
-const total=gs.reduce((a,g)=>a+g.docs,0);
-
-$('cand').innerHTML='<div class=pmsg>'+F(T('cand_msg'),{n:total,g:gs.length})+'</div>'+
-
-gs.map((g,i)=>'<label class=crow><input type=checkbox '+(g.noise?'':'checked')+' onchange=candPick('+i+',this.checked)><span>'+esc(g.dir)+'</span>'+(g.noise?'<nz>'+esc(T('noise'))+'</nz>':'')+'<span class=n>'+g.docs+'</span></label>').join('')
-
-+'<div class=pmsg>'+esc(T('cand_tail'))+'</div>'
-
-+'<div class=prow style="margin-top:8px"><button class="pbtn" onclick=candGo(this)>'+esc(T('cand_go'))+'</button></div>';
-
-DIRS=gs.filter(g=>!g.noise).map(g=>g.dir);draw();
-
-pm.textContent=T('cand_done')}
-
-function renderRepairAsk(a){cfg.classList.add('on');
-
-$('cand').innerHTML='<div class=pmsg>'+esc(F(T('repair_ask'),{p:a.old}))+'</div>'+
-
-a.items.map((it,i)=>'<label class=crow onclick=repairPick('+i+')><span>'+esc(it.path)+'</span><span class=n>'+it.hits+'/'+it.n+'</span></label>').join('')+
-
-'<div class=pmsg><a href="javascript:repairNone()">'+esc(T('repair_none'))+'</a> · '+esc(T('repair_ask_tail'))+'</div>'}
-
-async function repairPick(i){try{const r=await(await fetch('/api/repair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({i:i})})).json();
-
-if(!r.ok){toast(r.err||T('save_fail'));return}
-
-$('cand').innerHTML='';pm.textContent=T('repair_done');
-
-fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(e=>{});
-
-}catch(e){toast(T('save_fail'))}}
-
-async function repairNone(){try{await fetch('/api/repair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dismiss:true})})}catch(e){}
-
-$('cand').innerHTML='';pm.textContent=T('err_prefix')+T('repair_ask_tail')}
-
-function candGo(b){CFG_DIRTY=false;hideCfg();upd(b)}
-
-function candPick(i,on){const d=CAND[i].dir;
-
-if(on){if(!DIRS.includes(d))DIRS.push(d)}else{DIRS=DIRS.filter(x=>x!==d)}CFG_DIRTY=true;draw()}
-
-async function loadNames(){try{const d=await(await fetch('/api/names')).json();
-
-const el=$('nstat');if(!el)return;
-
-el.innerHTML=d.count>0?F(T('nstat_on'),{n:d.count.toLocaleString()}):esc(T('nstat_off'));
-
-}catch(e){}}
-
-async function buildNames(b){if(b)b.disabled=1;$('pw').style.display='';$('pi').style.width='3%';
-
-pm.textContent=T('m_names');
-
-try{const r=await(await fetch('/api/names',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
-
-if(!r.ok){pm.textContent=T(r.k)||r.err||'';if(b)b.disabled=0;$('pw').style.display='none';return}}
-
-catch(e){pm.textContent=String(e);if(b)b.disabled=0;$('pw').style.display='none';return}
-
-clearInterval(tid);tid=setInterval(async()=>{let d;
-
-try{d=await(await fetch('/api/names')).json()}catch(e){return}
-
-if(d.state==='busy'){try{const s=await(await fetch('/api/status')).json();
-
-const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):10;$('pi').style.width=pc+'%';
-
-pm.textContent='🗂 '+(smsg(s)||T('m_names'));}catch(e){}}
-
-else{clearInterval(tid);if(b)b.disabled=0;$('pi').style.width='100%';
-
-pm.textContent=d.state==='done'?F(T('m_names_done'),{n:d.n}):((T(d.k)||'')+' '+(d.err||''));
-
-loadNames();setTimeout(()=>location.reload(),1500)}},1000)}
-
-async function selfTest(b){b.disabled=1;$('pw').style.display='';$('pi').style.width='5%';
-
-pm.textContent=T('test_hint');
-
-try{const r=await(await fetch('/api/selftest',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
-
-if(r&&r.ok===false){b.disabled=0;$('pw').style.display='none';pm.textContent=smsg(r);return}}catch(e){b.disabled=0;$('pw').style.display='none';pm.textContent=T('err_prefix')+T('net_fail');return}
-
-clearInterval(tid);tid=setInterval(async()=>{let s;
-
-try{s=await(await fetch('/api/selftest')).json()}catch(e){return}
-
-if(s.state==='busy'){$('pi').style.width='60%';pm.textContent=smsg(s)||T('test_busy')}
-
-else{clearInterval(tid);b.disabled=0;$('pw').style.display='none';
-
-pm.textContent=(s.ok?T('test_ok'):T('test_bad'))+(smsg(s)||'')+T('test_report')}},1500)}
-
-async function saveUpd(b){if(!DIRS.length){pm.textContent=T('save_need');return}
-
-b.disabled=1;pm.textContent=T('saving');
-
-let r;
-
-try{r=await(await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
-
-body:JSON.stringify({include_dirs:DIRS,exclude_dirs:EXC})})).json();
-
-}catch(e){b.disabled=0;pm.textContent=T('err_prefix')+T('net_fail');return}
-
-if(!r.ok){pm.textContent=r.k?T(r.k):(r.err||T('save_fail'));b.disabled=0;return}
-
-CFG_DIRTY=false;upd(null)}
-
-async function upd(b){if(!DIRS.length){pm.textContent=T('upd_need');return}
-
-if(b)b.disabled=1;$('savebtn').disabled=1;$('updonly').disabled=1;$('smartbtn').disabled=1;
-
-$('pw').style.display='';$('pi').style.width='2%';pm.textContent=T('started');
-
-/* 以前这里 await fetch 没兜底：请求一失败（服务刚重启/端口变了），按钮就永远灰着，
-
-   恢复代码只写在 poll 里，而 poll 根本没被启动。失败时当场把按钮还回去。 */
-
-try{const r=await(await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targets:DIRS})})).json();
-
-  if(r&&r.ok===false){btnBack();$('pw').style.display='none';$('pi').style.width='0';pm.textContent=smsg(r);return}
-
-}catch(e){btnBack();$('pw').style.display='none';pm.textContent=T('err_prefix')+T('net_fail');return}
-
-poll()}
-
-function smsg(o){if(!o)return'';
-
-if(o.k&&DICT[LANG][o.k]!==undefined)return F(T(o.k),o.a||{});
-
-return o.msg||o.err||''}
-
-function renderProg(s){
-
-if(s.state!=='busy')return;
-
-if(s.phase==='discover'&&!s.total){$('pi').classList.add('indet');pm.textContent='🧠 '+smsg(s);return}
-
-$('pi').classList.remove('indet');
-
-const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):8;
-
-$('pi').style.width=pc+'%';
-
-const ph=T('ph_'+s.phase)||T('ph_working');
-
-pm.textContent=F(T('prog'),{ph:ph,d:s.done,t:(s.total||'?'),ok:s.ok,f:s.fail})+(smsg(s)?' · '+smsg(s):'')}
-
-let POLLF=0;
-
-function btnBack(){$('savebtn').disabled=0;$('updonly').disabled=0;$('smartbtn').disabled=0;$('gear').style.display=''}
-
-function poll(){clearInterval(tid);POLLF=0;tid=setInterval(async()=>{let s;
-
-try{s=await(await fetch('/api/status')).json();POLLF=0}
-
-catch(e){/* 服务没了就别刷了：连挂 8 次把按钮还回去，告诉用户联系不上后台 */
-
-if(++POLLF>=8){clearInterval(tid);btnBack();$('pw').style.display='none';pm.textContent=T('err_prefix')+T('net_fail')}
-
-return}
-
-PROG_CACHE=s;
-
-if(s.state==='busy'){s.phase&&DICT[LANG]['ph_'+s.phase]?renderProg(s):(()=>{const pc=s.total>0?Math.min(100,Math.round(s.done/s.total*100)):8;
-
-$('pi').style.width=pc+'%';pm.textContent=T('ph_working')+(smsg(s)?' · '+smsg(s):'')})()}
-
-else{clearInterval(tid);btnBack();
-
-if(s.state==='done'){$('pi').style.width='100%';pm.textContent=F(T('done_reload'),{m:smsg(s)||T('m_update_done')});
-
-// 第一次用：更新只建了「文档正文」，60 万个文件名的索引还得再点一次 🗂（藏在折叠区）。
-
-// 与其指望新人自己找到，不如直接接着建。
-
-if(s.need_names&&!window.__namesAuto){window.__namesAuto=1;pm.textContent=T('m_names_auto');setTimeout(()=>buildNames(null),400);return}
-
-setTimeout(()=>location.reload(),2500)}
-
-else if(s.state==='error'){$('pw').style.display='none';if(s.ask&&s.ask.state==='wait'){renderRepairAsk(s.ask)}pm.textContent=(s.paused?T('paused_prefix'):T('err_prefix'))+(smsg(s)||'')}}},800)}
-
-cfgLoad();applyLang();setTimeout(()=>{try{applyTheme(THEME||'auto')}catch(e){}},300);
-
-/* 托盘里点「设置/关于/使用帮助」时，主窗口可能是刚加载的，面板名走 URL 参数传进来 */
-
-(function(){try{var m=/[?&]panel=([a-z]+)/.exec(location.search);if(!m)return;var n=m[1];setTimeout(function(){showPanel(n)},400);history.replaceState(null,'',location.pathname+(location.hash||''))}catch(e){}})();
-
-// ?q=关键词 直接出结果：方便收藏常用搜索，或从命令行直接打开结果页
-
-const Q0=(new URLSearchParams(location.search)).get('q');
-
-if(Q0){qEl.value=Q0;go()}
-
-else{goHome()}
-
-// ?cfg=1 打开即展开设置面板：供 --settings 启动参数、书签直达、截图
-
-try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
-
-</script></body></html>'''
 
     import os
 
@@ -19096,7 +22817,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
 
 
-    def _subs(html, total=None, nfiles=None):
+    def _subs(html, total=None, nfiles=None, lang=None):
 
         """统一替换模板里的版本 / 索引量 / 运行环境等占位符。
 
@@ -19130,7 +22851,61 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     nfiles = _SUB_CACHE['files']
 
-        return (html.replace('__VER__', APP_VERSION)
+        # 第 233 项：正文搜索是设置项（默认开），快搜窗的 BODY_ON 从这里取。
+        # 直接读 settings.json 而不进 _SUB_CACHE：改完设置要立刻生效。
+        _bs = _settings_read().get('body_search', True)
+        # 第 275 项：空状态紧凑显示（默认关 = 原来的两排大行）。同理直接读 settings，
+        # 改完下次开窗就生效。
+        _hc = bool(_settings_read().get('qs_home_compact', False))
+        try:
+            _hn = int(_settings_read().get('qs_home_count', 4) or 4)
+        except Exception:
+            _hn = 4
+        _hn = max(1, min(10, _hn))      # 第 275 项：条数 1..10，越界夹紧
+        _hs = bool(_settings_read().get('qs_home_show', True))   # 第 275 项：整块显不显示
+        # 第 280 项：悬停说明跟界面语言走（三个图标 + 立即翻译按钮 + 两条点击提示）。
+        # lang 由调用方给：/mini?lang=en 必须跟着 URL 走，不能只看 settings。
+        _tp = _mini_tips(lang)
+        # 第 281 项：快搜窗面板正文（截图识字 / 翻译 / 剪贴板 / 首屏）的文案也跟语言走。
+        # 用一张独立表 MINI_UI，占位符 __U_<key>__ 在这里一次性替换。
+        _ml = str(lang or _mini_tip_lang()).strip().lower()
+        _ml = {'zh': 'zh-CN', 'zh-cn': 'zh-CN', 'zh_cn': 'zh-CN', 'cn': 'zh-CN'}.get(_ml, _ml)
+        if _ml not in MINI_UI:
+            _ml = 'zh-CN'
+        _ui = MINI_UI.get(_ml) or MINI_UI['zh-CN']
+        for _k, _v in _ui.items():
+            html = html.replace('__U_%s__' % _k, str(_v))
+        return (html.replace('__TIP_SNIP__', _tp['snip'])
+                    .replace('__TIP_CLIP__', _tp['clip'])
+                    .replace('__TIP_TRANS__', _tp['trans'])
+                    .replace('__TIP_RUN__', _tp['run'])
+                    .replace('__TIP_COPY_ITEM__', _tp['copy_item'])
+                    .replace('__TIP_COPY_TEXT__', _tp['copy_text'])
+                    .replace('__TIP_CB_TITLE__', _tp['cb_title'])
+                    .replace('__TIP_CB_ALL__', _tp['cb_all'])
+                    .replace('__TIP_CB_FAV__', _tp['cb_fav'])
+                    .replace('__TIP_CB_TEXT__', _tp['cb_text'])
+                    .replace('__TIP_CB_IMAGE__', _tp['cb_image'])
+                    .replace('__TIP_CB_FILE__', _tp['cb_file'])
+                    .replace('__TIP_CB_CLEAR__', _tp['cb_clear'])
+                    .replace('__TIP_CB_CLEAR_TITLE__', _tp['cb_clear_title'])
+                    .replace('__TIP_CB_CLOSE__', _tp['cb_close'])
+                    .replace('__TIP_CB_EMPTY__', _tp['cb_empty'])
+                    .replace('__TIP_CB_EMPTY_FAV__', _tp['cb_empty_fav'])
+                    .replace('__TIP_CB_LOAD_FAIL__', _tp['cb_load_fail'])
+                    .replace('__TIP_CB_PIN_ADD__', _tp['cb_pin_add'])
+                    .replace('__TIP_CB_PIN_DEL__', _tp['cb_pin_del'])
+                    .replace('__TIP_CB_DEL__', _tp['cb_del'])
+                    .replace('__TIP_CB_BADGE_FILE__', _tp['cb_badge_file'])
+                    .replace('__TIP_CB_BADGE_TEXT__', _tp['cb_badge_text'])
+                    .replace('__TIP_CB_COPIED__', _tp['cb_copied'])
+                    .replace('__TIP_CB_COPY_FAIL__', _tp['cb_copy_fail'])
+                    .replace('__TIP_TRANS_TARGET__', _tp['trans_target'])
+                    .replace('__HOME_SHOW__', 'true' if _hs else 'false')
+                    .replace('__HOME_COUNT__', str(_hn))
+                    .replace('__HOME_COMPACT__', 'true' if _hc else 'false')
+                    .replace('__BODYSEARCH__', '1' if _bs else '0')
+                    .replace('__VER__', APP_VERSION)
 
                     .replace('__FILES__', f'{nfiles:,}')
 
@@ -19284,6 +23059,19 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
         def do_GET(self):
 
+            # 第 277 项：handle_error 里拿不到 handler 对象，这里留一条「最后处理的
+            # 路径」给 QuietServer 兜底用（多线程下可能错位，只作线索、不当事实）。
+            # 查询串必须砍掉：/api/translate 的 q 就是用户原文。
+            try:
+                self.server._last_path = self.path.split('?')[0][:80]
+            except Exception:
+                pass
+
+            # 第 326 项：用户活动时间戳（空闲时后台才敢做 FTS 压缩 / VACUUM）。
+            # 第 366 项：前端定时轮询的只读接口不算活动，否则空闲判断永远不会成立。
+            if not _is_heartbeat(self.path):
+                _touch_activity()
+
             try:
 
                 self._do_GET()
@@ -19332,6 +23120,95 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/snip/result'):
+                import snip_ocr
+                res = snip_ocr.get_snip_result()
+                body = json.dumps(res, ensure_ascii=False).encode('utf-8')
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/snip/thumb'):
+                import snip_ocr
+                tb = snip_ocr.get_snip_thumb_bytes()
+                body = tb or b''
+                ctype = 'image/png' if tb else 'text/plain'
+
+            elif self.path.startswith('/api/snip/test_capture'):
+                import snip_ocr
+                data = snip_ocr.test_screen_capture()
+                body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/snip/clipboard_img'):
+                import snip_ocr
+                info = snip_ocr.read_clipboard_image()
+                body = json.dumps(info, ensure_ascii=False).encode('utf-8')
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/clipboard/thumb/'):
+                from urllib.parse import unquote
+                fn = unquote(self.path[len('/api/clipboard/thumb/'):].split('?')[0])
+                import clipboard_mgr
+                d = clipboard_mgr.get_thumb_dir()
+                p = d / fn
+                if p.is_file() and p.resolve().is_relative_to(d.resolve()):
+                    body = p.read_bytes()
+                    ctype = 'image/png'
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+            elif self.path.startswith('/api/clipboard'):
+                qs = parse_qs(urlparse(self.path).query)
+                kind = qs.get('kind', ['all'])[0]
+                q = qs.get('q', [''])[0]
+                limit = int(qs.get('limit', ['60'])[0])
+                offset = int(qs.get('offset', ['0'])[0])
+                import clipboard_mgr
+                # 第 281 项：条目里的「41 字符 / 3 个项目 / 5 分钟前」原来在库里写死中文，
+                # 现在按界面语言在读的时候拼（老数据不用迁移）。
+                rows = clipboard_mgr.list_history(kind=kind, q=q, limit=limit, offset=offset,
+                                                  lang=_mini_tip_lang())
+                body = json.dumps({'ok': True, 'items': rows}, ensure_ascii=False).encode('utf-8')
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.split('?')[0] == '/api/byok':
+                # 第 274 项：自带密钥状态。**只回掩码和"配好了没"** ——
+                # 密钥本身永远不下发给前端、不写日志，用户填完就只有 settings.json 里那一份。
+                import translator
+                cfg = translator.byok_cfg()
+                ready = translator.byok_ready(cfg)
+                masked = {}
+                for pid in translator.BYOK_IDS:
+                    item = cfg.get(pid) or {}
+                    masked[pid] = {
+                        'key': translator.mask_secret(item.get('key')),
+                        'model': item.get('model') or '',
+                        'appid': item.get('appid') or '',
+                        'secret': translator.mask_secret(item.get('secret')),
+                    }
+                body = json.dumps({
+                    'ok': True,
+                    'ready': ready,
+                    'masked': masked,
+                    'specs': [{'id': pid, 'name': translator.BYOK_SPECS[pid]['name'],
+                               'note': translator.BYOK_SPECS[pid]['note'],
+                               'required': list(translator.BYOK_REQUIRED[pid])}
+                              for pid in translator.BYOK_IDS],
+                }, ensure_ascii=False).encode('utf-8')
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/translate'):
+                qs = parse_qs(urlparse(self.path).query)
+                text = (qs.get('text', [''])[0] or qs.get('q', [''])[0] or '').strip()
+                sl = (qs.get('from', ['auto'])[0] or qs.get('src_lang', ['auto'])[0] or 'auto').strip()
+                tl = (qs.get('to', ['auto'])[0] or qs.get('target_lang', ['auto'])[0] or qs.get('tgt_lang', ['auto'])[0] or 'auto').strip()
+                # 第 273 项：同上，tl='auto' 不再被 settings.trans_target_lang 顶替
+                import translator
+                res = translator.translate_text(text, src_lang=sl, tgt_lang=tl)
+                body = json.dumps(res, ensure_ascii=False).encode('utf-8')
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/peek'):
 
                 # 详情面板「读一段正文」：一次只读一篇，按 path 缓存 5 分钟
@@ -19341,6 +23218,16 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 pth = (qs.get('p', [''])[0] or '').strip()
 
                 kw = (qs.get('q', [''])[0] or '').strip()
+
+                # 第 332 项：pg>0 = 按块分期看正文（Word/Excel/PPT 没有分页图，
+                # 详情灯箱里 ← → 要能一页页往下读，读到底才换文件）。
+                try:
+
+                    pg = int((qs.get('pg', ['0'])[0] or '0'))
+
+                except ValueError:
+
+                    pg = 0
 
                 d = {'ok': False, 'why': 'bad_path'}
 
@@ -19352,9 +23239,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         try:
 
-                            with con_lock:
+                            with ro_db('/api/peek:check') as rc:
 
-                                okrow = bool(conn().execute(
+                                okrow = bool(rc.execute(
 
                                     'SELECT 1 FROM meta WHERE path=? LIMIT 1', (pth,)).fetchone())
 
@@ -19372,9 +23259,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         try:
 
-                            with con_lock:
+                            with ro_db('/api/peek') as rc:
 
-                                d = peek_body(conn(), pth, kw)
+                                d = peek_body(rc, pth, kw, page=pg)
 
                         except sqlite3.Error as e:
 
@@ -19412,6 +23299,30 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/metrics'):
+
+                # 第 277 项：本机功能计数（调用数 / 失败率 / p95 / 最近错误摘要）。
+                # 只读、只在本机；不含文本、路径、搜索词。
+                try:
+
+                    body = json.dumps(metrics.snapshot() if metrics else {'ok': False, 'msg': '指标模块未加载'},
+
+                                      ensure_ascii=False).encode()
+
+                except Exception as _e:
+
+                    body = json.dumps({'ok': False, 'msg': repr(_e)}, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/locale'):
+
+                # 第 308 项：日期 / 时间格式跟随 Windows 区域设置。
+                # 只回格式串，不回任何用户数据；90 秒内重复请求也只是一次 ctypes 调用。
+                body = json.dumps(sys_locale_info(), ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/env'):
 
                 # 环境自检：用户报「打不开 / 窗口不对」时，让他点一下这里，把结论发过来，
@@ -19424,6 +23335,10 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 _force = 'force=1' in self.path
 
+                # 第 277 项：深度体检（deep=1）会真的去连翻译引擎、加载 OCR 模型、
+                # 对更新通道发 HEAD —— 只在用户点「深度体检」时跑，结果也不进缓存。
+                _deep = 'deep=1' in self.path
+
 
 
                 # 体检文案要跟界面语言走（第 174/176 项）：
@@ -19435,7 +23350,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 _lang = ((_qs.get('lang') or ['zh'])[0] or 'zh')[:8]
 
-                if (not _force and _ENV_CACHE.get('t')
+                if (not _force and not _deep and _ENV_CACHE.get('t')
 
                         and _ENV_CACHE.get('lang') == _lang
 
@@ -19449,13 +23364,16 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         import env_check
 
-                        _inf = env_check.probe_all(data_dir=str(app_dir()), db_path=str(DB))
+                        _inf = env_check.probe_all(data_dir=str(app_dir()), db_path=str(DB),
+                                                   light=not _deep, deep=_deep)
 
                         _iss = env_check.judge(_inf, _lang)
 
                         body = json.dumps({'ok': True, 'info': _inf, 'issues': _iss,
 
                                            'plan': env_check.plan(_inf),
+
+                                           'metrics': metrics.failing(3) if metrics else [],
 
                                            'text': env_check.render(_inf, _iss, lang=_lang)},
 
@@ -19471,7 +23389,32 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                                           ensure_ascii=False).encode()
 
-                    _ENV_CACHE = {'t': _now, 'lang': _lang, 'body': body}
+                    _ENV_CACHE = {'t': _now, 'lang': _lang, 'body': body} if not _deep else _ENV_CACHE
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/index/verify'):
+
+                # 第 281 项：查全库校验状态（GET）。体检只读结论，不跑校验。
+                try:
+
+                    import env_check as _ecv
+
+                    out = {'ok': True,
+
+                           'running': bool(_VERIFY_RUN.get('running')),
+
+                           'started_s': int(time.time() - _VERIFY_RUN['started'])
+
+                           if _VERIFY_RUN.get('running') else 0,
+
+                           'last': _ecv.read_verify_state(str(app_dir()))}
+
+                except Exception as _e:
+
+                    out = {'ok': False, 'msg': repr(_e)}
+
+                body = json.dumps(out, ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -19761,6 +23704,63 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 return
 
+            elif self.path.startswith('/api/index/health'):
+
+                # 第 308 项：索引「有没有东西」这件事要能被界面问一句。
+                # 只读：文件数 / 正文数 / 索引范围条数 / 失联暂停的文件夹 /
+                # 全盘文件名索引状态。前端用它决定要不要弹「索引是空的」横幅。
+                try:
+
+                    with con_lock:
+
+                        nf = _count_files(conn())
+
+                        nd = _count_docs(conn())
+
+                except sqlite3.Error:
+
+                    nf, nd = 0, 0
+
+                sc = _scope_conf()
+
+                inc = [str(x) for x in (sc.get('include_dirs') or []) if str(x).strip()]
+
+                try:
+
+                    paused = int((_index_failures(30).get('total') or 0))
+
+                except Exception:
+
+                    paused = 0
+
+                body = json.dumps({'ok': True, 'files': nf, 'docs': nd,
+
+                                   'scope': len(inc), 'includes': inc[:10],
+
+                                   'paused': paused, 'names': NAMES.get('state'),
+
+                                   'zero': nf == 0,
+
+                                   'no_text': nd == 0},
+
+                                  ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/compact'):
+
+                # 第 366 项：整理索引库的进度（手动入口与后台空闲迁移共用）。
+                # 这个接口是只读心跳，不算用户活动（见 _is_heartbeat）。
+                snap = dict(COMPACT)
+
+                snap['db_mb'] = round(_db_mb(), 1)
+
+                body = json.dumps(snap, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
             elif self.path.startswith('/api/stats'):
 
                 # 共享连接必须整段加锁：多线程同时 execute/fetchone 会互相踩游标，
@@ -19775,13 +23775,21 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 if now - _SUB_CACHE.get('t', 0.0) > 30 or 'files' not in _SUB_CACHE:
 
-                    with con_lock:
+                    # 第 320 项：统计只是页脚数字，等锁等不到就先用旧值回话，
+                    # 别为了两行计数把整个窗卡住。
+                    try:
 
-                        _SUB_CACHE['docs'] = _count_docs(conn())
+                        with ro_db('/api/stats') as rc:
 
-                        _SUB_CACHE['files'] = _count_files(conn())
+                            _SUB_CACHE['docs'] = _count_docs(rc)
 
-                        _SUB_CACHE['t'] = now
+                            _SUB_CACHE['files'] = _count_files(rc)
+
+                            _SUB_CACHE['t'] = now
+
+                    except LockBusy:
+
+                        pass
 
                 body = json.dumps({'ok': True, 'files': _SUB_CACHE.get('files', 0),
 
@@ -19800,6 +23808,8 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 d = _settings_read()
 
                 d.setdefault('hotkey', True)
+                d.setdefault('hotkey_mode', 'double_ctrl')
+                d.setdefault('floating_ball', False)
 
                 d.setdefault('theme', 'auto')
 
@@ -19813,7 +23823,130 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 d.setdefault('compat', False)
 
+                # 第 197 项：两个「自动冒出来」的开关，默认都开（Listary 那种手感），
+                # 嫌烦的用户可以在设置里关掉，不用改配置文件。
+                d.setdefault('auto_popup', True)
+
+                d.setdefault('type_search', True)
+
+                # 第 245 项：弹窗样式定稿只剩方案1（rich，带正文片段的卡片）。
+                # 老 settings.json 里可能还留着 'tbl'（方案2 紧凑表），这里强制归一：
+                # 界面已经没有切换入口，不能让旧配置从后门把下线样式带回来。
+                d['qs_style'] = 'rich'
+                # 第 233 项：正文搜索默认开（这是与 Listary 的主要差异之一）。
+                # 用户不想让正文占结果时在设置 → 快搜窗里关掉。
+                d.setdefault('body_search', True)
+                # 第 275 项：快搜窗空状态「最近打开」是否紧凑显示，默认关（原样两排）。
+                d.setdefault('qs_home_compact', False)
+                d.setdefault('qs_home_show', True)      # 第 275 项：最近记录整块，默认显示
+                # 第 307 项：在资源管理器里点一下，开着的文件对话框跟过去。
+                # 默认开 —— 用户提这个需求就是希望「不用再去找」；嫌它爱管闲事
+                # 可以在设置 → 文件搜索里关掉。
+                d.setdefault('blank_jump', True)
+                # 第 327 项：左栏三块开关。第 337 项起「文件夹分组」默认**关** ——
+                # 用户原话「这一堆我感觉没啥用」，那 6 个顶层目录对日常搜索没帮助，
+                # 要的就到设置 → 左栏 里自己打开（true 才显示）。
+                d.setdefault('sb_types', True)
+                d.setdefault('sb_folders', False)
+                d.setdefault('sb_time', True)
+                # 第 338 项：左栏类型后面那列数字（全部 109763 / 图片 22842…）默认**关**。
+                d.setdefault('sb_counts', False)
+                # 第 275 项：空状态列几条（默认 4，1..10）。
+                try:
+                    d['qs_home_count'] = max(1, min(10, int(d.get('qs_home_count', 4) or 4)))
+                except Exception:
+                    d['qs_home_count'] = 4
+                d.setdefault('web_search', DEFAULT_WEB_SEARCH)
+                # 第 270 项：全删光的情况也要自洽 —— 用户把整表删空后 settings 里
+                # 只剩一个 []，而快搜侧 web_search_items() 遇到空表本来就会回落到
+                # 出厂默认（两边打架：界面一张白表、快搜仍能按 g/b 搜）。这里让
+                # 界面也显示出厂默认，用户随手一存就把这套落盘了。
+                if not d.get('web_search'):
+                    d['web_search'] = [dict(x) for x in DEFAULT_WEB_SEARCH]
+                # 第 310 项：老配置里只有那 7 条，且顺序还是老顺序。这里把存的表
+                # 和新默认合一遍（老配置按「国内 → 国外」重排并补上抖音/小红书/TikTok，
+                # 改过标题/网址的自定义配置只追加新引擎），界面拿到的就是最终生效的表。
+                try:
+                    d['web_search'] = _web_search_effective(d['web_search'])
+                except Exception:
+                    pass
+                # 第 270 项：把出厂默认引擎一起下发。用户删掉一条（比如那个
+                # 「Bing」）之后，之前只能自己点「添加引擎」再手打 key / 标题 /
+                # 网址模板才能补回来 —— 普通用户根本不会这么干，删了就永久少一个。
+                # 前端拿这份表做「恢复默认引擎」，只补被删掉的那些，用户的
+                # 自定义条目和改过的标题一律不动。
+                d['web_search_defaults'] = [dict(x) for x in DEFAULT_WEB_SEARCH]
+                # 第 299 项：网络代理三种模式（默认跟随系统代理，和以前 trans_proxy=auto 一致）。
+                # proxy_now 是"现在实际用的那个"，供设置页原样显示 —— 用户说"我明明开了代理"时，
+                # 界面能直接告诉他程序到底认到了什么。
+                d.setdefault('proxy_mode', 'system')
+                d.setdefault('proxy_host', netproxy.DEFAULT_HOST)
+                d.setdefault('proxy_port', netproxy.DEFAULT_PORT)
+                try:
+                    d['proxy_now'] = netproxy.describe()
+                except Exception:
+                    d['proxy_now'] = {'mode': d.get('proxy_mode'), 'url': '', 'system': ''}
+                d.setdefault('trans_target_lang', 'auto')
+                d.setdefault('trans_live', True)
+                # 第 268 项：聚合翻译可逐引擎开关。默认全开（老行为不变），
+                # 用户嫌慢就在设置页关掉几个 —— 每次翻译只打勾上的那几条。
+                try:
+                    import translator as _tr
+                    # 第 346 项（B）：第一次读到老配置时收敛成默认前四个，并落盘一次；
+                    # 打过标记之后再也不会动用户的勾选。
+                    _mig, _changed = _tr.migrate_346(d)
+                    if _changed:
+                        _patch = {'trans_engines': _mig.get('trans_engines'),
+                                  'trans_engines_346': True,
+                                  'trans_engines_ver': _tr.ENGINE_VER}
+                        try:
+                            _settings_update(_patch)
+                        except Exception:
+                            pass
+                        d.update(_patch)
+                    # 第 295 项：把"后来新增、用户从没见过"的引擎补进清单，
+                    # 否则老配置里只有 4 家，新引擎永远进不来（设置页列着也不生效）。
+                    d['trans_engines'] = _tr.active_engines(d)
+                    d['trans_engines_ver'] = _tr.ENGINE_VER
+                except Exception:
+                    d.setdefault('trans_engines', list(_tr.DEFAULT_ENGINES))
+                # 第 273 项：「自动」= 译成界面语言。界面文字和界面语言都从后端算，
+                # 免得快搜窗（Python 模板）和设置页（React）各写一套、说得不一样。
+                try:
+                    import translator as _tr2
+                    d['ui_lang'] = _tr2.ui_lang()
+                    d['trans_auto_label'] = _tr2.auto_label(d['ui_lang'])
+                    d['trans_auto_target'] = _tr2.auto_target('en', d['ui_lang'])
+                    # 第 274 项：哪几家自带密钥已经配好（只回布尔，不回密钥）
+                    d['trans_byok_ready'] = _tr2.byok_ready()
+                except Exception:
+                    d.setdefault('ui_lang', 'zh-CN')
+                    d.setdefault('trans_auto_label', '自动（译成中文）')
+
                 body = json.dumps(d, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.split('?')[0] == '/api/proxy':
+                # 第 299 项：设置页「网络代理」打开时读一次：模式、实际代理、检测到的系统代理
+                try:
+                    d = netproxy.describe()
+                except Exception as e:
+                    d = {'mode': 'system', 'url': '', 'system': '', 'err': repr(e)[:80]}
+                body = json.dumps(d, ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/open_dirs'):
+
+                body = json.dumps(_api_open_dirs(), ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+
+
+            elif self.path.startswith('/api/dialog_probe'):
+
+                body = json.dumps(quick_switch.probe(), ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -19855,6 +23988,25 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/index_failures'):
+
+                # 第 247 项：meta.reason 里躺着的失败记录，摆到用户面前。
+                lim = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('limit', ['200'])[0]
+                try:
+                    lim = int(lim)
+                except ValueError:
+                    lim = 200
+                body = json.dumps(_index_failures(lim), ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/exclude_test'):
+
+                _p = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('p', [''])[0]
+                body = json.dumps(_exclude_test(_p), ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/names'):
 
                 # 全盘文件名索引的构建进度 + 当前规模
@@ -19877,6 +24029,68 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/facets'):
+
+                # 第 324 项：左栏计数（大类 / 文档子类型 / 顶层文件夹）。跟着当前
+                # 关键词走 —— 计数不跟随，用户就会看到「PDF 25」点进去只有 2 条。
+                qs = parse_qs(urlparse(self.path).query)
+
+                qf = (qs.get('q', [''])[0] or '').strip()
+
+                synf = parse_qsyn(qf)
+
+                try:
+
+                    # 第 327 项：只读连接，不抢 con_lock —— 后台在重扫/瘦身时左栏计数照样秒回
+                    with ro_db('/api/facets') as rc:
+
+                        out = facets(rc, synf)
+
+                except LockBusy:
+
+                    out = {'ok': False, 'busy': True, 'total': 0,
+                           'kinds': [], 'subs': [], 'folders': []}
+
+                except sqlite3.Error:
+
+                    out = {'ok': False, 'total': 0, 'kinds': [], 'subs': [], 'folders': []}
+
+                body = json.dumps(out, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/dirs'):
+
+                # 第 327 项：左栏「文件夹」点进去要有结果（目录在 dirs 表）
+                qs = parse_qs(urlparse(self.path).query)
+
+                dq = (qs.get('q', [''])[0] or '').strip()
+
+                dpf = (qs.get('pf', [''])[0] or '').strip()
+
+                try:
+
+                    dn = max(1, min(400, int(qs.get('n', ['200'])[0])))
+
+                except (TypeError, ValueError):
+
+                    dn = 200
+
+                try:
+
+                    with ro_db('/api/dirs') as rc:
+
+                        ditems = dir_rows(rc, dq, dn, dpf)
+
+                except sqlite3.Error:
+
+                    ditems = []
+
+                body = json.dumps({'ok': True, 'items': ditems, 'n': len(ditems)},
+                                  ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/files'):
 
                 # 详情页第二路：文件名。用 mini_search 统一排序（应用优先 + 前缀优先），
@@ -19891,41 +24105,70 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 q = syn['q']
 
+                # 第 324 项：左栏文件夹子分类 → 目录前缀。走 SQL 收口（mini_search 的 pf），
+                # 而不是先取 200 条再本地过滤 —— 那个目录可能一条都没进候选。
+                pf = (qs.get('pf', [''])[0] or '').strip()
+
                 srt = (qs.get('s', ['rel'])[0] or 'rel').lower()
 
                 items = []
 
                 st = 'off'
 
+                # 第 229 项二轮：空查询（q 为空）不走下面的 try，total 从未赋值
+                # 就进 'more': total > len(items) —— debug.log 实测 UnboundLocalError
+                total = 0
+
                 if q:
 
                     try:
 
-                        with con_lock:
-
-                            c = conn()
+                        # 第 327 项：文件名搜索走只读连接。这条是主界面的主查询，
+                        # 以前它一要排队，整屏就白了。
+                        with ro_db('/api/files') as c:
 
                             # 先用前缀（走 idx_files_name，毫秒级）；只有前缀凑不满一屏
 
                             # 才补一次全表扫。以前每敲一个字都深扫 60 万行 ≈ 270ms。
 
-                            r = mini_search(c, q, limit=20, deep=False, body=False)
+                            if syn['ext'] or syn['size'] != (None, None) or syn['days'] or syn['folder']:
 
-                            items = r.get('items', [])
+                                # 第 229 项五轮：ext/size/dm 语法都会把池子筛得所剩
+                                # 无几，浅搜 20 条里可能一条都不剩（「微信 ext:pdf」
+                                # 实测回空）—— 直接深扫大池子再交给下面的语法筛。
+                                r = mini_search(c, q, limit=200, deep=True, body=False, pf=pf)
 
-                            total = r.get('n', 0)
+                                items = r.get('items', [])
 
-                            if len(items) < 12:
+                                total = r.get('n', 0)
 
-                                r2 = mini_search(c, q, limit=20, deep=True, body=False)
+                            else:
 
-                                if len(r2.get('items', [])) > len(items):
+                                r = mini_search(c, q, limit=20, deep=False, body=False, pf=pf)
 
-                                    items = r2.get('items', [])
+                                items = r.get('items', [])
 
-                                    total = max(total, r2.get('n', 0))
+                                total = r.get('n', 0)
+
+                                if len(items) < 12:
+
+                                    r2 = mini_search(c, q, limit=20, deep=True, body=False, pf=pf)
+
+                                    if len(r2.get('items', [])) > len(items):
+
+                                        items = r2.get('items', [])
+
+                                        total = max(total, r2.get('n', 0))
 
                             st = 'ok' if total > 0 else 'off'
+
+                    except LockBusy:
+
+                        items = []
+
+                        total = 0
+
+                        st = 'busy'
 
                     except sqlite3.Error:
 
@@ -19933,52 +24176,158 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         total = 0
 
-                    for it in items:
+                elif syn['ext'] or syn['size'] != (None, None) or syn['days'] or syn['folder']:
 
-                        it.setdefault('d', os.path.dirname(it.get('p', '')))
+                    # 第 229 项五轮：纯语法筛选统一走 SQL WHERE（ext/size/days）——
+                    # 「size:>2m 搜不到」就是最近 400 条里没有大文件，靠池子后筛
+                    # 根本不可靠（用户 16:1x 实测）。-排除/文件夹/ 这类名字级语法
+                    # 仍由下面的 syn_ok 在结果上收口。
+                    try:
 
-                        it.setdefault('src', 'disk')
+                        with ro_db('/api/files:syn') as rc:
 
-                        # 程序行：中文名（Weixin.exe → 微信）+ app 标记（前端据此不显示路径）
+                            items, total = syntax_only_items(rc, syn, 400)
 
-                        nm = it.get('n') or os.path.basename(it.get('p', ''))
+                        st = 'ok' if total > 0 else 'off'
 
-                        zh = None if it.get('t') == 'dir' else apprank.name_for_exe(nm)
+                    except LockBusy:
 
-                        if zh:
+                        items = []
 
-                            it.setdefault('dn', zh)
+                        total = 0
 
-                        if not it.get('app') and apprank.is_app_file(nm):
+                        st = 'busy'
 
-                            it['app'] = 1
+                    except sqlite3.Error:
 
-                    if syn['ext']:
+                        items = []
 
-                        want = ['.' + e.strip().lstrip('.') for e in syn['ext'].split(',') if e.strip()]
+                        total = 0
 
-                        items = [it for it in items if str(it.get('e') or '').lower() in want]
+                        st = 'off'
+
+                else:
+
+                    # 第 229 项四轮：空关键词（无任何语法）= 「浏览最近文件」——
+                    # 主窗筛选条（全部/文件名）空着打字框点过来时给一屏最近文件
+                    # （ORDER BY mtime 走 idx_files_mtime，毫秒级）；size>/dm: 这类
+                    # 纯语法也落到这里，再由下面的 syn_ok 收口筛选。
+                    try:
+
+                        with ro_db('/api/files:recent') as rc:
+
+                            rows = rc.execute(
+                                'SELECT path,name,ext,mtime,size FROM files '
+                                'ORDER BY mtime DESC LIMIT 400').fetchall()
+
+                        items = [{'n': nm, 'p': p, 't': 'file',
+                                  'e': (ex or '').lower(), 'm': mt,
+                                  's': sz, 'z': sz}
+                                 for (p, nm, ex, mt, sz) in rows]
+
+                        total = len(items)
+
+                        st = 'ok' if items else 'off'
+
+                    except LockBusy:
+
+                        items = []
+
+                        total = 0
+
+                        st = 'busy'
+
+                    except sqlite3.Error:
+
+                        items = []
+
+                        total = 0
+
+                        st = 'off'
+
+                # 第 238 项：`c:xxx` / `内容:xxx` 是「只搜正文」。前端同时打 /api 那一路
+                # 查正文，这里再回一批「文件名里有 xxx」的行，等于把用户明确排除掉的东西
+                # 又塞了回来（更糟的是 q 被剥空时直接变成「浏览最近 400 条」）。
+                if syn['content']:
+
+                    items = []
+
+                    total = 0
+
+                    st = 'off'
+
+                # 后处理对两条路都生效（原来长在 if q: 块里，ext-only 也要走）
+
+                for it in items:
+
+                    it.setdefault('d', os.path.dirname(it.get('p', '')))
+
+                    it.setdefault('src', 'disk')
+
+                    # 程序行：中文名（Weixin.exe → 微信）+ app 标记（前端据此不显示路径）
+
+                    nm = it.get('n') or os.path.basename(it.get('p', ''))
+
+                    zh = None if it.get('t') == 'dir' else apprank.name_for_exe(nm)
+
+                    if zh:
+
+                        it.setdefault('dn', zh)
+
+                    if not it.get('app') and apprank.is_app_file(nm):
+
+                        it['app'] = 1
+
+                if syn['ext']:
+
+                    want = ['.' + e.strip().lstrip('.') for e in syn['ext'].split(',') if e.strip()]
+
+                    items = [it for it in items if str(it.get('e') or '').lower() in want]
+
+                items = [it for it in items
+
+                         if syn_ok(it.get('p'), _sz_of(it), it.get('m'), syn)]
+
+                # 第 324 项：「浏览最近 / 纯语法筛选」这两路没走 mini_search，pf 在这里收口。
+                if pf:
+
+                    _pfl = pf.lower()
 
                     items = [it for it in items
+                             if str(it.get('p') or '').lower().startswith(_pfl)]
 
-                             if syn_ok(it.get('p'), _sz_of(it), it.get('m'), syn)]
+                items = sort_items(items, srt)
 
-                    items = sort_items(items, srt)
+                # 第 323 项：`q` 为空说明走的是「浏览最近文件」或「纯语法筛选（ext:pdf 这类）」，
+                # 这两条路以前一条都不验活 —— 删掉的图片还挂在列表里，点开就是打不开。
+                # 关键字那一路 `mini_search` 自己会验（top N 逐条 exists），这里不重复。
+                if not q:
 
-                    total = max(total, len(items))
+                    items = filter_alive(items)
 
-                    # 主窗口的结果也要登记进打开白名单，否则双击是「打开失败」
+                total = max(total, len(items))
 
-                    # （/api/mini 与 /api/recent 都登记了，只有这里漏了）
+                # 主窗口的结果也要登记进打开白名单，否则双击是「打开失败」
 
-                    if items:
+                # （/api/mini 与 /api/recent 都登记了，只有这里漏了）
 
-                        allow_open([x['p'] for x in items], replace=True)
+                # 第 319 项：这里不能 replace=True。前端 /api/files（文件名）与 /api（正文）
+                # 两路并发，谁后到谁执行；带 replace 的那一路会把另一路刚登记的正文命中
+                # 整表清掉 —— 用户点正文命中那一行右键「定位」，白名单里已经没有它了。
+
+                if items:
+
+                    allow_open([x['p'] for x in items])
 
                 body = json.dumps({'items': items, 'st': st, 'more': total > len(items)},
 
                                   ensure_ascii=False).encode()
 
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.split('?')[0] == '/api/web_search':
+                body = json.dumps({'ok': True, 'items': web_search_items()},
+                                  ensure_ascii=False).encode()
                 ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/mini'):
@@ -19987,7 +24336,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 # deep=1 才全表扫「名字任意位置包含」，由前端在结果不满一屏时补发；
 
-                # body=1 连正文一起查（两家长处都不在正文，这是第二大脑的差异点）。
+                # body=1 连正文一起查（两家长处都不在正文，这是Memex的差异点）。
 
                 qs = parse_qs(urlparse(self.path).query)
 
@@ -20011,6 +24360,14 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 want_body = qs.get('body', ['0'])[0] in ('1', 'true')
 
+                force_body = qs.get('fb', ['0'])[0] in ('1', 'true')   # 第 230 项：右侧「正文」按钮
+
+                if force_body: want_body = True
+
+                # scope：快搜窗是「在某个文件夹里打字」唤起的时候只给这个目录的
+                # 结果（第 197 项）。不传就是全局，行为跟以前一样。
+                scope = (qs.get('scope', [''])[0] or '').strip()
+
                 # c:xxx / content:xxx / 内容:xxx —— 只要正文，名字一条都不占。
 
                 # 主窗口早就认这个语法，快搜窗以前把它当普通词剥掉就当没发生。
@@ -20025,11 +24382,76 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     with con_lock:
 
-                        d = mini_search(conn(), q, 9, deep, want_body, c_only)
+                        # 第 229 项五轮：ext/size/dm 语法会把 9 条的池子筛光，
+                        # 先捞大池子，语法筛完在下面截回一屏（有关键词才放大）。
+                        d = mini_search(conn(), q,
+                                        60 if (q and (syn_m['ext']
+                                                      or syn_m['size'] != (None, None)
+                                                      or syn_m['days']
+                                                      or syn_m['folder'])) else 9,
+                                        deep, want_body, c_only, force_body)
 
                 except sqlite3.Error as e:
 
                     d = {'items': [], 'deep': deep, 'ms': 0, 'n': 0, 'err': str(e)}
+
+                # 第 229 项五轮：纯语法筛选（ext:pdf / size:>2m / dm:7d）—— q 被
+                # 语法剥空时 mini_search 会回空，这里直接按语法查 files 表
+                # （mtime 新的在前），与主窗 /api/files 同一条规则，别一个软件两套行为。
+                # 第 238 项：`folder/` 也算纯语法 —— 以前这里漏了它，q 被剥空后
+                # 直接进 mini_search('')，快搜窗就回 0 条，用户以为文件夹里没东西。
+                if not q and (syn_m['ext'] or syn_m['size'] != (None, None)
+                              or syn_m['days'] or syn_m['folder']):
+
+                    try:
+
+                        with con_lock:
+
+                            m_items, _m_total = syntax_only_items(conn(), syn_m, 9)
+
+                        d = {'items': m_items, 'deep': False, 'ms': 0, 'n': len(m_items)}
+
+                    except sqlite3.Error as e:
+
+                        d = {'items': [], 'deep': deep, 'ms': 0, 'n': 0, 'err': str(e)}
+
+                # 目录内的命中排前面，再用全局结果补满：用户就在这个文件夹里，
+                # 但也可能记错了位置，别让他对着「没有结果」发呆。
+                # 第 373 项：以前的 scope 是「目录内命中排前面，再用全局结果补满」，
+                # 提示条却写「只在「X」中搜索」—— 用户看到列表里全是别的盘的文件，
+                # 自然认为限定失效。现在改成真的只用这个目录里的结果。
+                if scope and q:
+                    try:
+                        _pre_nc = os.path.normcase(os.path.normpath(scope)).rstrip('\\') + '\\'
+                    except Exception:
+                        _pre_nc = ''
+                    if _pre_nc:
+                        d['items'] = [x for x in d['items']
+                                      if os.path.normcase(os.path.normpath(x.get('p') or '')
+                                                          ).startswith(_pre_nc)]
+                    try:
+                        near = _scope_items(scope, q, 9)
+                    except Exception:
+                        near = []
+                    _seen = set(os.path.normcase(x['p']) for x in d['items'])
+                    for x in near:
+                        _k = os.path.normcase(x['p'])
+                        if _k in _seen:
+                            continue
+                        _seen.add(_k)
+                        d['items'].append(x)
+                    d['items'] = d['items'][:9]
+                    d['scope'] = scope
+                    d['scope_n'] = len(d['items'])
+                    # 这个目录在文件名索引里一条都没有 → 前端可以说清「这里还没进索引」
+                    try:
+                        with con_lock:
+                            d['scope_cold'] = 0 if conn().execute(
+                                'SELECT 1 FROM files WHERE instr(lower(path), ?) = 1 LIMIT 1',
+                                (_pre_nc,)).fetchone() else 1
+                    except Exception:
+                        d['scope_cold'] = 0
+
 
                 if d['items']:
 
@@ -20088,6 +24510,38 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 png = None
 
+                # 第 248 项：虚拟商店应用入口（path = shell:AppsFolder\<AUMID>）。
+
+                # 它的 ext 是空的，走 sys_icon('') 只会给一张空白纸；必须问 Shell 要
+
+                # 开始菜单那张磁贴图标。AUMID 格式 + 索引存在性双重校验，
+
+                # 免得 /api/icon 变成任意 shell: 路径的解析器。
+
+                if p and not isdir and app_entries.is_shell_app_path(p):
+
+                    allowed = ev_recent(p)
+
+                    if not allowed:
+
+                        try:
+
+                            with con_lock:
+
+                                allowed = bool(conn().execute(
+
+                                    'SELECT 1 FROM files WHERE path=? LIMIT 1',
+
+                                    (p,)).fetchone())
+
+                        except sqlite3.Error:
+
+                            pass
+
+                    if allowed:
+
+                        png = shell_app_icon(p)
+
                 if p and not isdir and ext in ('.exe', '.lnk'):
 
                     # 安全校验：只给「索引里有的」或「最近搜出来过的」路径取图标
@@ -20138,7 +24592,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     self.send_header('Cache-Control',
 
-                                     'max-age=60' if (p and ext in ('.exe', '.lnk')) else 'max-age=86400')
+                                     'max-age=60' if (p and (ext in ('.exe', '.lnk') or app_entries.is_shell_app_path(p))) else 'max-age=86400')
 
                     self.send_header('Content-Length', str(len(png)))
 
@@ -20154,9 +24608,166 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 return
 
+            elif self.path.startswith('/api/pdfmeta'):
+
+                # 第 325 项：详情栏翻页要知道总页数。只回一个数字，不读页面内容。
+                qs = parse_qs(urlparse(self.path).query)
+
+                p = (qs.get('p', [''])[0] or '').strip()
+
+                pgs = 0
+
+                if p and _local_only(p) and os.path.exists(p):
+
+                    allowed = ev_recent(p)
+
+                    if not allowed:
+
+                        try:
+
+                            with con_lock:
+
+                                allowed = bool(conn().execute(
+                                    'SELECT 1 FROM files WHERE path=? LIMIT 1', (p,)).fetchone())
+
+                        except sqlite3.Error:
+
+                            pass
+
+                    if allowed:
+
+                        pgs = pdf_pages(p)
+
+                body = json.dumps({'ok': bool(pgs), 'pages': pgs}, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/oss/licenses'):
+
+                # 第 380 项：关于页「开源组件」的数据源。
+                # 清单来自随包分发的 THIRD-PARTY-NOTICES.md（手写在前端会跟版本走散），
+                # 模型工件额外给 SHA-256 前 12 位 —— 合规要求「不能只看文件名」。
+                comps, models, base = [], [], ''
+
+                try:
+
+                    comps = _load_licenses_manifest()
+
+                    base = _licenses_base() or ''
+
+                    for m in _model_digests():
+
+                        models.append(m)
+
+                except Exception:
+
+                    pass
+
+                body = json.dumps({'ok': bool(comps), 'components': comps, 'models': models,
+
+                                   'dir': (str(Path(base) / 'licenses') if base else ''),
+
+                                   'notices': (str(Path(base) / 'THIRD-PARTY-NOTICES.md') if base else '')},
+
+                                  ensure_ascii=False).encode()
+
+                self.send_response(200)
+
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                self.send_header('Cache-Control', 'max-age=600')
+
+                self.send_header('Content-Length', str(len(body)))
+
+                self.end_headers()
+
+                self.wfile.write(body)
+
+                return
+
+            elif self.path.startswith('/api/raw'):
+
+                # 第 379 项：Office 真版面预览的字节出口。
+                # 安全口径和 /api/thumb 一模一样：路径必须在索引里（或本次搜索出现过）、
+                # 必须 same-origin、扩展名白名单、48MB 上限 —— localhost 上也不能变成
+                # 「任意读盘」的后门。
+                qs = parse_qs(urlparse(self.path).query)
+
+                p = (qs.get('p', [''])[0] or '').strip()
+
+                site = (self.headers.get('Sec-Fetch-Site') or '').lower()
+
+                ext = os.path.splitext(p)[1].lower().lstrip('.') if p else ''
+
+                rb = b''
+
+                mime = 'application/octet-stream'
+
+                if p and ext in _RAW_OK_EXT and site not in ('cross-site', 'same-site', 'none'):
+
+                    allowed = ev_recent(p)
+
+                    if not allowed:
+
+                        try:
+
+                            with con_lock:
+
+                                c = conn()
+
+                                allowed = bool(c.execute(
+                                    'SELECT 1 FROM files WHERE path=? LIMIT 1', (p,)).fetchone()) or bool(
+                                    c.execute('SELECT 1 FROM meta WHERE path=? LIMIT 1', (p,)).fetchone())
+
+                        except sqlite3.Error:
+
+                            pass
+
+                    if allowed and os.path.isfile(p):
+
+                        try:
+
+                            if os.path.getsize(p) <= _RAW_MAX:
+
+                                with open(p, 'rb') as f:
+
+                                    rb = f.read()
+
+                                mime = _RAW_MIME.get(ext, mime)
+
+                        except OSError:
+
+                            rb = b''
+
+                if rb:
+
+                    self.send_response(200)
+
+                    self.send_header('Content-Type', mime)
+
+                    self.send_header('Cache-Control', 'max-age=600')
+
+                    self.send_header('Content-Length', str(len(rb)))
+
+                    self.end_headers()
+
+                    self.wfile.write(rb)
+
+                    return
+
+                self.send_response(204)
+
+                self.end_headers()
+
+                return
+
             elif self.path.startswith('/api/thumb'):
 
-                # 文件缩略图。图片直接缩放、PDF 取首页、其它类型回 204 让前端用系统图标。
+                # 文件缩略图。图片直接缩放、PDF 取首页，其它类型回 204 让前端用系统图标。
+
+                # 第 313 项：**不要**给 Office 加 Shell 缩略图分支 —— 前端缩略图视图会对每格
+
+                # 发这个接口，COM 一卡就把 HTTP 线程全占死（312 项线上事故）。
 
                 # 安全校验：必须是索引里的路径或本次搜索返回过的，防止任意文件被读
 
@@ -20168,7 +24779,28 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 small = (qs.get('s', [''])[0] or '') == '1'
 
+                # 第 317 项：详情栏 / 灯箱要「看得清」的版本。
+                # 默认 320×400 是给网格格子用的；PDF 首页按这个宽度渲染，正文小字完全糊成一团
+                # （用户截图反馈「看 pdf 完全看不清」）。big=1 走 900×1200。
+                big = (qs.get('big', [''])[0] or '') == '1'
+
+                # 第 325 项：详情里翻页（pg 从 1 开始，用户看到的就是页码）、关键词高亮（q）、
+                # 以及「展开」后的超清版（xl=1 → 1600×2200，PDF 正文小字这才真的读得清）。
+                try:
+
+                    pg = int((qs.get('pg', ['0'])[0] or '0').strip() or '0')
+
+                except ValueError:
+
+                    pg = 0
+
+                hl = (qs.get('q', [''])[0] or '').strip()
+
+                xl = (qs.get('xl', [''])[0] or '') == '1'
+
                 png = b''
+
+                pages = 0
 
                 if p and site not in ('cross-site', 'same-site', 'none'):
 
@@ -20200,7 +24832,36 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     if allowed:
 
-                        png = make_thumb(p, 200, 200) if small else make_thumb(p)
+                        # 第 317 项：big 优先（详情/灯箱），其次 small（网格小格），默认中等
+                        # 第 325 项：页数只对 PDF 有意义，随手记下来给前端做「12 / 36」。
+                        if p.lower().endswith('.pdf'):
+
+                            try:
+
+                                pages = pdf_pages(p)
+
+                            except Exception:
+
+                                pages = 0
+
+                        pg0 = max(0, pg - 1)
+
+                        if xl:
+
+                            png = make_thumb(p, 1600, 2200, page=pg0, q=hl)
+
+                        elif big:
+
+                            png = (make_thumb(p, 900, 1200, page=pg0, q=hl) if p.lower().endswith('.pdf')
+                                   else make_thumb(p, 900, 1200))
+
+                        elif small:
+
+                            png = make_thumb(p, 200, 200)
+
+                        else:
+
+                            png = make_thumb(p, page=pg0, q=hl) if p.lower().endswith('.pdf') else make_thumb(p)
 
                         png = png or b''
 
@@ -20211,6 +24872,8 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                     self.send_header('Content-Type', 'image/png')
 
                     self.send_header('Cache-Control', 'max-age=86400')
+
+                    self.send_header('X-Pages', str(pages))
 
                     self.send_header('Content-Length', str(len(png)))
 
@@ -20268,11 +24931,11 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 try:
 
-                    with con_lock:
+                    with ro_db('/api/timeline') as rc:
 
                         # 「文件夹」走 dirs 表（mtime 是后补的列，老库可能有 NULL 未回填）
 
-                        groups = timeline_rows(conn(), days, exts=exts, pf=pf,
+                        groups = timeline_rows(rc, days, exts=exts, pf=pf,
 
                                                dirs_only=(kind == 'dir'))
 
@@ -20324,9 +24987,9 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 try:
 
-                    with con_lock:
+                    with ro_db('/api:recent') as rc:
 
-                        items = recent_rows(conn(), 5)
+                        items = recent_rows(rc, 10)   # 第 275 项：条数最多 10 条，得先有 10 条可选
 
                 except sqlite3.Error:
 
@@ -20388,13 +25051,48 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 srt = (qs.get('s', ['rel'])[0] or 'rel').lower()
 
+                busy = False
+
                 try:
 
-                    # 空关键词返回空列表：以前会 WHERE 1=1 LIMIT 30 随便给 30 篇，
+                    # 第 229 项四轮：空关键词 = 「浏览最近文档」，不是「没搜到」——
+                    # 主窗筛选条空着打字框点「正文」时，给最近入索引的文档（mtime
+                    # 新的在前）。以前故意回空（WHERE 1=1 LIMIT 30 像搜到了其实
+                    # 没搜），但那样点了筛选没任何反应（用户 15:5x 反馈）。
+                    # content: 前缀（scope=正文）同样落到这里。
+                    if not q:
 
-                    # 页面上看起来像「搜到了」，其实什么都没搜
+                        try:
 
-                    rows = [] if not q else self._search(q, ext, pf, wn)
+                            with db_lock('/api:recent', 12.0):
+
+                                rows = conn().execute(
+                                    "SELECT path, '' FROM meta "
+                                    'ORDER BY mtime DESC LIMIT 60').fetchall()
+
+                        except LockBusy:
+
+                            rows = []
+
+                            busy = True
+
+                        except sqlite3.Error:
+
+                            rows = []
+
+                    else:
+
+                        try:
+
+                            rows = self._search(q, ext, pf, wn)
+
+                        except LockBusy:
+
+                            # 库被长任务占着：这一路先空着，但要让前端知道是「忙」
+                            # 而不是「真的没有」。以前这里会一起超时，界面只剩一半结果。
+                            rows = []
+
+                            busy = True
 
                     # 第二个字段是正文片段（snippet 里用 / 标高亮），
 
@@ -20462,7 +25160,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         allow_open([h['p'] for h in hits])
 
-                    body = json.dumps({'hits': hits, 'dym': dym, 'q': q},
+                    body = json.dumps({'hits': hits, 'dym': dym, 'q': q, 'busy': busy},
 
                                       ensure_ascii=False).encode()
 
@@ -20491,6 +25189,26 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 ok = False
 
                 reason = ''
+
+                # 第 246 项：虚拟应用入口（shell:AppsFolder\<AUMID>）不是磁盘路径，
+                # 下面的 realpath 会把它拼到 cwd、os.path.exists 也永远为 False。
+                # 闸门不放松：本机同源 + 本次搜索真的返回过，避免任意 AppID 启动口。
+                if app_entries.is_shell_app_path(p):
+                    if site not in ('cross-site', 'same-site', 'none') and ev_recent(p):
+                        try:
+                            app_entries.launch(p)
+                            ok, reason = True, ''
+                        except Exception:
+                            ok, reason = False, 'fail'
+                    else:
+                        ok, reason = False, 'deny'
+                    body = json.dumps({'ok': ok, 'reason': reason}, ensure_ascii=False).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
 
                 # 先规范化再判：Windows 会忽略结尾的空格和点（`notepad.exe.` 仍是 exe），
 
@@ -20568,7 +25286,8 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                             try:
 
-                                os.startfile(p)
+                                # 第 382 项：走平台层；Windows 内部仍是 os.startfile，行为不变
+                                plat_shell.open_path(p)
 
                                 with con_lock:
 
@@ -20604,9 +25323,10 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 mj = json.dumps(MINI_L, ensure_ascii=False).replace('</', '<' + chr(92) + '/')
 
-                body = _subs(MINI_TPL).replace(
-
-                    '__MINI_L__', mj).replace('__MINI_LANG__', lang).encode()
+                wj = json.dumps(web_search_items(), ensure_ascii=False).replace('</', '<' + chr(92) + '/')
+                body = _subs(MINI_TPL, lang=lang).replace(
+                    '__MINI_L__', mj).replace('__MINI_LANG__', lang).replace(
+                    '__WEB_SEARCH__', wj).encode()
 
                 ctype = 'text/html; charset=utf-8'
 
@@ -20790,6 +25510,17 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                          '.png': 'image/png',
 
+                         # 第 204 项：教程动图。少了这行会回 application/octet-stream，
+                         # 而全局 end_headers() 带 X-Content-Type-Options: nosniff，
+                         # 浏览器会拒绝渲染 <img>，看起来像「动图没打包进去」。
+                         '.gif': 'image/gif',
+
+                         '.jpg': 'image/jpeg',
+
+                         '.jpeg': 'image/jpeg',
+
+                         '.webp': 'image/webp',
+
                          '.ico': 'image/x-icon',
 
                          '.woff2': 'font/woff2',
@@ -20802,19 +25533,21 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                   and web_ui_dir() is not None
 
-                  and 'ui=legacy' not in self.path
+                  and 'ui=legacy' not in self.path):
 
-                  and 'panel=' not in self.path
+                # 第 374 项：旧界面早就没人用了，302 不再为 ?panel= / ?q= 开小门
 
-                  and 'q=' not in self.path):
+                # ——那两条原本是给托盘抽屉和旧链接留的，可托盘走的是 app_window
 
-                # 默认首页改成新界面（React）。三种情况仍回旧界面：
+                # 里直接拼好的 /web/?q=…&panel=…，这两条从来就没被触发过。
 
-                # ?ui=legacy（手动兜底）、?panel=…（托盘要用旧界面的抽屉）、?q=…（旧链接）
+                # 查询串必须原样带过去，否则 /?q=归档 这类老书签会被跳成空页。
+
+                _q = self.path.split('?', 1)
 
                 self.send_response(302)
 
-                self.send_header('Location', '/web/')
+                self.send_header('Location', '/web/' + (('?' + _q[1]) if len(_q) > 1 else ''))
 
                 self.end_headers()
 
@@ -20901,6 +25634,11 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
         def do_POST(self):
 
             try:
+                self.server._last_path = self.path.split('?')[0][:80]
+            except Exception:
+                pass
+
+            try:
 
                 self._do_POST()
 
@@ -20911,43 +25649,31 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
 
         def _do_POST(self):
-
             if not self._guard() or 'application/json' not in (self.headers.get('Content-Type') or ''):
-
+                self.close_connection = True
                 self.send_response(403)
-
                 self.end_headers()
-
                 return
 
             # 写配置/改开机自启这类动作，同样只收页面自己发的同源请求
-
             if self.path.startswith('/api/') and not self._same_origin():
-
+                self.close_connection = True
                 self.send_response(403)
-
                 self.end_headers()
-
                 return
 
             try:
-
                 n = int(self.headers.get('Content-Length') or 0)
-
             except ValueError:
-
                 n = 0                       # Content-Length 是垃圾时当空 body 处理
 
-            if not (0 <= n <= 64 * 1024):
-
+            max_body = 20 * 1024 * 1024 if self.path.startswith('/api/snip/') else 64 * 1024
+            if not (0 <= n <= max_body):
                 # 负数会让 rfile.read(-1) 一直读到对端关闭（线程被白占 15 秒）；
-
-                # 超大值则是一次性读进内存。配置类请求没有这么大的合法 body。
-
+                # 超大值则是一次性读进内存。配置类请求没有这么大的合法 body；截图图片允许到 20MB。
+                self.close_connection = True
                 self.send_response(413)
-
                 self.end_headers()
-
                 return
 
             try:
@@ -20978,6 +25704,240 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 return
 
+            if self.path.split('?')[0] == '/api/web_search_open':
+                q = str(req.get('query') or '').strip()
+                k = str(req.get('key') or '').strip().lower()
+                u = web_search_url(k, q)
+                if not u:
+                    body = json.dumps({'ok': False, 'err': 'no engine or empty query'},
+                                      ensure_ascii=False).encode()
+                else:
+                    try:
+                        import webbrowser
+                        webbrowser.open(u)
+                        body = json.dumps({'ok': True, 'url': u}, ensure_ascii=False).encode()
+                    except Exception as e:
+                        body = json.dumps({'ok': False, 'err': str(e)},
+                                          ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+                # 第 310 项：这里原来只赋值 body 就往下走，后面那条 if/elif/else
+                # 大链会走到最后的 else，把 body 覆盖成 {'ok': False} —— 于是
+                # 「网络搜索」按回车永远返回失败、浏览器也不会被打开。必须就地收口。
+                self.send_response(200)
+                self.send_header('Content-Type', ctype)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/snip/trigger':
+                import snip_ocr
+                qs = parse_qs(urlparse(self.path).query)
+                do_ocr = req.get('ocr') if isinstance(req, dict) else False
+                if not do_ocr and 'ocr' in qs:
+                    do_ocr = qs['ocr'][0] in ('1', 'true', 'True')
+                # 第 369 项：translate=1 走「框选 → OCR → 翻译 → 原位卡片」，不写剪贴板
+                do_tr = req.get('translate') if isinstance(req, dict) else False
+                if not do_tr and 'translate' in qs:
+                    do_tr = qs['translate'][0] in ('1', 'true', 'True')
+                ok = snip_ocr.trigger_snip(do_ocr=bool(do_ocr), do_translate=bool(do_tr))
+                cur_id = int(ok) if isinstance(ok, (int, float)) and ok > 0 else snip_ocr.get_snip_result().get('snip_id', 0)
+                body = json.dumps({'ok': bool(ok), 'snip_id': cur_id}, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/snip/copy_text':
+                import snip_ocr
+                txt = req.get('text')
+                ok = snip_ocr.copy_snip_text(txt)
+                body = json.dumps({'ok': ok}, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/snip/save':
+                import snip_ocr
+                p = req.get('path')
+                ok, path_or_err = snip_ocr.save_snip_image(p)
+                body = json.dumps({'ok': ok, 'path': path_or_err if ok else '', 'err': '' if ok else path_or_err}, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] in ('/api/snip/ocr_image', '/api/snip/ocr_latest'):
+                import snip_ocr
+                img_data = req.get('image') if isinstance(req, dict) else ''
+                res = snip_ocr.ocr_base64_image(img_data)
+                body = json.dumps(res, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/clipboard/copy':
+                cid = int(req.get('id', 0)) if isinstance(req, dict) else 0
+                import clipboard_mgr
+                ok, msg = clipboard_mgr.copy_item(cid, _mini_tip_lang())
+                body = json.dumps({'ok': ok, 'msg': msg}, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/clipboard/delete':
+                cid = int(req.get('id', 0)) if isinstance(req, dict) else 0
+                import clipboard_mgr
+                ok = clipboard_mgr.delete_item(cid)
+                body = json.dumps({'ok': ok}, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/clipboard/clear':
+                import clipboard_mgr
+                ok = clipboard_mgr.clear_history()
+                body = json.dumps({'ok': ok}, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/clipboard/pin':
+                cid = int(req.get('id', 0)) if isinstance(req, dict) else 0
+                import clipboard_mgr
+                ok, val = clipboard_mgr.toggle_pin(cid)
+                body = json.dumps({'ok': ok, 'pinned': val}, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/byok':
+                # 第 274 项：存/清自带密钥。只落本机 settings.json，写成功后把这家引擎
+                # 自动加进 trans_engines —— 用户填了密钥就期待它生效，不该再去开关里找。
+                import translator
+                provider = (req.get('provider') or '').strip().lower() if isinstance(req, dict) else ''
+                ok, why = False, 'unknown_provider'
+                if provider in translator.BYOK_IDS:
+                    cfg = translator.byok_cfg()
+                    item = dict(cfg.get(provider) or {})
+                    payload = req.get('fields') if isinstance(req.get('fields'), dict) else req
+                    clear = bool(req.get('clear'))
+                    for f in translator.BYOK_FIELDS:
+                        if clear:
+                            item[f] = ''
+                            continue
+                        v = payload.get(f) if isinstance(payload, dict) else None
+                        if v is not None:
+                            # 空串也照样写（就是"清掉这一项"），只有没传才保留原值
+                            item[f] = str(v).strip()
+                    cfg[provider] = item
+                    payload_out = {'trans_byok': cfg}
+                    engines = translator.normalize_engines(
+                        _settings_read().get('trans_engines'))
+                    filled = item.get('key') if provider != 'baidu_api' \
+                        else (item.get('appid') and item.get('secret'))
+                    if filled and provider not in engines:
+                        engines.append(provider)
+                    # 清空后仍留在开关里没问题（没密钥时后端自动跳过），这里不动清单
+                    payload_out['trans_engines'] = engines
+                    ok, back = _settings_update(payload_out)
+                    why = '' if ok else 'write_failed'
+                elif isinstance(req, dict) and req.get('provider') in (None, ''):
+                    # 只读：POST 空 provider 当查询用（前端偶尔图省事）
+                    ok, why = True, ''
+                ready = translator.byok_ready()
+                masked = {}
+                for pid in translator.BYOK_IDS:
+                    it = (translator.byok_cfg().get(pid) or {})
+                    masked[pid] = {'key': translator.mask_secret(it.get('key')),
+                                   'model': it.get('model') or '',
+                                   'appid': it.get('appid') or '',
+                                   'secret': translator.mask_secret(it.get('secret'))}
+                body = json.dumps({'ok': ok, 'why': why, 'ready': ready, 'masked': masked},
+                                  ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            # 第 361 项：截图翻译。body {text, to}；text 为空就用最新一次 OCR 的结果。
+            if self.path.split('?')[0] == '/api/snip/translate':
+                _txt = (req.get('text') or '') if isinstance(req, dict) else ''
+                _tl = (req.get('to') or req.get('tgt_lang') or 'auto') if isinstance(req, dict) else 'auto'
+                _res = snip_translate(_txt, _tl)
+                body = json.dumps(_res, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.split('?')[0] == '/api/translate':
+                text = (req.get('text') or req.get('q') or '').strip() if isinstance(req, dict) else ''
+                sl = (req.get('from') or req.get('src_lang') or 'auto').strip() if isinstance(req, dict) else 'auto'
+                tl = (req.get('to') or req.get('target_lang') or req.get('tgt_lang') or 'auto').strip() if isinstance(req, dict) else 'auto'
+                # 第 273 项：**不再**把 tl='auto' 换成 settings.trans_target_lang。
+                # 那一步会让人选了「自动」却实际按"默认目标语言"翻 —— 默认语言正好
+                # 等于源语言时（英语→英语），接口原样吐回原文，用户看到的就是"翻译不了"。
+                # 现在「自动」一律交给 translator.auto_target()：译成界面语言。
+                import translator
+                res = translator.translate_text(text, src_lang=sl, tgt_lang=tl)
+                body = json.dumps(res, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Cache-Control', 'no-cache')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            # 第 346 项：把译文读出来。本机 SAPI 合成，离线，不出网。
+            # 返回 audio/wav 原始字节（前端用 Audio 播）；合成不了就回 JSON，
+            # 前端据此把喇叭按钮禁掉，而不是点了没反应。
+            if self.path.split('?')[0] == '/api/tts':
+                text = (req.get('text') or '') if isinstance(req, dict) else ''
+                lang = (req.get('lang') or '') if isinstance(req, dict) else ''
+                try:
+                    import tts as _tts
+                    data, voice = _tts.wav_bytes(text, lang)
+                except Exception as e:
+                    body = json.dumps({'ok': False, 'why': str(e)[:200]},
+                                      ensure_ascii=False).encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Cache-Control', 'no-store')
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                try:
+                    from urllib.parse import quote as _q
+                    vh = _q((voice or '')[:80])
+                except Exception:
+                    vh = ''
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/wav')
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('Cache-Control', 'no-store')
+                if vh:
+                    self.send_header('X-TTS-Voice', vh)
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
             if self.path.startswith('/api/autostart'):
 
                 on = bool(req.get('on', False))
@@ -20996,6 +25956,20 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 return
 
+            if self.path.startswith('/api/dialog_jump'):
+
+                body = json.dumps(_api_dialog_jump(req), ensure_ascii=False).encode()
+
+                self.send_response(200)
+
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                self.end_headers()
+
+                self.wfile.write(body)
+
+                return
+
             if self.path.startswith('/api/wall'):
 
                 body = json.dumps(_wall_apply(req), ensure_ascii=False).encode()
@@ -21003,6 +25977,92 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 self.send_response(200)
 
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                self.end_headers()
+
+                self.wfile.write(body)
+
+                return
+
+            if self.path.split('?')[0] == '/api/uninstall':
+                # 第 296 项：界面上的「卸载」按钮。必须显式 confirm，避免误点。
+                # keep = 只删程序文件（索引库 *.db / settings.json / backups 留着）；
+                # full = 连数据一起删。脚本会等本进程退出后再动手，所以这里先回包。
+                mode = str((req or {}).get('mode') or 'keep')
+                if not (req or {}).get('confirm'):
+                    body = json.dumps({'ok': False, 'err': 'need confirm',
+                                       'k': 'e_need_confirm'}, ensure_ascii=False).encode()
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                try:
+                    import uninstall as _un
+                    ok, script = _un.run_uninstall(app=app_dir(),
+                                                   keep_data=(mode != 'full'))
+                except Exception as e:
+                    ok, script = False, ''
+                    _log_file('uninstall failed: %r' % (e,))
+                body = json.dumps({'ok': ok, 'script': script,
+                                   'mode': 'full' if mode == 'full' else 'keep'},
+                                  ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.startswith('/api/proxy/test'):
+                # 第 299 项：设置页的「测试连接」。按"保存中的草稿"试，用户不用先保存再试。
+                # 只打一个 204 端点，超时 6 秒；错误只回 code，由前端翻成界面语言。
+                draft = {}
+                if isinstance(req.get('draft'), dict):
+                    draft = req['draft']
+                try:
+                    r = netproxy.test(draft=draft)
+                except Exception as e:
+                    r = {'ok': False, 'code': 'network', 'status': 0, 'ms': 0,
+                         'via': '', 'err': repr(e)[:120]}
+                body = json.dumps(r, ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if self.path.startswith('/api/shell_open'):
+
+                # 第 355 项：命令关键字 cmd / psh 的落地。只开一个终端，
+                # 目录用 Popen(cwd=...) 传，不拼进 shell 命令，避免注入。
+                _kind = str(req.get('kind') or 'cmd')
+
+                _dir = str(req.get('dir') or '').strip()
+
+                if _kind not in ('cmd', 'psh'):
+
+                    body = json.dumps({'ok': False, 'err': 'kind'}, ensure_ascii=False).encode()
+
+                    self.send_response(400)
+
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                    self.end_headers()
+
+                    self.wfile.write(body)
+
+                    return
+
+                out = shell_open(_kind, _dir)
+
+                body = json.dumps(out, ensure_ascii=False).encode()
+
+                self.send_response(200)
+
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                self.send_header('Cache-Control', 'no-store')
 
                 self.end_headers()
 
@@ -21068,6 +26128,37 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     patch['palette'] = req['palette']
 
+                if 'palette_vars' in req:
+
+                    # 整套配色：卡片这类原生窗口的**唯一真源**。格式不对就整包拒，
+                    # 免得半套颜色落盘后卡片更难解释。
+
+                    clean = _clean_palette_vars(req['palette_vars'])
+
+                    if clean is None:
+
+                        body = json.dumps({'ok': False, 'err': 'palette_vars 要 6 个 "r g b"',
+
+                                           'k': 'e_bad_palette_vars'}, ensure_ascii=False).encode()
+
+                        self.send_response(400)
+
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+
+                        self.end_headers()
+
+                        self.wfile.write(body)
+
+                        return
+
+                    patch['palette_vars'] = clean
+
+                if 'palette_dark' in req:
+
+                    # 和 palette_vars 一起用：决定深色才挂 DarkMode_Explorer、accent 选黑字还是白字
+
+                    patch['palette_dark'] = bool(req['palette_dark'])
+
                 if 'titlebar' in req:
 
                     # 自绘标题栏（第 180 项）：只收布尔。窗口样式开机时改，
@@ -21075,6 +26166,54 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                     # 所以改完要重启才生效 —— 界面上的说明也这么写。
 
                     patch['titlebar'] = bool(req['titlebar'])
+
+                if 'auto_popup' in req:
+
+                    patch['auto_popup'] = bool(req['auto_popup'])
+
+                if 'type_search' in req:
+
+                    patch['type_search'] = bool(req['type_search'])
+
+                if 'qs_style' in req:
+
+                    # 第 245 项：方案2 已下线，任何写入都归一到 rich。
+                    patch['qs_style'] = 'rich'
+
+                if 'body_search' in req:
+
+                    patch['body_search'] = bool(req['body_search'])
+
+                if 'qs_home_compact' in req:
+
+                    patch['qs_home_compact'] = bool(req['qs_home_compact'])
+
+                if 'qs_home_show' in req:
+
+                    patch['qs_home_show'] = bool(req['qs_home_show'])
+
+                if 'blank_jump' in req:
+
+                    patch['blank_jump'] = bool(req['blank_jump'])
+
+                # 第 327 项：左栏三块（类型分类 / 文件夹分组 / 时间筛选）可以关掉，
+                # 关掉只是不显示，筛选状态还在，重新打开照旧。
+                for _sbk in ('sb_types', 'sb_folders', 'sb_time', 'sb_counts'):
+
+                    if _sbk in req:
+
+                        patch[_sbk] = bool(req[_sbk])
+
+                if 'qs_home_count' in req:
+
+                    try:
+                        patch['qs_home_count'] = max(1, min(10, int(req['qs_home_count'])))
+                    except Exception:
+                        pass
+
+                if 'web_search' in req:
+
+                    patch['web_search'] = _normalize_web_search(req['web_search'])
 
                 if 'welcome_seen' in req:
 
@@ -21106,6 +26245,93 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                     patch['lang_user'] = True
 
+                if 'trans_target_lang' in req:
+                    patch['trans_target_lang'] = str(req['trans_target_lang']).strip()
+
+                if 'trans_live' in req:
+                    patch['trans_live'] = bool(req['trans_live'])
+
+                if 'trans_engines' in req:
+                    # 第 268 项：只接受已知 id、去重、保序；空列表由 translator
+                    # 归一回全开，别让用户把自己关到一个引擎都不剩。
+                    try:
+                        import translator as _tr
+                        patch['trans_engines'] = _tr.normalize_engines(req['trans_engines'])
+                        # 第 295 项：记下"保存这一刻的引擎版本"，以后新增的引擎
+                        # 才会自动补进这份清单（用户从没见过，不该默认被关掉）。
+                        patch['trans_engines_ver'] = _tr.ENGINE_VER
+                    except Exception:
+                        pass
+
+                if 'proxy_mode' in req:
+                    # 第 299 项：只收三个白名单值，写坏了会让全程序回落到直连（很难查）
+                    m = str(req.get('proxy_mode') or '').strip().lower()
+                    if m not in netproxy.MODES:
+                        body = json.dumps({'ok': False, 'err': 'proxy_mode 只能是 system/none/custom',
+                                           'k': 'e_bad_proxy_mode'}, ensure_ascii=False).encode()
+                        self.send_response(400)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    patch['proxy_mode'] = m
+
+                if 'proxy_host' in req:
+                    host = str(req.get('proxy_host') or '').strip()
+                    if len(host) > 200 or any(ch in host for ch in (' ', '\t', '\r', '\n', '"', "'")):
+                        body = json.dumps({'ok': False, 'err': 'proxy_host 不合法',
+                                           'k': 'e_bad_proxy_host'}, ensure_ascii=False).encode()
+                        self.send_response(400)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    # 填了整串（http://user:pass@host:port）也校验一下，socks 这里不支持
+                    if host and '://' in host and host.split('://', 1)[0].lower() not in ('http', 'https'):
+                        body = json.dumps({'ok': False, 'err': '只支持 http/https 代理',
+                                           'k': 'e_bad_proxy_scheme'}, ensure_ascii=False).encode()
+                        self.send_response(400)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    patch['proxy_host'] = host or netproxy.DEFAULT_HOST
+
+                if 'proxy_port' in req:
+                    try:
+                        port = int(req.get('proxy_port'))
+                    except Exception:
+                        port = 0
+                    if not (1 <= port <= 65535):
+                        body = json.dumps({'ok': False, 'err': 'proxy_port 只能是 1..65535',
+                                           'k': 'e_bad_proxy_port'}, ensure_ascii=False).encode()
+                        self.send_response(400)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    patch['proxy_port'] = port
+
+                if 'hotkey_mode' in req:
+                    mode = str(req['hotkey_mode']).strip()
+                    if mode in ('double_ctrl', 'alt_space', 'ctrl_space'):
+                        patch['hotkey_mode'] = mode
+
+                if 'floating_ball' in req:
+                    patch['floating_ball'] = bool(req['floating_ball'])
+
+                if 'floating_ball_x' in req:
+                    try:
+                        patch['floating_ball_x'] = int(req['floating_ball_x'])
+                    except Exception:
+                        pass
+
+                if 'floating_ball_y' in req:
+                    try:
+                        patch['floating_ball_y'] = int(req['floating_ball_y'])
+                    except Exception:
+                        pass
+
                 ok, d = _settings_update(patch)
 
                 if not ok:
@@ -21123,6 +26349,13 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                     self.wfile.write(body)
 
                     return
+
+                # 第 299 项：改完代理立刻清缓存 + 同步环境变量，下一次联网请求就生效
+                if any(k in patch for k in ('proxy_mode', 'proxy_host', 'proxy_port')):
+                    try:
+                        netproxy.refresh()
+                    except Exception:
+                        pass
 
                 body = json.dumps({'ok': True, 'settings': d}, ensure_ascii=False).encode()
 
@@ -21144,7 +26377,16 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 dirs = safe_scope_list(raw, True)  # 显式添加的共享盘也收；其余仍只收本机存在的目录
 
-                if not dirs:
+                # 第 294 项：网络位置（NAS / 共享盘）是 Pro 位 net_index。
+                # 判定放在 _safe_scope_dir 校验之后：不可达的 UNC 早被滤掉了，
+                # 不会因为用户手打错一个路径就弹付费提示。
+                if scope_net_blocked(dirs, (_scope_conf().get('include_dirs') or [])):
+
+                    body = json.dumps({'ok': False, 'err': '网络位置索引需要 Pro', 'k': 'e_net_pro'},
+
+                                      ensure_ascii=False).encode()
+
+                elif not dirs:
 
                     body = json.dumps({'ok': False, 'err': '至少要添加一个文件夹', 'k': 'e_need_dir'},
 
@@ -21304,6 +26546,71 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/index/verify'):
+
+                # 第 281 项：启动全库校验（POST）。单飞：正在跑就返回 already，
+                # 免得用户连点几次把磁盘读满。跑完把结论写 verify_state.json。
+                try:
+
+                    import env_check as _ecv2
+
+                    if _VERIFY_RUN.get('running'):
+
+                        out = {'ok': True, 'running': True, 'already': True,
+
+                               'started_s': int(time.time() - _VERIFY_RUN['started'])}
+
+                    else:
+
+                        with _VERIFY_LOCK:
+
+                            if _VERIFY_RUN.get('running'):
+
+                                out = {'ok': True, 'running': True, 'already': True}
+
+                            else:
+
+                                _VERIFY_RUN['running'] = True
+
+                                _VERIFY_RUN['started'] = time.time()
+
+                                _dbp, _dd = str(DB), str(app_dir())
+
+                                def _work():
+
+                                    try:
+
+                                        _r = _ecv2.full_verify(_dbp, data_dir=_dd)
+
+                                        _VERIFY_RUN['res'] = _r
+
+                                        if metrics:
+
+                                            metrics.add('verify_full', status='ok' if _r.get('ok') else 'fail',
+
+                                                        ms=int(float(_r.get('elapsed') or 0) * 1000),
+                                                        err='' if _r.get('ok') else str(_r.get('state') or ''))
+
+                                    except Exception as _ex:
+
+                                        error_report.capture_exc(_ex, 'index-verify')
+
+                                    finally:
+
+                                        _VERIFY_RUN['running'] = False
+
+                                threading.Thread(target=_work, name='index-verify', daemon=True).start()
+
+                                out = {'ok': True, 'running': True}
+
+                except Exception as _e:
+
+                    out = {'ok': False, 'msg': repr(_e)}
+
+                body = json.dumps(out, ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/errlog'):
 
                 op = str(req.get('op') or '').strip()
@@ -21342,7 +26649,7 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         RuntimeError('预览示例：这不是真实错误'), None, cur['include_paths'])
 
-                    out = {'ok': True, 'text': error_report.markdown(demo)}
+                    out = {'ok': True, 'text': error_report.markdown(demo, lang=_errlog_lang())}
 
                 elif op == 'preview':
 
@@ -21356,7 +26663,8 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                         r = error_report.get_report(items[0]['id']) if items else None
 
-                    out = {'ok': r is not None, 'text': error_report.markdown(r) if r else ''}
+                    out = {'ok': r is not None,
+                           'text': error_report.markdown(r, lang=_errlog_lang()) if r else ''}
 
                 elif op == 'send':
 
@@ -21371,6 +26679,43 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                     ok, err = error_report.send_one(rid) if rid else (False, '没有待发送的报告')
 
                     out = {'ok': ok, 'err': err, 'state': error_report.status()}
+
+                elif op == 'crumb':
+
+                    # 第 277 项：前端只报动作名与枚举（面板名 / 结果码），不报内容。
+                    # 例：{'items': [{'a': 'panel', 'v': 'translate'}, {'a': 'search'}]}
+                    items = req.get('items') if isinstance(req.get('items'), list) else []
+
+                    n = 0
+
+                    try:
+
+                        import breadcrumb as _bc2
+
+                        for it in items[:8]:
+
+                            if isinstance(it, dict) and it.get('a'):
+
+                                _bc2.add(it.get('a'), v=it.get('v'), panel=it.get('panel'))
+
+                                n += 1
+
+                    except Exception:
+
+                        pass
+
+                    out = {'ok': True, 'n': n}
+
+                elif op == 'js':
+
+                    # 第 277 项：前端异常（window.onerror / unhandledrejection /
+                    # ErrorBoundary）。只收 message、stack 前若干帧与面板名，
+                    # 不收任何输入框内容；与自动捕获一样受 collect 之外的脱敏规则约束。
+                    rid = error_report.save_js(req)
+
+                    out = {'ok': bool(rid), 'id': rid or '', 'err': '' if rid else '空报告',
+
+                           'state': error_report.status()}
 
                 elif op == 'feedback':
 
@@ -21417,6 +26762,39 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
                 body = json.dumps(settings_backup.restore(app_dir(), raw),
 
                                   ensure_ascii=False).encode()
+
+                ctype = 'application/json; charset=utf-8'
+
+            elif self.path.startswith('/api/compact'):
+
+                # 第 366 项：手动「整理索引库」。迁移 + optimize + VACUUM 一次跑完，
+                # 进度走 GET /api/compact；整个过程独占写锁，搜索会短暂报忙。
+                if COMPACT.get('state') == 'busy':
+
+                    body = json.dumps({'ok': False, 'err': '正在整理索引库', 'k': 'e_compact_busy'},
+
+                                      ensure_ascii=False).encode()
+
+                elif _job_busy():
+
+                    body = json.dumps({'ok': False, 'err': '已有任务在跑', 'k': 'e_busy'},
+
+                                      ensure_ascii=False).encode()
+
+                else:
+
+                    # 先把状态置成 busy 再开线程：否则前端 700ms 后第一次读进度
+                    # 可能还读到上一次的 idle，直接判定「已结束」。
+                    COMPACT.update({'state': 'busy', 'phase': 'backup', 'done': 0, 'total': 0,
+                                    'k': 'maint_busy_compact', 'a': {}, 'msg': '', 'err': '',
+                                    'before': _db_mb(), 'after': 0.0, 'secs': 0.0,
+                                    'at': time.time(), 'auto': False})
+
+                    threading.Thread(target=_compact_thread, kwargs={'auto': False, 'claimed': True},
+
+                                     daemon=True, name='compact-now').start()
+
+                    body = json.dumps({'ok': True}, ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
 
@@ -21512,13 +26890,18 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                 try:
 
-                    subprocess.Popen(['explorer', str(app_dir())])
+                    # 第 382 项：Windows 走资源管理器打开；mac 走 open，linux 走 xdg-open
+                    plat_shell.open_path(str(app_dir()))
 
                     body = b'{"ok": true}'
 
                 except Exception as e:
 
                     body = json.dumps({'ok': False, 'err': str(e)}, ensure_ascii=False).encode()
+
+                # 第 382 项：这个分支原来**漏了 ctype**，走到 send_header 时 ctype 未绑定，
+                # 整个 /api/open_dir 直接 500（前端「打开数据目录」按钮其实一直是坏的）。
+                ctype = 'application/json; charset=utf-8'
 
             elif self.path.startswith('/api/reverse'):
 
@@ -21606,7 +26989,8 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
                                 zf.write(f, arc)
 
-                        subprocess.Popen(['explorer', '/select,', str(zpath)])
+                        # 第 382 项：Windows 是 explorer /select 选中那个 zip，mac 是 open -R
+                        plat_shell.reveal(str(zpath))
 
                         body = json.dumps({'ok': True, 'zip': str(zpath), 'n': len(good)},
 
@@ -21876,9 +27260,13 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
         def _search(self, q, ext=None, pf=None, with_name=True):
 
-            with con_lock:
+            # 第 320 项：正文那一路以前是裸 with con_lock —— 一个长任务占住库，
+            # 这里就跟文件名那一路一起挂死，界面看到的是「搜什么都转圈」。
+            # 第 327 项：正文查询就是那个「5.6 秒的慢查询」（888MB 库 + 冷页），
+            # 改成走只读连接后，它自己慢，别人不受影响 —— 界面不再整屏空白。
+            with ro_db('/api:body') as rc:
 
-                return search_rows(conn(), q, 30, ext, pf, with_name)
+                return search_rows(rc, q, 30, ext, pf, with_name)
 
     class QuietServer(ThreadingHTTPServer):
 
@@ -21897,6 +27285,17 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
             if et in (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
 
                 return
+
+            # 第 277 项：这里接住的是 50+ 个 /api 处理器抛出的异常。
+            # socketserver 只会 traceback.print_exc() 到 stderr，而打包版
+            # pythonw 没有控制台 —— 等于整条链路都在黑洞里。
+            try:
+
+                error_report.capture_api(getattr(self, '_last_path', '') or '?')
+
+            except Exception:
+
+                pass
 
             super().handle_error(request, client_address)
 
@@ -21932,15 +27331,16 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
 
         try:
 
-            with con_lock:
+            with db_lock('boot_maint:count', 10.0):
 
                 left = conn().execute('SELECT COUNT(*) FROM dirs WHERE mtime IS NULL').fetchone()[0]
 
             if left:
 
-                with con_lock:
-
-                    got = backfill_dir_mtime(conn(), limit=4000)
+                # 第 321 项：不能再套一层 con_lock —— backfill_dir_mtime 内部只锁
+                # 「读一页 + 写一批」，os.stat 全在锁外；套上外层锁就等于又回到
+                # 「4000 个目录 stat 期间谁都进不来」的老毛病。
+                got = backfill_dir_mtime(conn(), limit=4000)
 
                 if got:
 
@@ -21959,6 +27359,35 @@ try{if((new URLSearchParams(location.search)).get('cfg'))showCfg()}catch(e){}
     # 回填完才把 2 字查询路由过去（_bigram_ready），没完成前照旧走 LIKE，不回退。
 
     threading.Thread(target=_bigram_backfill, daemon=True).start()
+
+    # 第 326 项：老库正文瘦身（一次性）+ 左栏计数暖缓存（每分钟一次）
+    threading.Thread(target=_slim_docs_once, daemon=True, name='slim-docs').start()
+
+    threading.Thread(target=_facets_warm_loop, daemon=True, name='facets-warm').start()
+
+    # 第 326 项：空闲压缩（FTS 合并 + VACUUM），30 天一次
+    threading.Thread(target=_compact_loop, daemon=True, name='db-compact').start()
+
+    # 第 326 项：开机先把 WAL 截断一次。索引器写得多时 WAL 能涨到几百 MB
+    # （实测 603MB，比库本身还占地方），启动这一刻还没有长读事务，截得掉。
+    try:
+
+        conn().execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
+    except Exception:
+
+        pass
+
+    # 第 321 项：锁看门狗。卡住时把「谁攥着 con_lock」的线程栈写进 debug.log。
+    threading.Thread(target=_lock_watchdog, daemon=True, name='lock-watchdog').start()
+
+    # 体积评估 #1：常驻期间定时收 WAL。autocheckpoint 只管合并帧，
+    # 长会话里没有一次「干净的截断」机会，文件就停在最高水位（实测 60.9 MB）。
+    # 这里每 60 秒试一次 TRUNCATE：有长读事务就 busy，下一轮再来，绝不等。
+    threading.Thread(target=_wal_keeper_loop, daemon=True, name='wal-keeper').start()
+
+    # 第 323 项：后台验活 —— 库里已经不存在的路径定时清掉（列表里就不会再出现死行）。
+    threading.Thread(target=_gone_reconcile_loop, daemon=True, name='gone-reconcile').start()
 
     return QuietServer(('127.0.0.1', port), H)
 
@@ -21998,7 +27427,7 @@ def serve(port=8765):
 
     threading.Timer(1.2, webbrowser.open, args=(f'http://127.0.0.1:{port}',)).start()
 
-    print(f'第二大脑已启动：http://127.0.0.1:{port}（关闭本窗口即停止服务）')
+    print(f'Memex已启动：http://127.0.0.1:{port}（关闭本窗口即停止服务）')
 
     start_pinyin_backfill()      # 老库补拼音，后台跑，不挡界面
 
@@ -22117,3 +27546,6 @@ def cli(argv=None):
 if __name__ == '__main__':
 
     cli()
+
+
+

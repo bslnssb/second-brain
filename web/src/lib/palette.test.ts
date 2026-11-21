@@ -51,6 +51,16 @@ describe('applyPalette', () => {
     expect(document.documentElement.style.getPropertyValue('--sb-accent')).toBe('176 118 60')
   })
 
+  it('把配色写进 sb_vars，快搜窗（第 195 项）才能跟着换', () => {
+    applyPalette('paper', false)
+    const a = JSON.parse(localStorage.getItem('sb_vars') || 'null')
+    expect(a?.dark).toBe(false)
+    expect(a?.vars?.accent).toBe('176 118 60')
+    applyPalette('auto', false)
+    const b = JSON.parse(localStorage.getItem('sb_vars') || 'null')
+    expect(b?.vars).toBeNull()
+  })
+
   it('切回「跟随系统」时把上一套变量清干净', () => {
     applyPalette('night', true)
     expect(document.documentElement.style.getPropertyValue('--sb-bg')).toBe('18 24 38')

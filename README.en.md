@@ -1,10 +1,10 @@
-# Second Brain · Local Document Search
+# Memex · Your Second Brain
 
 [简体中文](README.md) | **English** · [Homepage](https://bslnssb.github.io/second-brain/)
 
 **Scanned documents are searchable too.**
 
-Photocopied contracts, photographed invoices, PDFs exported as images, phone shots of paper notices — there is not a single character in them your system can find. Second Brain recognises the text, indexes it locally, then puts it in the same double-tap-Ctrl search box as the file names.
+Photocopied contracts, photographed invoices, PDFs exported as images, phone shots of paper notices — there is not a single character in them your system can find. Memex recognises the text, indexes it locally, then puts it in the same double-tap-Ctrl search box as the file names.
 
 Fully offline: nothing leaves the machine, no account, no server. Python + SQLite FTS5. One `brain.db` holds every extracted document body; it keeps working with the network unplugged.
 
@@ -19,14 +19,14 @@ Fully offline: nothing leaves the machine, no account, no server. Python + SQLit
 
 ## Download
 
-Grab the latest `SecondBrain-Setup-vX.Y.Z.exe` (about 180 MB) from [Releases](https://github.com/bslnssb/second-brain/releases) and run it.
+Grab the latest `Memex-Setup-vX.Y.Z.exe` (about 180 MB) from [Releases](https://github.com/bslnssb/second-brain/releases) and run it.
 
-On a machine where you cannot install software? The same Release carries a portable `SecondBrain-vX.Y.Z-portable.zip` — unzip it anywhere writable and run `SecondBrain.exe`. No installer, no services; data lives next to the program (or in `%LOCALAPPDATA%` when the folder is read-only).
+On a machine where you cannot install software? The same Release carries a portable `Memex-vX.Y.Z-portable.zip` — unzip it anywhere writable and run `Memex.exe`. No installer, no services; data lives next to the program (or in `%LOCALAPPDATA%` when the folder is read-only).
 
 | | |
 |---|---|
 | OS | Windows 10 / 11 (64-bit) |
-| Installed size | About 330 MB (`SecondBrain.exe` + `_internal/`) |
+| Installed size | About 330 MB (`Memex.exe` + `_internal/`) |
 | Admin rights | Not required — a per-user install works |
 | Network | After install, **fully offline**; the OCR model ships with the app |
 | Uninstall | Settings → Apps → Uninstall, or just delete the folder |
@@ -69,7 +69,7 @@ When the quick search box is empty it lists recently opened files, so often you 
 ## How it compares to Everything, Listary and TextSeek
 
 **If what you want is "press Ctrl twice, type, open a file", Everything + Listary already do it well.**
-Second Brain is only "good enough" at that: file and folder name index (game libraries excludable — 200k entries here, around 0.2 ms per prefix query), pinyin, real icons, recent files when empty, segmented paths.
+Memex is only "good enough" at that: file and folder name index (game libraries excludable — 200k entries here, around 0.2 ms per prefix query), pinyin, real icons, recent files when empty, segmented paths.
 
 **The extra step it takes is scanned paper.**
 
@@ -78,17 +78,17 @@ Second Brain is only "good enough" at that: file and folder name index (game lib
 | **Everything** | Best in class, reads the NTFS file table, live | Live `content:` matching only; the 1.5 content index has to be switched on | No |
 | **Listary V7** | Strong, with pinyin, launcher and Quick Switch | Yes, through the companion app Gety (hooked up in the V7 beta) | Gety claims it; needs a second app installed |
 | **TextSeek** | Average | Strong — good Chinese tokenising, regex support | Parses the text layer only; scans need separate OCR |
-| **Second Brain** | Good enough | **In the quick window, with the sentence highlighted** | **Chinese OCR built in — one exe, nothing else to install** |
+| **Memex** | Good enough | **In the quick window, with the sentence highlighted** | **Chinese OCR built in — one exe, nothing else to install** |
 
 In one line: searching inside text is no longer anyone's exclusive feature. **"Double-tap Ctrl + scanned paper + nothing else to install" is still a fairly empty spot.**
 
-**What it does not do**: slower than Everything (which reads the file table volume-wide; Second Brain keeps a scoped index plus folder watching, so other drives and anything that changed while it was closed need one manual update); no Listary Quick Switch or Open/Save dialog jumping; Windows only; about 330 MB installed. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
+**What it does not do**: slower than Everything (which reads the file table volume-wide; Memex keeps a scoped index plus folder watching, so other drives and anything that changed while it was closed need one manual update); no Listary Quick Switch or Open/Save dialog jumping; Windows only; about 330 MB installed. So if you use Listary as a file-dialog accelerator, the two do not conflict — install both.
 
-> Second Brain is an independent implementation: it uses no code, icons or UI assets from the products above, and has no affiliation with them. Product names appear only to explain the differences.
+> Memex is an independent implementation: it uses no code, icons or UI assets from the products above, and has no affiliation with them. Product names appear only to explain the differences.
 
 ## First run
 
-1. Double-click `SecondBrain.exe` — the main window opens (closing it does not quit; the app stays in the tray waiting for a double Ctrl)
+1. Double-click `Memex.exe` — the main window opens (closing it does not quit; the app stays in the tray waiting for a double Ctrl)
 2. Open **Settings** and click **Scan all drives** — it proposes the folders worth indexing and lets you confirm
 3. Indexing starts on its own; the search box does not wait for it
 4. Day to day: files created, renamed or deleted on the Desktop, in Downloads, Documents, or inside your scope **appear in about 2 seconds**. Run **Update current scope** when you want the *text inside* new documents searchable; **Rebuild name index** after moving large numbers of files
@@ -125,11 +125,11 @@ The exe accepts startup arguments, handy for launcher integration:
 
 | Command | Effect |
 |---|---|
-| `SecondBrain.exe reimbursement` | Open the main window with results |
-| `SecondBrain.exe --settings` | Open the main window with settings expanded |
-| `SecondBrain.exe --silent` | Stay in the tray, no window, wait for double Ctrl |
-| `SecondBrain.exe --mini` | Show the quick search box on launch |
-| `SecondBrain.exe --lang en reimbursement` | Force the English UI (`zh` likewise) |
+| `Memex.exe reimbursement` | Open the main window with results |
+| `Memex.exe --settings` | Open the main window with settings expanded |
+| `Memex.exe --silent` | Stay in the tray, no window, wait for double Ctrl |
+| `Memex.exe --mini` | Show the quick search box on launch |
+| `Memex.exe --lang en reimbursement` | Force the English UI (`zh` likewise) |
 
 URL parameters for the browser UI:
 

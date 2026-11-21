@@ -22,7 +22,15 @@ export type ScopeInfo = {
   files: number
   docs: number
   names_state?: string
-  rules: { ext: number; skip: number; size_limit: number }
+  rules: {
+    ext: number
+    skip: number
+    size_limit: number
+    // 第 243 项：短音频阈值（秒）、音乐平台目录数、已知软件目录数
+    audio_min_seconds: number
+    music_apps: number
+    software_dirs: number
+  }
 }
 export type ConfigInfo = {
   exists: boolean
@@ -47,6 +55,54 @@ export type Settings = {
   compat?: boolean
   /** 自绘标题栏（第 180 项）：窗口样式开机时改，要重启才生效 */
   titlebar?: boolean
+  /** 文件对话框一出现就自动弹快搜窗（第 197 项） */
+  auto_popup?: boolean
+  /** 在资源管理器文件夹里直接打字就搜当前目录（第 197 项） */
+  type_search?: boolean
+  /** 第 245 项：弹窗样式定稿只剩方案1，qs_style 不再是可写设置项（后端统一归一 rich）。 */
+  /** 第 233 项：快搜窗是否连文档正文一起搜（默认开；关掉只搜文件名/文件夹） */
+  body_search?: boolean
+  /** 第 203 项：网络搜索引擎。url 必须含 {query} 占位符 */
+  web_search?: { key: string; title: string; url: string; enabled?: boolean }[]
+  /** 第 270 项：出厂默认引擎（只由后端下发、不落盘），供「恢复默认引擎」补回被删掉的条目 */
+  web_search_defaults?: { key: string; title: string; url: string; enabled?: boolean }[]
+  /** 聚合翻译默认目标语言（auto, zh-CN, en, ja, ko, fr, de, es, ru, pt, it, ar, th, vi） */
+  trans_target_lang?: string
+  /** 快搜栏输入时是否实时翻译 */
+  trans_live?: boolean
+  /** 第 268 项：聚合翻译要打哪几个引擎（id 见 translator.ENGINES）；空/缺省=全开 */
+  trans_engines?: string[]
+  /** 第 274 项：哪几家自带密钥已经配好（只下发布尔，密钥本身永不下发） */
+  trans_byok_ready?: Record<string, boolean>
+  /** 第 299 项：网络代理模式 system / none / custom（默认 system） */
+  proxy_mode?: string
+  /** 自定义代理地址：host、host:port 或 http://user:pass@host:port */
+  proxy_host?: string
+  proxy_port?: number
+  /** 后端只读快照：现在实际用的代理（'' = 直连）与检测到的系统代理 */
+  proxy_now?: { mode?: string; url?: string; system?: string }
+  /** 第 275 项：快搜窗空状态「最近打开」紧凑显示（默认关 = 原来的两排大行） */
+  qs_home_compact?: boolean
+  /** 第 275 项：空状态列几条（默认 4，1..10） */
+  qs_home_count?: number
+  /** 第 275 项：最近记录整块显不显示（默认显示） */
+  qs_home_show?: boolean
+  /** 第 307 项：在资源管理器里点文件夹，开着的打开/保存对话框跟过去（默认开） */
+  blank_jump?: boolean
+  /** 第 273 项：后端算好的「自动」文案（随界面语言变化） */
+  trans_auto_label?: string
+  /** 唤出方式热键模式：'double_ctrl' | 'alt_space' | 'ctrl_space' */
+  hotkey_mode?: 'double_ctrl' | 'alt_space' | 'ctrl_space'
+  /** 第 327 项：左栏三块能不能关掉（默认都开）——类型分类 / 文件夹分组 / 时间筛选 */
+  sb_types?: boolean
+  sb_folders?: boolean
+  sb_time?: boolean
+  /** 第 338 项：左栏类型后面那列条数（默认关）；也是老配置缺键时按 false 处理 */
+  sb_counts?: boolean
+  /** 桌面常驻悬浮球/悬浮窗开关 */
+  floating_ball?: boolean
+  floating_ball_x?: number
+  floating_ball_y?: number
 }
 
 type Bridge = {
@@ -81,12 +137,53 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const getStats = () => api<Stats>('/api/stats')
+
+/** 第 366 项：整理索引库（老库迁移 + FTS 合并 + VACUUM）的进度 */
+export type CompactState = {
+  state: 'idle' | 'busy' | 'done' | 'err' | string
+  phase?: string
+  done?: number
+  total?: number
+  k?: string
+  a?: Record<string, string | number>
+  msg?: string
+  err?: string
+  before?: number
+  after?: number
+  secs?: number
+  auto?: boolean
+  db_mb?: number
+}
+export const getCompact = () => api<CompactState>('/api/compact')
+export const startCompact = () =>
+  api<{ ok?: boolean; k?: string; err?: string }>('/api/compact', { method: 'POST', body: '{}' })
+
+/** 第 308 项：索引健康快照（判断「索引是空的」和失联文件夹） */
+export type IndexHealth = {
+  ok?: boolean
+  files: number
+  docs: number
+  scope: number
+  includes?: string[]
+  paused: number
+  names?: string
+  zero?: boolean
+  no_text?: boolean
+}
+export const getIndexHealth = () => api<IndexHealth>('/api/index/health')
+/** 一键重扫：复用现有的增量更新（无 targets 时按 scope.json 里已存范围跑） */
+export const startIndexUpdate = () =>
+  api<{ ok: boolean }>('/api/update', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: '{}',
+  })
 export const getConfig = () => api<ConfigInfo>('/api/config')
 export const getPing = () => api<Ping>('/api/ping')
 
 /**
  * Pro：把当前结果导出成 Excel（第 140 项）。
- * 后端自己写文件到「文档/第二大脑导出」并定位，前端只负责提示 ——
+ * 后端自己写文件到「文档/Memex 导出」并定位，前端只负责提示 ——
  * 和「右键打包」同一套做法，免得在 WebView2 里跟 blob 下载打交道。
  * 未授权时返回 `{ ok:false, pro:true }`，不是异常。
  */
@@ -142,6 +239,10 @@ export const ocrBatchOp = (op: OcrOp, extra?: { paths?: string[]; dirs?: string[
     body: JSON.stringify({ op, ...(extra || {}) }),
   })
 
+/** 第 308 项：Windows 区域格式（短日期 / 短时间样式 + locale 名） */
+export type LocaleInfo = { locale: string; date: string; time: string }
+export const getLocaleInfo = () => api<LocaleInfo>('/api/locale')
+
 /** 选文件夹拿完整路径；浏览器里没有原生桥时返回空串 */
 export async function pickFolder(): Promise<string> {
   try {
@@ -168,6 +269,14 @@ export type WallState = {
   name?: string
   opacity: number
   blur: number
+  /** 第 362 项：画面焦点（百分比，50/50 = 居中）与放大（100~200） */
+  pos_x: number
+  pos_y: number
+  zoom: number
+  /** 生效范围：详情搜索 / 设置页 / 快搜窗，各自开关 */
+  scope_main: boolean
+  scope_settings: boolean
+  scope_mini: boolean
   /** 文件修改时间：换图 / 重选同一张时用它让浏览器重新取图（缓存键） */
   v?: number
   err?: string
@@ -183,7 +292,14 @@ const wallPost = (body: unknown) =>
   })
 
 export const setWallFile = (path: string) => wallPost({ op: 'set', path })
-export const tuneWall = (opacity: number, blur: number) => wallPost({ op: 'tune', opacity, blur })
+export type WallTune = Partial<
+  Pick<
+    WallState,
+    'opacity' | 'blur' | 'pos_x' | 'pos_y' | 'zoom' | 'scope_main' | 'scope_settings' | 'scope_mini'
+  >
+>
+/** 第 362 项：只改传进来的字段 —— 位置/缩放/范围都走这里 */
+export const tuneWall = (patch: WallTune) => wallPost({ op: 'tune', ...patch })
 export const clearWall = () => wallPost({ op: 'clear' })
 
 /** 授权状态。字段与后端 license_core.parse_code 的返回一致，未激活时 edition='free'。 */
@@ -197,6 +313,8 @@ export type LicenseState = {
   exp: string
   issued: string
   features: string[]
+  /** 计划名：free / pro / team（第 293 项由码类型推导，商用许可看这个而不是 features） */
+  plan: 'free' | 'pro' | 'team'
   days_left: number | null
   code_masked: string
   clock_warn: boolean
@@ -254,6 +372,10 @@ export const getTimeline = (days = 14, kind = 'all') => {
 export const getSettings = () => api<Settings>('/api/settings')
 export const saveSettings = (patch: Settings) =>
   api<{ ok: boolean }>('/api/settings', { method: 'POST', body: JSON.stringify(patch) })
+export type TranslateItem = { engine: string; text: string; extra?: string }
+export type TranslateData = { ok: boolean; src?: string; tgt?: string; text?: string; results: TranslateItem[] }
+export const translateText = (text: string, to: string = 'auto', from: string = 'auto') =>
+  api<TranslateData>('/api/translate', { method: 'POST', body: JSON.stringify({ text, to, from }) })
 export const getAutostart = () => api<{ on: boolean }>('/api/autostart')
 export const setAutostart = (on: boolean) =>
   api<{ ok: boolean; on: boolean }>('/api/autostart', { method: 'POST', body: JSON.stringify({ on }) })
@@ -467,10 +589,54 @@ export type Health = {
   issues?: HealthItem[]
   plan?: string[]
   text?: string
+  /** 第 281 项：全库校验的最近结论（体检里不再跑 quick_check，结论从磁盘读） */
+  verify?: VerifyState
+  /** 第 277 项：本机功能计数摘要（只在有失败时出现） */
+  metrics?: {
+    name: string
+    h24_calls: number
+    h24_bad: number
+    bad_rate: number
+    p95: number
+    last_err: string
+  }[]
 }
-export const getHealth = (force = false, lang = 'zh') => {
+
+/** 第 281 项：全库校验（整库 quick_check）单独一个动作，慢，后台跑，状态可查。 */
+export type VerifyState = {
+  running: boolean
+  started_s: number
+  last?: {
+    state?: string
+    ok?: boolean
+    at?: string
+    elapsed?: number
+    mb?: number
+    stale?: boolean
+  }
+}
+export const getVerify = () => api<VerifyState>('/api/index/verify')
+export const runVerify = () => api<VerifyState>('/api/index/verify', { method: 'POST' })
+export const getHealth = (force = false, lang = 'zh', deep = false) => {
   const q = new URLSearchParams()
   if (force) q.set('force', '1')
+  // deep=1 才会真的连翻译引擎 / 加载 OCR / 跑截图，只在用户点「深度体检」时传
+  if (deep) q.set('deep', '1')
   q.set('lang', lang)
   return api<Health>(`/api/env?${q.toString()}`)
 }
+
+/** 第 194 项：把目录送进当前正在使用的打开/保存对话框（Quick Switch）。
+ *  items 里 k=open 是资源管理器当前打开的目录，k=recent 是最近打开过的目录。 */
+export type OpenDir = { p: string; n: string; k: 'open' | 'recent' }
+export type OpenDirs = { items: OpenDir[]; dialog: boolean; title?: string }
+export type DialogJump = { ok: boolean; reason?: string; path?: string }
+
+export const getOpenDirs = () => api<OpenDirs>('/api/open_dirs')
+
+export const dialogJump = (p: string) =>
+  api<DialogJump>('/api/dialog_jump', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ p }),
+  })

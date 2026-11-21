@@ -18,8 +18,33 @@
 
 # ─────────────────────────── 内核（开发根是唯一维护地） ───────────────────────────
 sync  brain.py
+sync  pdf_engine.py
+sync  clipboard_mgr.py
+sync  translator.py
+sync  tts.py
+sync  tests/test_346_tts.py
+sync  tests/test_plat_382.py
+# 卸载（第 296 项）：生成 .cmd + 登记「设置→应用」卸载项；漏了它 exe 里 import 直接失败
+sync  uninstall.py
+# 系统程序清单（第 297 项）：设置/cmd/记事本… 不在索引里，查询时补
+sync  sys_apps.py
+sync  snip_ocr.py
+# 第 380 项：OCR 引擎统一入口（薄适配层，brain/snip_ocr/selftest 都走它）
+sync  ocr_engine.py
+sync  plat/
+sync  THIRD-PARTY-NOTICES.md
+sync  licenses/
+sync  snip_overlay.py
+sync  snip_card.py
+# 免打包调试通道（第 370 项）：启动时优先加载 App\dev_override\<name>.py
+sync  dev_override.py
+sync  quick_switch.py
+sync  typewatch.py
+sync  follow_click.py
 sync  libsets.py
 sync  error_report.py
+sync  feature_metrics.py
+sync  breadcrumb.py
 sync  settings_backup.py
 # 离线授权（第 137 项）：纯标准库 Ed25519，只有公钥进 exe；
 # 签发工具在开发根 tools/make_license.py，**不进本仓库**（私钥更不进）
@@ -48,13 +73,41 @@ sync  tests/test_license.py
 sync  tests/test_care.py
 sync  tests/test_dedupe_nested.py
 sync  tests/test_appearance.py
+sync  tests/test_quick_switch.py
+sync  tests/test_follow_click.py
+sync  tests/test_locale_308.py
+sync  tests/test_mini_recent_rank.py
+sync  tests/test_default_exclude.py
+sync  tests/test_hit_contract.py
+sync  tests/test_folder_syntax.py
+sync  tests/test_startup_paths.py
+sync  tests/test_software_dir_sniff.py
+sync  tests/test_software_dir_rules.py
+sync  tests/test_audio_probe.py
+sync  tests/test_type_popup_dismiss.py
+sync  tests/test_single_popup_style.py
+sync  tests/test_app_entries.py
+sync  tests/test_shell_app_icon.py
+sync  tests/test_competitor_improvements.py
+sync  tests/test_native_dialog_thread.py
+sync  tests/test_libsets.py
+sync  tests/test_snip_ocr.py
+sync  tests/test_snip_translate_369.py
+sync  tests/test_nc_hit_368.py
+sync  tests/test_clipboard_mgr.py
+sync  tests/test_translator.py
+sync  tests/test_uninstall_296.py
+sync  tests/test_sys_apps_297.py
 sync  env_check.py
 sync  env_msgs.py
 sync  app_window.py
 sync  hotkey.py
+sync  floating_ball.py
 sync  tray.py
 sync  apprank.py
 sync  scan_docs.py
+sync  audio_probe.py
+sync  app_entries.py
 sync  ocr_backfill.py
 sync  gen_icon.py
 
@@ -87,6 +140,7 @@ sync  web/src/
 sync  assets/donate.png
 sync  assets/icon.ico
 sync  assets/icon_preview.png
+sync  assets/ball.png
 # 下面这些截图只在这个仓库里维护（README 用，2× DPR，760/1280 宽）
 local assets/screenshot-quick.png
 local assets/screenshot-quick-empty.png
@@ -142,3 +196,14 @@ private pro/
 # ─────────────────────────── 构建产物（不进 git） ───────────────────────────
 build web/dist/
 local 报告问题.bat
+sync  tests/test_web_search.py
+sync  tests/test_window_size_saved.py
+sync  tests/test_tray_panel_open.py
+sync  tests/test_floating_ball.py
+sync  tests/test_telemetry.py
+sync  tools/verify_user_runtime.py
+sync  netproxy.py
+sync  tests/test_netproxy_299.py
+
+
+

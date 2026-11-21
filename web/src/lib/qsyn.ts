@@ -24,6 +24,24 @@ export type QSyn = {
 
 const SU: Record<string, number> = { k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 }
 
+/**
+ * 第 309 项：把「语法前缀 + 冒号」两边的空白和全角冒号收拢掉。
+ *
+ * 实测（2026-11-18 用户报「信息安全 ext:pdf 搜不到」）：`ext:pdf` 有 30 条，
+ * 而 `ext: pdf`（冒号后多打一个空格）、`ext： pdf`、`ext :pdf` 全部 0 条 ——
+ * 因为切词后 `ext:` 变成一个空值语法前缀，落到关键词里变成「ext:」这个字面词，
+ * 什么都匹配不上，用户看到的就是「搜索坏了」。中文输入法在冒号后补空格很常见，
+ * 所以这里在切词之前先规整：`ext : pdf` → `ext:pdf`。
+ *
+ * 只动这几个已知前缀，不动文件名里正常的冒号。
+ */
+const SYN_NORM = /(^|[\s\u3000])(ext|type|size|dm|content|内容)[\s\u3000]*[:：][\s\u3000]*/gi
+
+export function normSynText(raw: string): string {
+  return String(raw ?? '').replace(SYN_NORM, (_m, lead: string, pfx: string) => lead + pfx + ':')
+}
+
+
 export function qsize(num: string, unit = ''): number | null {
   const v = Number(num)
   if (!Number.isFinite(v)) return null
@@ -31,8 +49,10 @@ export function qsize(num: string, unit = ''): number | null {
 }
 
 export function parseQSyn(raw: string): QSyn {
+  // 第 309 项：先规整「前缀 + 冒号 + 空格」写法，再切词。
+  const norm = normSynText(raw)
   const syn: QSyn = {
-    q: String(raw ?? '').trim(),
+    q: norm.trim(),
     ext: null,
     size: [null, null],
     days: null,
@@ -41,8 +61,23 @@ export function parseQSyn(raw: string): QSyn {
     content: false,
   }
   const rest: string[] = []
-  // 用 [ \t\u3000] 切：中文输入法常带全角空格，JS 的 split(' ') 会把它留在词里
-  for (let tok of String(raw ?? '').split(/[ \t\u3000]+/)) {
+  // 用 [ \t\u3000] 切：中文输入法常带全角空格，JS 的 split(' ') 会把它留在词里。
+  // 第 294 项（H）：双引号内的空格不切 —— 目录名带空格时（`"D:\我的 文件\"`）
+  // 否则会被切成两个词，folder 过滤直接失效。
+  const toks: string[] = []
+  for (const t of norm.match(/"[^"]*"|[^\s\u3000]+/g) || []) {
+    // 第 309 项：`ext: pdf, docx` 切词后是 `pdf,` + `docx`，后半段会掉成关键词，
+    // 这里把以逗号结尾的 ext/type 前缀和后面那个词拼回去。
+    const prev = toks[toks.length - 1]
+    if (prev && /^(ext:|type:)/i.test(prev) && prev.trim().endsWith(',')) {
+      toks[toks.length - 1] = prev + t
+    } else {
+      toks.push(t)
+    }
+  }
+  for (let tok of toks) {
+    if (!tok) continue
+    if (tok.length > 2 && tok.startsWith('"') && tok.endsWith('"')) tok = tok.slice(1, -1)
     if (!tok) continue
     let low = tok.toLowerCase()
 

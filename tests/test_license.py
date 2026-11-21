@@ -95,9 +95,12 @@ class TestCode(unittest.TestCase):
         self.assertEqual(res['exp'], '2027-11-07')
 
     def test_all_features(self):
+        # 第 293 项：'*' = 全部功能位，但**不含** commercial ——
+        # 商用许可只由码类型（pro / team）推导，trial 不送。
         code = L.make_code(SEED, features='*')
         res = L.parse_code(code, PUB)
-        self.assertEqual(set(res['features']), set(L.ALL_FEATURES))
+        want = set(L.ALL_FEATURES) - {'commercial'}
+        self.assertEqual(set(res['features']), want)
 
     def test_partial_features(self):
         code = L.make_code(SEED, features='export,ocr_batch')

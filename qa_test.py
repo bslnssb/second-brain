@@ -607,7 +607,7 @@ def write_report(path, meta):
     n_warn = sum(1 for r in RESULTS if r[2] == 'WARN')
     n_info = sum(1 for r in RESULTS if r[2] == 'INFO')
 
-    lines = [f'# 第二大脑 QA 报告（{now}）', '']
+    lines = [f'# Memex QA 报告（{now}）', '']
     lines.append(f'**结论：{n_pass} 通过 / {n_fail} 失败 / {n_warn} 警告 / {n_info} 说明**')
     lines.append('')
     lines.append('> 由 `qa_test.py` 自动生成。用真实索引库跑，只读，不写库、不建索引。')

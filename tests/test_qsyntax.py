@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import brain  # noqa: E402
+from unittest import mock  # noqa: E402
 
 
 class TestSizeSyntaxNoColon(unittest.TestCase):
@@ -190,6 +191,86 @@ class TestBodySlots(unittest.TestCase):
     def test_never_exceeds_limit(self):
         for n in range(0, 10):
             self.assertLessEqual(brain._body_slots(n, False), 9)
+
+
+class ExtOnlyTest(unittest.TestCase):
+    """第 229 项三/五轮：纯语法筛选（无关键词）必须能列出文件；
+    多格式（含全角逗号）、类型别名、size 的 SQL 直查都要能用。"""
+
+    def _con(self):
+        import sqlite3
+        con = sqlite3.connect(':memory:')
+        con.execute('CREATE TABLE files(path TEXT PRIMARY KEY, name TEXT NOT NULL, '
+                    'dir TEXT, ext TEXT, size REAL, mtime REAL)')
+        con.executemany('INSERT INTO files VALUES(?,?,?,?,?,?)', [
+            (r'C:\a\新报告.pdf', '新报告.pdf', r'C:\a', '.pdf', 1024.0, 200.0),
+            (r'C:\b\旧简历.docx', '旧简历.docx', r'C:\b', '.docx', 2048.0, 100.0),
+            (r'C:\c\note.txt', 'note.txt', r'C:\c', '.txt', 10.0, 300.0),
+        ])
+        return con
+
+    def test_parse_strips_ext_only_query(self):
+        # 前提：ext:pdf 被语法剥走后 q 为空 —— 这正是以前「搜不到」的根因
+        self.assertEqual('', brain.parse_qsyn('ext:pdf')['q'])
+        self.assertEqual('pdf', brain.parse_qsyn('ext:pdf')['ext'])
+
+    def test_ext_multi_fullwidth_comma_and_alias(self):
+        # 全角逗号/顿号 + word→doc,docx（.word 不是真扩展名，以前永远 0 条）
+        self.assertEqual('pdf,doc,docx', brain.parse_qsyn('ext:pdf，word')['ext'])
+        self.assertEqual('pdf,doc', brain.parse_qsyn('ext:pdf、doc')['ext'])
+        self.assertEqual('pdf,doc,docx', brain.parse_qsyn('ext:pdf,word')['ext'])
+        self.assertEqual('xls,xlsx', brain.parse_qsyn('ext:excel')['ext'])
+
+    def test_ext_only_lists_and_sorts(self):
+        with mock.patch.object(brain.apprank, 'is_app_file', return_value=False), \
+                mock.patch.object(brain.apprank, 'name_for_exe', return_value=None):
+            items, total = brain.syntax_only_items(
+                self._con(), brain.parse_qsyn('ext:pdf'), 10)
+        self.assertEqual(1, total)
+        self.assertEqual({'.pdf'}, {it['e'] for it in items})
+        self.assertEqual('新报告.pdf', items[0]['n'])   # mtime 新的在前
+        self.assertEqual(1024.0, items[0]['z'])
+
+    def test_size_sql_filter(self):
+        # 五轮：size 纯语法走 SQL，不再靠「最近 400 条后筛」（池子里没大文件就 0 条）
+        with mock.patch.object(brain.apprank, 'is_app_file', return_value=False), \
+                mock.patch.object(brain.apprank, 'name_for_exe', return_value=None):
+            items, total = brain.syntax_only_items(
+                self._con(), brain.parse_qsyn('size:>1.5k'), 10)
+            self.assertEqual(1, total)
+            self.assertEqual('旧简历.docx', items[0]['n'])
+            items, total = brain.syntax_only_items(
+                self._con(), brain.parse_qsyn('size:1k-2m'), 10)
+        self.assertEqual(2, total)   # 1024 和 2048 都在闭区间内
+
+    def test_ext_plus_size_combo(self):
+        with mock.patch.object(brain.apprank, 'is_app_file', return_value=False), \
+                mock.patch.object(brain.apprank, 'name_for_exe', return_value=None):
+            items, total = brain.syntax_only_items(
+                self._con(), brain.parse_qsyn('ext:pdf size>1.5k'), 10)
+            self.assertEqual(0, total)   # 唯一的 pdf 只有 1k，被 size 筛掉
+            items, total = brain.syntax_only_items(
+                self._con(), brain.parse_qsyn('ext:pdf,docx size>1.5k'), 10)
+        self.assertEqual(1, total)
+
+    def test_empty_syntax_returns_empty(self):
+        self.assertEqual([], brain.syntax_only_items(
+            self._con(), brain.parse_qsyn(''), 10)[0])
+
+    def test_fullwidth_colon(self):
+        """第 229 项四轮：中文输入法的全角冒号也要认成语法。"""
+        s = brain.parse_qsyn('ext：pdf')
+        self.assertEqual('', s['q'])
+        self.assertEqual('pdf', s['ext'])
+        s = brain.parse_qsyn('ext：pdf size：>10m')
+        self.assertEqual('pdf', s['ext'])
+        self.assertEqual(10 * 1024 * 1024, s['size'][0])
+        s = brain.parse_qsyn('c：微信')
+        self.assertTrue(s['content'])
+        self.assertEqual('微信', s['q'])
+        # 文件名里合法的全角冒号不能被吞（没有语法前缀就不动）
+        s = brain.parse_qsyn('报告：终稿')
+        self.assertEqual('报告：终稿', s['q'])
 
 
 if __name__ == '__main__':

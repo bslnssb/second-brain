@@ -30,7 +30,7 @@ _DEBUG = bool(os.environ.get('SB_DEBUG'))
 # 这里按 brain.boot_lang() 现取，每次弹菜单时重新算（改语言后下一次右键就变）。
 TRAY_L = {
     'zh': {'main': '打开详细搜索', 'mini': '快搜窗口（双击 Ctrl）', 'settings': '设置…',
-           'about': '关于第二大脑', 'help': '使用帮助', 'feedback': '反馈 / 报错', 'quit': '退出'},
+           'about': '关于 Memex', 'help': '使用帮助', 'feedback': '反馈 / 报错', 'quit': '退出'},
     'en': {'main': 'Open the search window', 'mini': 'Quick search (double Ctrl)', 'settings': 'Settings…',
            'about': 'About', 'help': 'Help', 'feedback': 'Feedback / report a bug', 'quit': 'Quit'},
     'es': {'main': 'Abrir la ventana de búsqueda', 'mini': 'Búsqueda rápida (doble Ctrl)', 'settings': 'Ajustes…',
@@ -99,7 +99,7 @@ class Tray:
     on_quit()      菜单「退出」（调用方负责真正结束进程）
     """
 
-    def __init__(self, on_main, on_mini=None, on_quit=None, tip='第二大脑',
+    def __init__(self, on_main, on_mini=None, on_quit=None, tip='Memex',
                  on_settings=None, on_about=None, on_feedback=None, on_help=None):
         self.on_main = on_main
         self.on_mini = on_mini
@@ -109,6 +109,7 @@ class Tray:
         self.on_feedback = on_feedback
         self.on_help = on_help
         self.tip = tip
+        self._tip_now = tip
         self.ok = False
         self._hwnd = None
         self._thread = None
@@ -282,6 +283,25 @@ class Tray:
         try:
             win32gui.Shell_NotifyIcon(
                 win32gui.NIM_DELETE, (self._hwnd, 0, 0, 0, None, ''))
+        except Exception:
+            pass
+
+    def set_tip(self, text):
+        """第 224 项：运行中改托盘悬停提示（NIM_MODIFY）。
+
+        索引/扫描期间显示进度（「Memex（索引更新中 …）」），结束恢复常规提示。
+        文本没变就不打 Shell_NotifyIcon；失败静默 —— 提示是辅助信息，
+        不该为它报错、更不该影响主流程。"""
+        try:
+            import win32gui
+            text = (text or self.tip)[:127]
+            if text == self._tip_now:
+                return
+            self._tip_now = text
+            nid = (self._hwnd, 0,
+                   win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP,
+                   WM_TRAY, self._hicon, text)
+            win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, nid)
         except Exception:
             pass
 

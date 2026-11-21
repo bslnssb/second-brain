@@ -2,9 +2,9 @@
 """把刚打好的应用部署到项目根目录（带自动备份 + 轮转），别再手搓 cp。
 
 背景（2026-11-06）：
-    以前每次部署都是手工 `cp SecondBrain.exe` + `mv _internal _internal-prev-<时间戳>`，
+    以前每次部署都是手工 `cp Memex.exe` + `mv _internal _internal-prev-<时间戳>`，
     一个下午就在项目根目录堆了 34 个 `_internal-prev-*`（每个 316 MB，合计 11 GB）
-    和 36 个 `SecondBrain.exe-prev-*`，根目录彻底看不见正经文件。
+    和 36 个 `Memex.exe-prev-*`，根目录彻底看不见正经文件。
 
 现在只有一条命令：
     python -m PyInstaller --noconfirm --clean second-brain-app.spec
@@ -12,7 +12,9 @@
 
 规则：
     - 旧版本**移动**到 构建产物/build-backup/<YYYYMMDD-HHMMSS>/（同盘 rename，瞬时，不复制）
-    - 新版本从 上传的干净版/dist/SecondBrain/ 复制到 开发测试版/
+    - 第 292 项（2026-11-18）起**默认不再**把 exe/_internal 镜像到 开发测试版：
+      运行位置只有装机版 App，程序由 开发测试版/tmp/deploy_installed.py 部署；
+      旧行为（镜像到开发测试版）留在 DEV_MIRROR 开关后面。
     - 超过 --keep 份的旧备份自动删除（只删本脚本自己产出的目录结构）
     - release/ 已被 brain._SELF_DIRS 排除，备份不会被索引进库
 
@@ -21,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -29,11 +32,18 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent          # 上传的干净版
 ROOT = HERE.parent / '开发测试版'                # 开发测试版（brain.py 与运行数据所在）
-SRC = HERE / 'dist' / 'SecondBrain'
+SRC = HERE / 'dist' / 'Memex'
 BACKUP_ROOT = HERE.parent / '构建产物' / 'build-backup'
 
-EXE = 'SecondBrain.exe'
+EXE = 'Memex.exe'
 INTERNAL = '_internal'
+
+# 第 292 项（2026-11-18）：运行位置只有装机版 App。
+# 以前这个脚本把 exe + _internal 镜像到 开发测试版，于是磁盘上有两份可运行副本、
+# 两个 brain.db（2.4 GB 在用 / 1 GB 旧库），谁跑旧了谁也看不出来。
+# 现在默认只往装机版目录补「报告问题.bat」；真要恢复旧行为，把 DEV_MIRROR 改回 True。
+DEV_MIRROR = False
+APP_DIR = Path(os.environ.get('LOCALAPPDATA', '')) / 'Memex' / 'App'
 
 
 def human(n: int) -> str:
@@ -60,6 +70,8 @@ def source_ok() -> bool:
     if not (SRC / INTERNAL).is_dir():
         print(f'[x] 没找到 {SRC / INTERNAL}')
         return False
+    # 第 302 项：每次打包都顺手生成 Uninstall.exe（同一个 exe 的副本）
+    ensure_uninstaller(SRC)
     return True
 
 
@@ -154,6 +166,20 @@ def prune_web_assets(root: Path) -> int:
         except OSError:
             pass        # 被占用就留着，清垃圾绝不能让部署失败
     return n
+
+
+def ensure_uninstaller(src_dir: Path) -> Path:
+    """第 302 项：安装目录里必须有 Uninstall.exe（用户双击就能卸）。
+    它就是 Memex.exe 的副本 —— 主程序启动时看到自己叫 Uninstall.exe 就走卸载流程，
+    免得再维护第二份二进制、也免得签名/密码学两套。"""
+    exe = src_dir / EXE
+    uni = src_dir / 'Uninstall.exe'
+    try:
+        if exe.is_file():
+            shutil.copy2(exe, uni)
+    except OSError:
+        pass
+    return uni
 
 
 def deploy() -> bool:
@@ -278,10 +304,25 @@ def main() -> int:
     print(f'目标：{ROOT}')
     if not source_ok():
         return 2
+    if not DEV_MIRROR:
+        # 第 292 项：不再往开发测试版镜像运行副本（那会造出第二份程序 + 第二份数据）。
+        try:
+            bat = SRC / '报告问题.bat'
+            if not bat.is_file():
+                bat = HERE / '报告问题.bat'
+            if bat.is_file() and APP_DIR.is_dir():
+                shutil.copy2(bat, APP_DIR / '报告问题.bat')
+                print('[2/3] 兜底入口 → 装机版\\报告问题.bat')
+        except Exception as e:
+            print('[!] 报告问题.bat 没复制成功：%r' % (e,))
+        print('[2/3] 已跳过「开发测试版」运行副本镜像（运行位置只有装机版，'
+              '程序由 tmp/deploy_installed.py 部署）')
+        print('完成（本次未改动任何程序文件）。')
+        return 0
     backup_current()
     if not deploy():
         print('[x] 部署校验失败：缺 exe / _internal，或 exe 与构建产物 sha 不一致')
-        print('    若提示文件被占用，先退出正在运行的 SecondBrain.exe，再重跑 stage_app.py')
+        print('    若提示文件被占用，先退出正在运行的 Memex.exe，再重跑 stage_app.py')
         return 3
     rotate(max(args.keep, 0))
     print('完成。回滚＝把 构建产物/build-backup 里对应目录的 exe 和 _internal 搬回 开发测试版/。')

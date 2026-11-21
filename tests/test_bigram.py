@@ -71,10 +71,9 @@ class BigramSearchTest(unittest.TestCase):
         shutil.rmtree(self.tmp.name, ignore_errors=True)
 
     def _insert_doc(self, con, path, text):
-        cur = con.execute('INSERT INTO docs VALUES(?,?,?)',
-                          (path, os.path.splitext(path)[1], text))
-        brain._bigram_add(con, cur.lastrowid, text)
-        return cur.lastrowid
+        rid = brain.doc_insert(con, path, os.path.splitext(path)[1], text)
+        brain._bigram_add(con, rid, text)
+        return rid
 
     def test_2char_query_routes_to_bigram_and_hits(self):
         con = brain.init_db()

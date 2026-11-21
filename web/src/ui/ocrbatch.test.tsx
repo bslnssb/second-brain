@@ -88,14 +88,15 @@ describe('OcrBatchModal', () => {
 
   it('「加入当前结果」只把扫描件路径交给后端', async () => {
     const posted: unknown[] = []
-    const { container } = setup(RUNNING, posted, [
+    setup(RUNNING, posted, [
       { p: 'D:/case/a.pdf' },
       { p: 'D:/case/photo.JPG' },
       { p: 'D:/case/note.docx' },
       { p: 'D:/case/app.exe' },
     ])
-    expect(container.textContent).toContain('(2)')
-    const btn = container.querySelector('[data-act="ocr-add-results"]') as HTMLElement
+    // 第 381 项：Modal 改为 portal 到 body，断言必须查 document
+    expect(document.body.textContent).toContain('(2)')
+    const btn = document.querySelector('[data-act="ocr-add-results"]') as HTMLElement
     fireEvent.click(btn)
     await vi.waitFor(() => expect(posted.length).toBe(1))
     expect(posted[0]).toEqual({
@@ -106,8 +107,8 @@ describe('OcrBatchModal', () => {
 
   it('暂停按钮在运行时才出现，点它发 pause', async () => {
     const posted: unknown[] = []
-    const { container } = setup(RUNNING, posted)
-    const btn = container.querySelector('[data-act="ocr-pause"]') as HTMLElement
+    setup(RUNNING, posted)
+    const btn = document.querySelector('[data-act="ocr-pause"]') as HTMLElement
     expect(btn).toBeTruthy()
     fireEvent.click(btn)
     await vi.waitFor(() => expect(posted.length).toBe(1))
@@ -115,9 +116,9 @@ describe('OcrBatchModal', () => {
   })
 
   it('暂停状态显示「继续」而不是「暂停」', () => {
-    const { container } = setup({ ...RUNNING, run: 'paused' }, [])
-    expect(container.querySelector('[data-act="ocr-pause"]')).toBeNull()
-    expect(container.querySelector('[data-act="ocr-resume"]')).toBeTruthy()
+    setup({ ...RUNNING, run: 'paused' }, [])
+    expect(document.querySelector('[data-act="ocr-pause"]')).toBeNull()
+    expect(document.querySelector('[data-act="ocr-resume"]')).toBeTruthy()
   })
 
   it('失败项显示原因，成功项显示页数', () => {
@@ -133,3 +134,5 @@ describe('OcrBatchModal', () => {
     expect(document.body.textContent).toContain('pymupdf 炸了')
   })
 })
+
+

@@ -1,5 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { errOp } from '../api'
+import { reportJs } from '../lib/errhook'
 import { t } from '../lib/i18n'
 
 /**
@@ -23,6 +24,11 @@ export class ErrorBoundary extends Component<Props, State> {
   componentDidCatch(err: Error, info: ErrorInfo) {
     // 打包后没有 devtools，至少让 pywebview 的控制台里留一条能对上的线索
     console.error('[sb] render error', err, info.componentStack)
+    // 第 277 项：自动上报（op=js）。以前要用户手动点「报告」，而白屏时
+    // 用户往往直接去任务管理器结束了进程 —— 证据永远拿不到。
+    reportJs('RenderError', err.message || String(err),
+             `${err.stack || ''}\n${info.componentStack || ''}`)
+    void this.report()
   }
 
   // 第 162 项：界面崩了，设置页里的「报告我看到的问题」根本进不去。
@@ -30,7 +36,7 @@ export class ErrorBoundary extends Component<Props, State> {
   async report() {
     const e = this.state.err
     if (!e) return
-    const text = ['界面渲染崩溃', String(e.message || e), String(e.stack || '')]
+    const text = [t('err_render_crash'), String(e.message || e), String(e.stack || '')]
       .filter(Boolean).join('\n').slice(0, 1800)
     try {
       await errOp('feedback', { text })

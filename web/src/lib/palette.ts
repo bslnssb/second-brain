@@ -32,6 +32,9 @@ export type Palette = {
   dark: boolean
   /** 分组只影响设置里的排列顺序 */
   group: 'basic' | 'paper' | 'soft' | 'deep'
+  /** 第 202 项：和别的配色肉眼几乎同色，设置里不再展示；**id 仍保留**，
+      避免删 id 牵动前后端列表 / i18n / 用户已保存的 sb_palette。 */
+  legacy?: boolean
   /** 不填 = 用 index.css 的默认值 */
   vars?: PaletteVars
 }
@@ -45,7 +48,7 @@ export const BASE_BG = { light: '244 246 250', dark: '24 27 33' }
 export const PALETTES: Palette[] = [
   // ── 系统与基础：不加 vars，跟随 index.css / data-theme ──
   { id: 'auto', dark: false, group: 'basic' },
-  { id: 'light', dark: false, group: 'basic' },
+  { id: 'light', dark: false, group: 'basic', legacy: true },
   { id: 'dark', dark: true, group: 'basic' },
 
   // ── 纸墨质感：暖色底，长时间看文档比纯白舒服 ──
@@ -65,6 +68,7 @@ export const PALETTES: Palette[] = [
   },
   {
     id: 'amber',
+    legacy: true,
     dark: false,
     group: 'paper',
     vars: {
@@ -79,6 +83,7 @@ export const PALETTES: Palette[] = [
   },
   {
     id: 'pure',
+    legacy: true,
     dark: false,
     group: 'paper',
     vars: {
@@ -109,6 +114,7 @@ export const PALETTES: Palette[] = [
   },
   {
     id: 'blue',
+    legacy: true,
     dark: false,
     group: 'soft',
     vars: {
@@ -123,6 +129,7 @@ export const PALETTES: Palette[] = [
   },
   {
     id: 'lilac',
+    legacy: true,
     dark: false,
     group: 'soft',
     vars: {
@@ -153,6 +160,7 @@ export const PALETTES: Palette[] = [
   // ── 深邃暗色：夜里用，对比度别调太高（纯黑白反而刺眼） ──
   {
     id: 'graphite',
+    legacy: true,
     dark: true,
     group: 'deep',
     vars: {
@@ -167,6 +175,7 @@ export const PALETTES: Palette[] = [
   },
   {
     id: 'night',
+    legacy: true,
     dark: true,
     group: 'deep',
     vars: {
@@ -195,6 +204,7 @@ export const PALETTES: Palette[] = [
   },
   {
     id: 'black',
+    legacy: true,
     dark: true,
     group: 'deep',
     vars: {
@@ -212,8 +222,9 @@ export const PALETTES: Palette[] = [
     dark: true,
     group: 'deep',
     vars: {
-      bg: '10 16 20',
-      card: '16 26 32',
+      /* 第 202 项：原来和 dark(24 27 33) 都是近黑，改成明显偏青的深蓝绿 */
+      bg: '4 40 56',
+      card: '10 52 70',
       ink: '220 246 250',
       sub: '120 170 180',
       line: '32 58 66',
@@ -249,6 +260,23 @@ export function paletteBg(id: string, systemDark: boolean): string {
 export function paletteBgHex(id: string, systemDark: boolean): string {
   const rgb = paletteBg(id, systemDark).split(/\s+/).map((n) => Number(n) || 0)
   return '#' + rgb.map((n) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * 三档基础色在 index.css 里实际生效的值（与 index.css 逐字一致）。
+ * 卡片这类原生窗口要的是「屏幕上真正显示的颜色」，光知道 id 还不够 ——
+ * auto 得先按系统深浅落成 light/dark 才有意义。
+ */
+export const BASE_VARS: Record<'light' | 'dark', PaletteVars> = {
+  light: { bg: '244 246 250', card: '255 255 255', ink: '26 34 51', sub: '92 104 128', line: '226 231 240', accent: '37 99 235', side: '110 122 148' },
+  dark: { bg: '24 27 33', card: '31 35 43', ink: '232 236 244', sub: '154 164 182', line: '52 58 70', accent: '110 141 248', side: '150 162 182' },
+}
+
+/** 这套配色此刻真正落地的 7 个颜色（三档基础色也解析成具体值，不给 null） */
+export function paletteVarsOf(id: string, systemDark: boolean): PaletteVars {
+  const p = getPalette(id)
+  if (p.vars) return p.vars
+  return paletteDark(id, systemDark) ? BASE_VARS.dark : BASE_VARS.light
 }
 
 /** 基础三档不带 vars —— App 用它决定「要不要把底色报给原生窗口」 */
@@ -288,6 +316,9 @@ export function applyPalette(id: string, systemDark: boolean): { dark: boolean; 
   }
   try {
     localStorage.setItem(LS_KEY, p.id)
+    // 第 195 项：快搜窗（/mini）是独立的内嵌页面，拿不到这里的模块；
+    // 同源 localStorage 是两边唯一零成本的数据通道。
+    localStorage.setItem('sb_vars', JSON.stringify({ dark, vars: p.vars || null }))
   } catch {
     /* 隐私模式下 localStorage 会抛，不影响当前这次生效 */
   }

@@ -229,3 +229,77 @@ export function IconMini({ size = 16 }: { size?: number }) {
     </svg>
   )
 }
+
+/* 设置侧栏「网络搜索」用：地球（经线 + 纬线 + 赤道），Listary 同位置也是地球 */
+export const IconGlobe = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="10" cy="10" r="7" />
+    <ellipse cx="10" cy="10" rx="3.1" ry="7" />
+    <path d="M3 10h14" />
+  </Svg>
+)
+
+/* 设置侧栏「网络代理」用：插头 + 一条线（和「网络搜索」的地球区分开） */
+export const IconPlug = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M6.2 3.2v3.2M11.8 3.2v3.2" />
+    <path d="M4.6 6.4h8.8v2.6a4.4 4.4 0 0 1-8.8 0z" />
+    <path d="M9 13.4v3.4h5.6" />
+  </Svg>
+)
+
+/* 设置侧栏「热键」用：一块键盘（键位 + 空格条） */
+export const IconKeyboard = (p: IconProps) => (
+  <Svg {...p}>
+    <rect x="2" y="5" width="16" height="10" rx="1.6" />
+    <path d="M5.4 8h.01M8.2 8h.01M11 8h.01M13.8 8h.01M5.4 10.6h.01M8.2 10.6h.01M11 10.6h.01M13.8 10.6h.01" />
+    <path d="M7 12.9h6" />
+  </Svg>
+)
+
+/* 设置侧栏「文件搜索」用：文件夹里露半个放大镜，和纯放大镜区分开 */
+export const IconFolderSearch = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M2.8 5.6c0-.9.7-1.6 1.6-1.6h3.1l1.5 1.8h6.6c.9 0 1.6.7 1.6 1.6v7.6c0 .9-.7 1.6-1.6 1.6H4.4c-.9 0-1.6-.7-1.6-1.6z" />
+    <circle cx="9.4" cy="10.6" r="2.1" />
+    <path d="M10.9 12.1l2 2" />
+  </Svg>
+)
+
+/* 屏幕截图按钮：直观的屏幕裁切截取框图标 */
+export const IconSnip = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M5 3v10a2 2 0 0 0 2 2h10" />
+    <path d="M15 17V7a2 2 0 0 0-2-2H3" />
+  </Svg>
+)
+
+/* 截图识字 / 文字提取图标：方框中带有大写 T 字符识别符号 */
+export const IconOcr = (p: IconProps) => (
+  <Svg {...p}>
+    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+    <path d="M7 8h10" />
+    <path d="M12 8v8" />
+    <path d="M9 16h6" />
+  </Svg>
+)
+
+/* 剪贴板历史图标 */
+export const IconClipboard = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M13.5 3.5h1.5a1.5 1.5 0 0 1 1.5 1.5v11.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5V5a1.5 1.5 0 0 1 1.5-1.5h1.5" />
+    <rect x="7" y="2" width="6" height="3" rx="1" ry="1" />
+  </Svg>
+)
+
+/* 聚合翻译图标 */
+export const IconTranslate = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M4.5 6.5l5 5" />
+    <path d="M3.5 11.5l5-5 1.5-2.5" />
+    <path d="M2 4h10" />
+    <path d="M6 1.5h1" />
+    <path d="M18 18l-4-8-4 8" />
+    <path d="M11.5 15h5" />
+  </Svg>
+)

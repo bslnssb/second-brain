@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把 dist/SecondBrain 打成安装器用的 payload.zip。
+"""把 dist/Memex 打成安装器用的 payload.zip。
 
 **先自检再打包**：上一版出过「payload 是空的但安装器照样打包成功」的事故
 （第 77 项之后发现的 v0.9.32 安装器），用户装到一半只得到一句「解压后没找到主程序」。
@@ -9,14 +9,17 @@ import sys
 import zipfile
 from pathlib import Path
 
-root = Path('dist/SecondBrain')
-docs = [Path('使用说明.md'), Path('README.md')]
+root = Path('dist/Memex')
+docs = [Path('使用说明.md'), Path('README.md'),
+        Path('使用说明.en.md'), Path('使用说明.es.md'),
+        Path('使用说明.hi.md'), Path('使用说明.pt.md'),
+        Path('试用说明.txt')]
 out = Path('payload.zip')
 sep = chr(92)  # 反斜杠，避免转义麻烦
 
-exe = root / 'SecondBrain.exe'
+exe = root / 'Memex.exe'
 if not exe.exists():
-    print('ERROR: %s missing — 先把主程序打包到 dist/SecondBrain 再生成 payload' % exe,
+    print('ERROR: %s missing — 先把主程序打包到 dist/Memex 再生成 payload' % exe,
           flush=True)
     sys.exit(2)
 
@@ -26,24 +29,28 @@ if not bat.exists():
     bat.write_bytes(Path('报告问题.bat').read_bytes())
 
 n = 0
-with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+# 第 222 项：压缩级别 6 → 9（payload 是安装包体积的大头）；pymupdf 已降到 1.24
+# （第 222 项：2.0 自带 92MB 的 AI 布局/表格附件，1.24 只有 45.9MB 且 API 兼容），
+# 旧版没有需要剪枝的 onnx 模型。
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_LZMA, compresslevel=9) as z:
     for p in root.rglob('*'):
         if p.is_file():
             rel = str(p.relative_to(root)).replace(sep, '/')
-            z.write(p, 'SecondBrain/' + rel)
+            z.write(p, 'Memex/' + rel)
             n += 1
     for d in docs:
         if d.exists():
-            z.write(d, 'SecondBrain/' + d.name)
+            z.write(d, 'Memex/' + d.name)
             n += 1
+
 
 # 打完再验一遍：清单里必须有主程序，且文件数不能少得离谱（正常 500+）
 with zipfile.ZipFile(out) as z:
     names = z.namelist()
-bad = [x for x in names if x == 'SecondBrain/']
-if 'SecondBrain/SecondBrain.exe' not in names or n < 100:
+bad = [x for x in names if x == 'Memex/']
+if 'Memex/Memex.exe' not in names or n < 100:
     print('ERROR: payload 不完整（%d 个文件，主程序%s）' %
-          (n, '在' if 'SecondBrain/SecondBrain.exe' in names else '缺失'), flush=True)
+          (n, '在' if 'Memex/Memex.exe' in names else '缺失'), flush=True)
     out.unlink(missing_ok=True)
     sys.exit(3)
 

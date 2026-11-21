@@ -51,7 +51,7 @@ def make_backup(data_dir, version=''):
     names = file_list(root)
     buf = io.BytesIO()
     manifest = {
-        'app': 'SecondBrain',
+        'app': 'Memex',
         'kind': 'settings-backup',
         'v': 1,
         'version': str(version or ''),
@@ -69,7 +69,7 @@ def make_backup(data_dir, version=''):
                 continue
             z.writestr(n, data[:MAX_MEMBER])
     raw = buf.getvalue()
-    return '第二大脑-设置备份_%s.zip' % time.strftime('%Y%m%d-%H%M%S'), raw
+    return 'Memex-设置备份_%s.zip' % time.strftime('%Y%m%d-%H%M%S'), raw
 
 
 def inspect(raw):

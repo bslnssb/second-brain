@@ -5,7 +5,7 @@ import { t } from '../lib/i18n'
 
 /* ------------------------------ 右键菜单 ------------------------------ */
 
-export type MenuItem = { label: string; onClick: () => void; danger?: boolean }
+export type MenuItem = { label: string; onClick: () => void; danger?: boolean; hint?: string }
 
 export function ContextMenu({
   x,
@@ -37,15 +37,15 @@ export function ContextMenu({
   }, [onClose])
 
   // 贴边时往回收，别跑到屏幕外
-  const left = Math.min(x, window.innerWidth - 190)
-  const top = Math.min(y, window.innerHeight - items.length * 30 - 16)
+  const left = Math.max(8, Math.min(x, window.innerWidth - 220))
+  const top = Math.max(8, Math.min(y, window.innerHeight - items.length * 32 - 16))
 
   return (
     <div
       ref={ref}
       role="menu"
       style={{ left, top }}
-      className="fixed z-40 min-w-[176px] overflow-hidden rounded-lg border border-line bg-bg py-1 text-[12px] shadow-xl"
+      className="fixed z-40 min-w-[192px] overflow-hidden rounded-lg border border-line bg-bg py-1 text-[12px] shadow-xl"
     >
       {items.map((it) => (
         <button
@@ -59,7 +59,8 @@ export function ContextMenu({
             it.danger ? 'text-red-500' : ''
           }`}
         >
-          {it.label}
+          <span>{it.label}</span>
+          {it.hint && <span className="ml-3 font-mono text-[11px] text-sub/70">{it.hint}</span>}
         </button>
       ))}
     </div>

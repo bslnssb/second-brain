@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { IconRefresh, IconCheck, IconSearch, IconStop } from './icons'
+import { IconRefresh, IconCheck, IconSearch, IconStop, IconZip } from './icons'
 import { t } from '../lib/i18n'
 
 /**
@@ -32,7 +32,10 @@ const etaText = (sec: number): string =>
     ? fill(t('eta_min'), { m: Math.floor(sec / 60), s: sec % 60 })
     : fill(t('eta_s'), { s: sec })
 
-type Job = 'scan' | 'update' | 'names' | 'selftest'
+type Job = 'scan' | 'update' | 'names' | 'selftest' | 'compact'
+
+/* 第 247 项那两个诊断面板（失败清单 / 排除规则自检）已按第 294 项（G）搬去
+   设置页「高级」里（panels.tsx 的 ExtrasPanel），本文件只留四个任务按钮。 */
 
 /** 按钮名与「正在干什么」都走 i18n；以前这两张表是写死的中文，切成英文后整块不跟着变 */
 const LABEL_KEY: Record<Job, string> = {
@@ -40,6 +43,7 @@ const LABEL_KEY: Record<Job, string> = {
   update: 'maint_update',
   names: 'maint_names',
   selftest: 'maint_selftest',
+  compact: 'maint_compact',
 }
 
 const BUSY_KEY: Record<Job, string> = {
@@ -47,6 +51,7 @@ const BUSY_KEY: Record<Job, string> = {
   update: 'maint_busy_update',
   names: 'maint_busy_names',
   selftest: 'maint_busy_selftest',
+  compact: 'maint_busy_compact',
 }
 
 /** 把 {n} 这类占位符填上：i18n 的 t() 只负责取串，参数在这里补 */
@@ -85,6 +90,16 @@ const PROBE: Record<Job, string> = {
   update: '/api/status',
   names: '/api/names',
   selftest: '/api/selftest',
+  compact: '/api/compact',
+}
+
+/** 整理索引库要走 POST /api/compact；其余按钮的 POST 路径就是 PROBE 那条 */
+const START_PATH: Record<Job, string> = {
+  scan: '/api/discover',
+  update: '/api/update',
+  names: '/api/names',
+  selftest: '/api/selftest',
+  compact: '/api/compact',
 }
 
 export function Maintenance({ onDone }: { onDone?: () => void }) {
@@ -108,9 +123,7 @@ export function Maintenance({ onDone }: { onDone?: () => void }) {
       setProg({})
       setNote('')
       try {
-        const r = await post<{ ok?: boolean; err?: string; k?: string }>(
-          which === 'scan' ? '/api/discover' : `/api/${which === 'update' ? 'update' : which}`,
-        )
+        const r = await post<{ ok?: boolean; err?: string; k?: string }>(START_PATH[which])
         if (r && r.ok === false) {
           setNote(say(r) || t('maint_start_fail'))
           setJob(null)
@@ -144,40 +157,49 @@ export function Maintenance({ onDone }: { onDone?: () => void }) {
 
   return (
     <div className="mt-4 border-t border-line pt-3">
-      <div className="mb-2 text-[12px] text-sub">{t('maint_title')}</div>
+      <div className="mb-2.5 text-[14px] text-sub">{t('maint_title')}</div>
       <div className="flex flex-wrap gap-1.5">
         <button
           disabled={!!job}
           onClick={() => start('scan')}
-          className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[12px] hover:border-accent disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded border border-line px-3 py-2 text-[13px] hover:border-accent disabled:opacity-50"
         >
           <IconSearch size={13} /> {t('maint_scan')}
         </button>
         <button
           disabled={!!job}
           onClick={() => start('update')}
-          className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[12px] hover:border-accent disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded border border-line px-3 py-2 text-[13px] hover:border-accent disabled:opacity-50"
         >
           <IconRefresh size={13} /> {t('maint_update')}
         </button>
         <button
           disabled={!!job}
           onClick={() => start('names')}
-          className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[12px] hover:border-accent disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded border border-line px-3 py-2 text-[13px] hover:border-accent disabled:opacity-50"
         >
           <IconRefresh size={13} /> {t('maint_names')}
         </button>
         <button
           disabled={!!job}
           onClick={() => start('selftest')}
-          className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[12px] hover:border-accent disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded border border-line px-3 py-2 text-[13px] hover:border-accent disabled:opacity-50"
         >
           <IconCheck size={13} /> {t('maint_selftest')}
+        </button>
+        {/* 第 366 项：老库迁移以前只在「空闲 10 分钟」后台偷偷跑，5 秒心跳让它永远不成立；
+            这里给一个手动入口，迁移 + FTS 合并 + VACUUM 一次跑完（先自动备份）。 */}
+        <button
+          disabled={!!job}
+          onClick={() => start('compact')}
+          className="flex items-center gap-1.5 rounded border border-line px-3 py-2 text-[13px] hover:border-accent disabled:opacity-50"
+        >
+          <IconZip size={13} /> {t('maint_compact')}
         </button>
       </div>
 
       {job && (
-        <div className="mt-2 text-[11px] text-sub">
+        <div className="mt-2.5 text-[13px] text-sub">
           <div className="mb-1 flex items-center gap-1">
             <IconStop size={11} />
             {t(LABEL_KEY[job])} · {say(prog) || fill(t(BUSY_KEY[job]), prog.a)}
@@ -187,11 +209,12 @@ export function Maintenance({ onDone }: { onDone?: () => void }) {
           <div className="h-1.5 overflow-hidden rounded-full bg-line">
             <div className="h-full bg-accent transition-all" style={{ width: `${pct}%` }} />
           </div>
-          <div className="mt-1 text-[11px] opacity-70">{t('maint_running_hint')}</div>
+          <div className="mt-1.5 text-[12px] opacity-70">{t('maint_running_hint')}</div>
         </div>
       )}
 
-      {!job && note && <div className="mt-2 text-[11px] text-accent">{note}</div>}
+      {!job && note && <div className="mt-2.5 text-[13px] text-accent">{note}</div>}
+
     </div>
   )
 }

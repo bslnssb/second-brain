@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""第二大脑 · 质量自检与检索评测（全程合成数据，绝不碰用户真实索引库）
+"""Memex · 质量自检与检索评测（全程合成数据，绝不碰用户真实索引库）
 
 四条互相独立的正确性证据链，全部可由任何人重复运行复核：
   A. 检索评测：合成语料 + 金标查询 → recall@1 / recall@3 / MRR，含相关度排序检验
-  B. 双抽取器交叉验证：pypdf 与 pymupdf 两个独立实现对同一 PDF 的文本一致性
+  B. 双抽取器交叉验证：pypdf 与 PDFium 两个独立实现对同一 PDF 的文本一致性
   C. OCR 字符错误率：程序自己渲染"标准答案"图片 → OCR → 与答案比对（CER）
   D. 健壮性 fuzz：畸形/截断/乱码文件喂给 extract_text，任何情况下不许崩溃
 外加：SQLite integrity_check、FTS5 integrity-check、文件变更重索引检验、
@@ -12,6 +12,7 @@
 
 用法：python brain.py selftest（或 eval）；桌面版设置面板点「🩺 质量自检」。
 """
+import base64
 import contextlib
 import difflib
 import io
@@ -39,15 +40,23 @@ def _has(name):
     except Exception:
         return None
 
-def _mk_pdf(mupdf, path, lines, fontsize=14):
-    doc = mupdf.open()
-    page = doc.new_page()
-    y = 72
-    for ln in lines:
-        page.insert_text((72, y), ln, fontname='china-s', fontsize=fontsize)
-        y += int(fontsize * 1.7)
-    doc.save(str(path))
-    doc.close()
+# 第 352 项：这三份 PDF 样本是开发机上用 PyMuPDF 一次性生成、再以 base64 内联进来的。
+# 为什么不用 PyMuPDF 现生成：它 AGPL，不能进商业发行版；PDFium 又只会读不会写。
+_SAMPLE_PDF_D = (
+    'JVBERi0xLjcKJcK1wrYKCjEgMCBvYmoKPDwvVHlwZS9DYXRhbG9nL1BhZ2VzIDIgMCBSPj4KZW5kb2JqCgoyIDAgb2JqCjw8L1R5cGUvUGFnZXMvQ291bnQgMS9LaWRzWzQgMCBSXT4+CmVuZG9iagoKMyAwIG9iago8PC9Gb250PDwvY2hpbmEtcyA1IDAgUj4+Pj4KZW5kb2JqCgo0IDAgb2JqCjw8L1R5cGUvUGFnZS9NZWRpYUJveFswIDAgNTk1IDg0Ml0vUm90YXRlIDAvUmVzb3VyY2VzIDMgMCBSL1BhcmVudCAyIDAgUi9Db250ZW50c1s4IDAgUiA5IDAgUl0+PgplbmRvYmoKCjUgMCBvYmoKPDwvVHlwZS9Gb250L1N1YnR5cGUvVHlwZTAvQmFzZUZvbnQvSGVpdGkvRW5jb2RpbmcvVW5pR0ItVVRGMTYtSC9EZXNjZW5kYW50Rm9udHNbNiAwIFJdPj4KZW5kb2JqCgo2IDAgb2JqCjw8L1R5cGUvRm9udC9TdWJ0eXBlL0NJREZvbnRUeXBlMC9CYXNlRm9udC9IZWl0aS9DSURTeXN0ZW1JbmZvPDwvUmVnaXN0cnkoQWRvYmUpL09yZGVyaW5nKEdCMSkvU3VwcGxlbWVudCA1Pj4vRm9udERlc2NyaXB0b3IgNyAwIFI+PgplbmRvYmoKCjcgMCBvYmoKPDwvVHlwZS9Gb250RGVzY3JpcHRvci9Gb250TmFtZShIZWl0aSkvRm9udEJCb3hbLTIwMCAtMjAwIDEyMDAgMTIwMF0vRmxhZ3MgNC9JdGFsaWNBbmdsZSAwL0FzY2VudCAxMDAwL0Rlc2NlbnQgLTIwMC9TdGVtViA4MD4+CmVuZG9iagoKOCAwIG9iago8PC9MZW5ndGggMTI4L0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp42iXMsQpCMQxA0T1fkR8Qm760SUEcBBc3oZs4NGmLDk8Q/x9UHnc6y4U3nCoQhl+EElEkYF1h74/nq+0+SIx14u2g5pw7m9roOZUiFj3lbmmZMic1mYlkdE+mJVFWMS4ymvDsPcfGPNT/3h7OWpQkWFlCiMd7vcC5whW+RlclSwplbmRzdHJlYW0KZW5kb2JqCgo5IDAgb2JqCjw8L0xlbmd0aCAxMjEvRmlsdGVyL0ZsYXRlRGVjb2RlPj4Kc3RyZWFtCnjaNUxBCsJADLznFfmAOLvNbhSkh4IXb0Ju0kMpLXpQEP8PZklLGIaZzAx9aTBKDL/EmllF2d50nJ+vz3T4cRK2lR8XoExALYBm5xVwQpHQ2vzOIeFL2nLu1ZPjHL/Wr1tO960SnbrE7p5re3npR7vR1ehOfz2cJDIKZW5kc3RyZWFtCmVuZG9iagoKeHJlZgowIDEwCjAwMDAwMDAwMDAgMDAwMDEgZiAKMDAwMDAwMDAxNiAwMDAwMCBuIAowMDAwMDAwMDYyIDAwMDAwIG4gCjAwMDAwMDAxMTQgMDAwMDAgbiAKMDAwMDAwMDE1OCAwMDAwMCBuIAowMDAwMDAwMjcxIDAwMDAwIG4gCjAwMDAwMDAzNzcgMDAwMDAgbiAKMDAwMDAwMDUyNiAwMDAwMCBuIAowMDAwMDAwNjY5IDAwMDAwIG4gCjAwMDAwMDA4NjYgMDAwMDAgbiAKCnRyYWlsZXIKPDwvU2l6ZSAxMC9Sb290IDEgMCBSL0lEWzw2MTZFQzNBQUMyQkE3Q0MzQjhDMzgxQzNCMEMyOUVDMj48NTc4RTg4OUVERDFGNjExRkZFQkI4QTBFREVCRjMyNzA+XT4+CnN0YXJ0eHJlZgoxMDU2CiUlRU9GCg==')
+
+_SAMPLE_PDF_ENC = (
+    'JVBERi0xLjcKJcK1wrYKCjEgMCBvYmoKPDwvVHlwZS9DYXRhbG9nL1BhZ2VzIDIgMCBSPj4KZW5kb2JqCgoyIDAgb2JqCjw8L1R5cGUvUGFnZXMvQ291bnQgMS9LaWRzWzQgMCBSXT4+CmVuZG9iagoKMyAwIG9iago8PC9Gb250PDwvY2hpbmEtcyA1IDAgUj4+Pj4KZW5kb2JqCgo0IDAgb2JqCjw8L1R5cGUvUGFnZS9NZWRpYUJveFswIDAgNTk1IDg0Ml0vUm90YXRlIDAvUmVzb3VyY2VzIDMgMCBSL1BhcmVudCAyIDAgUi9Db250ZW50c1s4IDAgUl0+PgplbmRvYmoKCjUgMCBvYmoKPDwvVHlwZS9Gb250L1N1YnR5cGUvVHlwZTAvQmFzZUZvbnQvSGVpdGkvRW5jb2RpbmcvVW5pR0ItVVRGMTYtSC9EZXNjZW5kYW50Rm9udHNbNiAwIFJdPj4KZW5kb2JqCgo2IDAgb2JqCjw8L1R5cGUvRm9udC9TdWJ0eXBlL0NJREZvbnRUeXBlMC9CYXNlRm9udC9IZWl0aS9DSURTeXN0ZW1JbmZvPDwvUmVnaXN0cnkoQWRvYmUpL09yZGVyaW5nKEdCMSkvU3VwcGxlbWVudCA1Pj4vRm9udERlc2NyaXB0b3IgNyAwIFI+PgplbmRvYmoKCjcgMCBvYmoKPDwvVHlwZS9Gb250RGVzY3JpcHRvci9Gb250TmFtZShIZWl0aSkvRm9udEJCb3hbLTIwMCAtMjAwIDEyMDAgMTIwMF0vRmxhZ3MgNC9JdGFsaWNBbmdsZSAwL0FzY2VudCAxMDAwL0Rlc2NlbnQgLTIwMC9TdGVtViA4MD4+CmVuZG9iagoKOCAwIG9iago8PC9MZW5ndGggMTExL0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp42g3CwQrCMAwA0Hu+Ij8gS9omaUF2ELx4E3oTD92WoIcJ4v+D4z34wqUDIx0YLaEZYd9hWl/vzzj9kAv2wMdZ0iBZVlWpVjy0Lr6ptBbBQy0PTTmaeLVWuXHZLNTVSSQfidL87De4drjDH0eTHC8KZW5kc3RyZWFtCmVuZG9iagoKeHJlZgowIDkKMDAwMDAwMDAwMCAwMDAwMSBmIAowMDAwMDAwMDE2IDAwMDAwIG4gCjAwMDAwMDAwNjIgMDAwMDAgbiAKMDAwMDAwMDExNCAwMDAwMCBuIAowMDAwMDAwMTU4IDAwMDAwIG4gCjAwMDAwMDAyNjUgMDAwMDAgbiAKMDAwMDAwMDM3MSAwMDAwMCBuIAowMDAwMDAwNTIwIDAwMDAwIG4gCjAwMDAwMDA2NjMgMDAwMDAgbiAKCnRyYWlsZXIKPDwvU2l6ZSA5L1Jvb3QgMSAwIFIvSURbPDZGQzI4RUMzQTYwRTczQzM5MkMyQTRDMjg1MkZDM0ExPjxBRTMxQUVBMjJDQTA1REMzODdEQTREODQ1M0E1NjFGQz5dPj4Kc3RhcnR4cmVmCjg0MwolJUVPRgo=')
+
+_SAMPLE_PDF_XCHECK = (
+    'JVBERi0xLjcKJcK1wrYKCjEgMCBvYmoKPDwvVHlwZS9DYXRhbG9nL1BhZ2VzIDIgMCBSPj4KZW5kb2JqCgoyIDAgb2JqCjw8L1R5cGUvUGFnZXMvQ291bnQgMS9LaWRzWzQgMCBSXT4+CmVuZG9iagoKMyAwIG9iago8PC9Gb250PDwvaGVsdiA1IDAgUj4+Pj4KZW5kb2JqCgo0IDAgb2JqCjw8L1R5cGUvUGFnZS9NZWRpYUJveFswIDAgNTk1IDg0Ml0vUm90YXRlIDAvUmVzb3VyY2VzIDMgMCBSL1BhcmVudCAyIDAgUi9Db250ZW50c1s2IDAgUiA3IDAgUl0+PgplbmRvYmoKCjUgMCBvYmoKPDwvVHlwZS9Gb250L1N1YnR5cGUvVHlwZTEvQmFzZUZvbnQvSGVsdmV0aWNhL0VuY29kaW5nL1dpbkFuc2lFbmNvZGluZz4+CmVuZG9iagoKNiAwIG9iago8PC9MZW5ndGggMTI5L0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp42i3LsQoCQQwE0D5fkT8wm+zO3IFYHNjYCduJxam3WGhh4/ebQqaYB8PIR5YuRS1TlK6kaX/L7rm9vlqq9qGXfauY0NxY2DAjcHOD0zFIbGmkpuw19weNkR4EGj1f/zfuKFw5pyoG6BYlPCJqtEAwppjDfDtc+0mOXc7yA+adI0AKZW5kc3RyZWFtCmVuZG9iagoKNyAwIG9iago8PC9MZW5ndGggMTI4L0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp42hWMMQ4CMQwEe7/CPyCxk91DQhQn0dAhpUM05C6igIKG9+PIhVermZWvrE2yprisNKUXbR85vPb3T3PkofdT6RhwZHRLACt6pI0FlQuLJToqMi2YJYhKTJazKziGuweToiPqXMCgxfcwBp1u2zRjw/G0/fxoV7k0uckfD2Yj6AplbmRzdHJlYW0KZW5kb2JqCgp4cmVmCjAgOAowMDAwMDAwMDAwIDAwMDAxIGYgCjAwMDAwMDAwMTYgMDAwMDAgbiAKMDAwMDAwMDA2MiAwMDAwMCBuIAowMDAwMDAwMTE0IDAwMDAwIG4gCjAwMDAwMDAxNTUgMDAwMDAgbiAKMDAwMDAwMDI2OCAwMDAwMCBuIAowMDAwMDAwMzU3IDAwMDAwIG4gCjAwMDAwMDA1NTUgMDAwMDAgbiAKCnRyYWlsZXIKPDwvU2l6ZSA4L1Jvb3QgMSAwIFIvSURbPEMyODVDMjhCNzlDMzk0NTc2REMzODgyMUMyQjFDMzlGPjw1QTBDRjcxODk5RjQ0OEIwRjE2ODY5Mzc4QUM0OEFCMT5dPj4Kc3RhcnR4cmVmCjc1MgolJUVPRgo=')
+
+_SAMPLE_PDF_OCR = (
+    'JVBERi0xLjcKJcK1wrYKCjEgMCBvYmoKPDwvVHlwZS9DYXRhbG9nL1BhZ2VzIDIgMCBSPj4KZW5kb2JqCgoyIDAgb2JqCjw8L1R5cGUvUGFnZXMvQ291bnQgMS9LaWRzWzQgMCBSXT4+CmVuZG9iagoKMyAwIG9iago8PC9Gb250PDwvY2hpbmEtcyA1IDAgUj4+Pj4KZW5kb2JqCgo0IDAgb2JqCjw8L1R5cGUvUGFnZS9NZWRpYUJveFswIDAgNTk1IDg0Ml0vUm90YXRlIDAvUmVzb3VyY2VzIDMgMCBSL1BhcmVudCAyIDAgUi9Db250ZW50c1s4IDAgUl0+PgplbmRvYmoKCjUgMCBvYmoKPDwvVHlwZS9Gb250L1N1YnR5cGUvVHlwZTAvQmFzZUZvbnQvSGVpdGkvRW5jb2RpbmcvVW5pR0ItVVRGMTYtSC9EZXNjZW5kYW50Rm9udHNbNiAwIFJdPj4KZW5kb2JqCgo2IDAgb2JqCjw8L1R5cGUvRm9udC9TdWJ0eXBlL0NJREZvbnRUeXBlMC9CYXNlRm9udC9IZWl0aS9DSURTeXN0ZW1JbmZvPDwvUmVnaXN0cnkoQWRvYmUpL09yZGVyaW5nKEdCMSkvU3VwcGxlbWVudCA1Pj4vRm9udERlc2NyaXB0b3IgNyAwIFI+PgplbmRvYmoKCjcgMCBvYmoKPDwvVHlwZS9Gb250RGVzY3JpcHRvci9Gb250TmFtZShIZWl0aSkvRm9udEJCb3hbLTIwMCAtMjAwIDEyMDAgMTIwMF0vRmxhZ3MgNC9JdGFsaWNBbmdsZSAwL0FzY2VudCAxMDAwL0Rlc2NlbnQgLTIwMC9TdGVtViA4MD4+CmVuZG9iagoKOCAwIG9iago8PC9MZW5ndGggMTI0L0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp42i2LwQoCMQxE7/mK/IA4SdttBPEgePEm9CYelu4WPbiw+P9g6kp4zDyY0ErnQsLwE87KOYPLm/b1+VrG3YdVuTS+H4E4AUNy/pnNJrWD1GYyj4NVAOrE5gQgafc4W3XJPZP0399GHN123YN78BLC6VGudCl0oy+74iLFCmVuZHN0cmVhbQplbmRvYmoKCnhyZWYKMCA5CjAwMDAwMDAwMDAgMDAwMDEgZiAKMDAwMDAwMDAgMDAwMDAgbiAKMDAwMDAwMDAxNiAwMDAwMCBuIAowMDAwMDAwMDYyIDAwMDAwIG4gCjAwMDAwMDAxMTQgMDAwMDAgbiAKMDAwMDAwMDE1OCAwMDAwMCBuIAowMDAwMDAwMjY1IDAwMDAwIG4gCjAwMDAwMDAzNzEgMDAwMDAgbiAKMDAwMDAwMDUyMCAwMDAwMCBuIAowMDAwMDAwNjYzIDAwMDAwIG4gCgp0cmFpbGVyCjw8L1NpemUgOS9Sb290IDEgMCBSL0lEWzxDMkJENUMyQjEzQzI5NjMzQzNCRkMyOTlDM0JFQzI5OT48RTExNDQ3MzlFMDU5OUJFNzI5MzI4OEFGM0I0QzI3Mzg+XT4+CnN0YXJ0eHJlZgo4NTYKJSVFT0YK')
+
+
+def _put_pdf(path, b64):
+    Path(path).write_bytes(base64.b64decode(b64))
 
 def _mk_docx(path, text):
     with zipfile.ZipFile(path, 'w') as z:
@@ -64,8 +73,9 @@ def _search_quiet(q, limit=5):
 def run_all(verbose=True, write_report=True):
     """跑全部证据链；返回 True=全部通过（SKIP 不算失败）"""
     RESULTS.clear()
-    mupdf = _has('pymupdf')
-    has_ocr = _has('rapidocr_onnxruntime') is not None
+    mupdf = _has('pdf_engine')     # 第 352 项：读 PDF 用 pypdfium2 垫片
+    # 第 380 项：引擎换包，探测目标同步改（ocr_engine 是薄适配层，rapidocr 才是真依赖）
+    has_ocr = (_has('rapidocr') is not None) and (_has('ocr_engine') is not None)
     tmp = Path(tempfile.mkdtemp(prefix='sb-selftest-'))
     corpus = tmp / 'corpus'
     corpus.mkdir(parents=True)
@@ -74,7 +84,7 @@ def run_all(verbose=True, write_report=True):
     t0 = time.time()
 
     # ── 合成语料（内容即金标答案）
-    (corpus / 'a.txt').write_text('第二大脑评测语料第一号：机房巡检记录模板，包含巡检时间、巡检人与整改期限。',
+    (corpus / 'a.txt').write_text('Memex评测语料第一号：机房巡检记录模板，包含巡检时间、巡检人与整改期限。',
                                   encoding='utf-8')
     (corpus / 'b.txt').write_text('评测语料第二号：生鲜冷链运输的温控标准与应急预案。', encoding='utf-8')
     (corpus / 'f.txt').write_text('应急预案专项汇总。' + '应急预案。' * 6 +
@@ -85,14 +95,15 @@ def run_all(verbose=True, write_report=True):
     _mk_docx(corpus / 'c.docx', '评测语料第三号：SQL注入漏洞的应急响应流程与修复建议。')
     enc_made = False
     if mupdf:
-        _mk_pdf(mupdf, corpus / 'd.pdf',
-                ['评测语料第四号：网络安全等级保护二级测评要点。', 'Zero Trust Architecture notes.'])
-        enc = mupdf.open()
-        pg = enc.new_page()
-        pg.insert_text((72, 72), '加密文件语料：机房门禁配置清单。', fontname='china-s', fontsize=14)
-        enc.save(str(corpus / 'e_encrypted.pdf'), encryption=mupdf.PDF_ENCRYPT_AES_256,
-                 owner_pw='owner', user_pw='user')
-        enc.close()
+        _put_pdf(corpus / 'd.pdf', _SAMPLE_PDF_D)
+        # 加密样本：拿同一页文本、用 pypdf 重新加密码（PDFium 不能写）
+        from pypdf import PdfReader, PdfWriter
+        w = PdfWriter()
+        for pg in PdfReader(str(corpus / 'd.pdf')).pages:
+            w.add_page(pg)
+        w.encrypt('user', 'owner')
+        with open(corpus / 'e_encrypted.pdf', 'wb') as f:
+            w.write(f)
         enc_made = True
 
     # 扫描清单 + 索引（走真实 index 路径）
@@ -142,9 +153,9 @@ def run_all(verbose=True, write_report=True):
             hits = _search_quiet('门禁配置', 30)
             bad = [p for p, _s in hits if 'e_encrypted' in p]
             if not mupdf:
-                # 加密样本本身要用 pymupdf 造，core 版没有它 → 没有可验证的对象。
+                # 加密样本要靠 pymupdf 时代的内联样本 + pypdf 加密，缺 pdf_engine 时没有可验证的对象。
                 # 判 PASS 会让人误以为「查过了」，所以这里如实跳过。
-                _rec('SKIP', 'A3 加密 PDF 不入库不可检索（缺 pymupdf，无加密样本）')
+                _rec('SKIP', 'A3 加密 PDF 不入库不可检索（缺 pdf_engine，无加密样本）')
             else:
                 _rec('PASS' if not bad else 'FAIL',
                      'A3 加密 PDF 不入库不可检索', f'{len(bad)} 条泄漏' if bad else '确认零泄漏')
@@ -155,18 +166,11 @@ def run_all(verbose=True, write_report=True):
         #     中文抽取质量已由 A 金标检索与 C OCR 两条链覆盖）
         try:
             if not mupdf:
-                _rec('SKIP', 'B 双抽取器交叉验证（缺 pymupdf）')
+                _rec('SKIP', 'B 双抽取器交叉验证（缺 pdf_engine）')
             else:
                 from pypdf import PdfReader
                 base = tmp / 'xcheck.pdf'
-                doc = mupdf.open()
-                pg = doc.new_page()
-                pg.insert_text((72, 72), 'The quick brown fox jumps over the lazy dog 1234567890.',
-                               fontname='helv', fontsize=14)
-                pg.insert_text((72, 108), 'Local full-text search evaluation page for cross-check.',
-                               fontname='helv', fontsize=14)
-                doc.save(str(base))
-                doc.close()
+                _put_pdf(base, _SAMPLE_PDF_XCHECK)
                 t1 = _norm('\n'.join((p.extract_text() or '')
                                       for p in PdfReader(str(base)).pages))
                 d2 = mupdf.open(str(base))
@@ -174,7 +178,7 @@ def run_all(verbose=True, write_report=True):
                 d2.close()
                 ratio = difflib.SequenceMatcher(None, t1, t2).ratio()
                 _rec('PASS' if ratio >= 0.8 else 'FAIL',
-                     f'B 双抽取器一致性 pypdf vs pymupdf = {ratio:.2f}',
+                     f'B 双抽取器一致性 pypdf vs PDFium = {ratio:.2f}',
                      '两个独立实现对同一基准页给出的文本一致' if ratio >= 0.8 else '一致性过低')
         except Exception as e:
             _rec('FAIL', 'B 双抽取器交叉验证', f'{type(e).__name__}: {e}')
@@ -182,15 +186,14 @@ def run_all(verbose=True, write_report=True):
         # ══ C. OCR 字符错误率（自渲染标准答案）
         try:
             if not (mupdf and has_ocr):
-                _rec('SKIP', 'C OCR 字符错误率（缺 pymupdf 或 rapidocr）')
+                _rec('SKIP', 'C OCR 字符错误率（缺 pdf_engine 或 rapidocr）')
             else:
-                truth = '第二大脑质量自检 OCR 二〇二六 ABC 123'
+                truth = 'Memex质量自检 OCR 二〇二六 ABC 123'
                 tdir = tmp / 'ocr'
                 tdir.mkdir()
-                _mk_pdf(mupdf, tdir / 'ocr.pdf', [truth], fontsize=22)
+                _put_pdf(tdir / 'ocr.pdf', _SAMPLE_PDF_OCR)
                 doc = mupdf.open(str(tdir / 'ocr.pdf'))
                 pix = doc[0].get_pixmap(matrix=mupdf.Matrix(180 / 72, 180 / 72))
-                from rapidocr_onnxruntime import RapidOCR
                 ocr = brain._get_ocr()
                 res, _ = ocr(pix.tobytes('png'))
                 got = ''.join(line[1] for line in res) if res else ''
@@ -266,9 +269,9 @@ def run_all(verbose=True, write_report=True):
         try:
             con = brain.init_db()
             if not mupdf:
-                # 同上：加密样本由 pymupdf 生成，core 版里没有这个文件，
+                # 同上：加密样本由 pymupdf 时代的样本 + pypdf 生成，缺 pdf_engine 时没有可验证的对象，
                 # 查不到记录不代表归因失败。
-                _rec('SKIP', 'G1 失败归因（缺 pymupdf，无加密样本）')
+                _rec('SKIP', 'G1 失败归因（缺 pdf_engine，无加密样本）')
             else:
                 reason = con.execute("SELECT reason FROM meta WHERE path LIKE '%e_encrypted%'") \
                             .fetchone()
@@ -298,7 +301,7 @@ def run_all(verbose=True, write_report=True):
                  f'命中 {n_hit} 条 / 不存在的路径 {n_miss} 条')
             con.close()
 
-            # 孤立代理项（pymupdf 对字体映射损坏的 PDF 会吐出这种字符）曾经让整篇
+            # 孤立代理项（PyMuPDF 对字体映射损坏的 PDF 会吐出这种字符）曾经让整篇
             # 文档在写 JSON / 存库时抛 UnicodeEncodeError，表现为「解析失败」。
             bad = 'abc' + chr(0xD800) + 'def' + chr(0xDC80)
             fixed = brain._clean_text(bad)
@@ -507,10 +510,10 @@ def run_all(verbose=True, write_report=True):
     summary = f'{passed} 项通过 / {len(fails)} 失败 / {len(skips)} 跳过'
     if write_report:
         lines = [
-            f'第二大脑 {brain.APP_VERSION} 质量自检与评测报告',
+            f'Memex {brain.APP_VERSION} 质量自检与评测报告',
             f'时间: {time.strftime("%Y-%m-%d %H:%M:%S")}',
             f'Python {sys.version.split()[0]} | SQLite {sqlite3.sqlite_version} | '
-            f'pymupdf {"有" if mupdf else "无"} | rapidocr {"有" if has_ocr else "无"}',
+            f'PDFium {"有" if mupdf else "无"} | rapidocr {"有" if has_ocr else "无"}',
             '-' * 60,
         ]
         lines += [f'[{s}] {n}' + (f' —— {d}' if d else '') for s, n, d in RESULTS]

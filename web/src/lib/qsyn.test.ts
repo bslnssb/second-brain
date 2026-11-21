@@ -36,6 +36,15 @@ describe('parseQSyn', () => {
     expect(s.q).toBe('ext:')
   })
 
+  // 第 309 项：冒号两边多打空格 / 中文全角冒号，都要照样当语法（否则就是 0 条）
+  it('冒号前后有空格也认（ext: pdf / ext： pdf / ext :pdf）', () => {
+    for (const raw of ['信息安全 ext: pdf', '信息安全 ext： pdf', '信息安全 ext :pdf', '信息安全 ext : pdf']) {
+      const s = parseQSyn(raw)
+      expect(s.ext).toBe('pdf')
+      expect(s.q).toBe('信息安全')
+    }
+  })
+
   it('size: 三种写法', () => {
     expect(parseQSyn('a size:>10m').size).toEqual([10 * 1024 * 1024, null])
     expect(parseQSyn('a size:<500k').size).toEqual([null, 500 * 1024])
@@ -90,6 +99,15 @@ describe('parseQSyn', () => {
   it('文件夹用尾斜杠，两种斜杠都认', () => {
     expect(parseQSyn('资料/ 笔记').folder).toBe('资料')
     expect(parseQSyn('资料\\ 笔记').folder).toBe('资料')
+  })
+
+  // 第 294 项（H）：范围书签会写 `"D:\我的 文件\" 关键词` —— 路径带空格，
+  // 不加引号的话会被切成两个词，folder 过滤直接失效。
+  it('双引号内的空格不切分（带空格的目录）', () => {
+    const s = parseQSyn('"D:\\我的 文件\\" 合同')
+    expect(s.folder).toBe('D:\\我的 文件')
+    expect(s.q).toBe('合同')
+    expect(parseQSyn('"D:\\学习 资料\\"').q).toBe('')
   })
 
   it('content: 只搜正文', () => {

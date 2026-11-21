@@ -21,10 +21,14 @@ def fake_winreg():
     m = types.ModuleType('winreg')
     m.HKEY_CURRENT_USER = object()
     m.REG_SZ = 1
+    m.KEY_SET_VALUE = 2
     key = MagicMock()
     key.__enter__.return_value = key
     m.CreateKey = MagicMock(return_value=key)
+    # 第 208 项：装完还要删旧键名 SecondBrain，夹具得覆盖 OpenKey / DeleteValue
+    m.OpenKey = MagicMock(return_value=key)
     m.SetValueEx = MagicMock()
+    m.DeleteValue = MagicMock()
     return m, key
 
 
@@ -32,7 +36,7 @@ class AutostartSetupTest(unittest.TestCase):
 
     def setUp(self):
         self.env = {'SB_NO_AUTOSTART': ''}
-        self.exe = ROOT / 'SecondBrain.exe'
+        self.exe = ROOT / 'Memex.exe'
 
     def call(self, **env):
         m, key = fake_winreg()
@@ -51,7 +55,7 @@ class AutostartSetupTest(unittest.TestCase):
                          (m.HKEY_CURRENT_USER,
                           r'Software\Microsoft\Windows\CurrentVersion\Run'))
         args = m.SetValueEx.call_args[0]
-        self.assertEqual(args[1], 'SecondBrain')       # SetValueEx(k, name, 0, type, cmd)
+        self.assertEqual(args[1], 'Memex')       # SetValueEx(k, name, 0, type, cmd)
         self.assertEqual(args[2], 0)
         self.assertEqual(args[3], m.REG_SZ)
         self.assertEqual(args[4], '"%s" --silent' % self.exe)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""第二大脑 · 桌面窗口启动器
+"""Memex · 桌面窗口启动器
 
 两个窗口：
   快搜窗（/mini）  双击 Ctrl 弹出，一个输入框 + 九行结果，Ctrl+1~9 直接开，Esc 收起
@@ -12,6 +12,10 @@
 带参数时走命令行（update / selftest / search …），方便打包成 exe 后复用同一入口。
 """
 import ctypes
+import app_entries
+import ctypes.wintypes  # 第 216 项：ctypes.wintypes 是懒加载属性，模块级导入一次，
+                        # 之后任何路径的 ctypes.wintypes.RECT() 都不会再 AttributeError
+                        #（titlebar_restore 在测试假 _win_ptr_funcs 下踩过：全量跑绿、单跑红）
 
 # 高 DPI 适配：必须在 import webview / 创建任何窗口之前设置。
 # 旧逻辑用 SetProcessDPIAware（System DPI Aware）——在多显示器 / 150% 缩放下，
@@ -55,8 +59,11 @@ import time
 import traceback
 import urllib.request
 import webbrowser
+import error_report      # 第 277 项：运行标记 / 前端异常 / 指标都要它；缺这行全是 NameError（都被 try 吞了）
 from pathlib import Path
 from urllib.parse import quote
+
+import quick_switch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -69,8 +76,22 @@ _CLI_CMDS = {'index', 'update', 'search', 'prune', 'serve', 'repair',
 
 MINI_W = 760                 # 快搜窗宽度（逻辑像素，CSS px 同尺度）
 MINI_H = 124                 # 初始高度：一行输入框 + 一行提示
-MINI_TITLE = '第二大脑 · 快搜'
-MAIN_TITLE = 'Second Brain · 第二大脑'
+# 第 198/201 项：贴在文件夹右下角 / 另存为下方的「小窗」尺寸。
+# 用户连着两次说「太大了」「还是太长」，所以宽度不再跟着窗口比例放大：
+# 固定 420 封顶（Listary 的贴角窗约 435），窗口更窄时再缩，绝不反过来变大。
+MINI_W_SMALL = 420
+MINI_W_DLG = 440            # 另存为对话框宽一档：那一行要放路径 + 按钮区
+MINI_H_SMALL = 92
+MINI_W_MIN = 300
+MAXH_MIN = 150
+MAXH_CAP = 360
+
+# Win32 SetWindowPos 旗标（模块级）。229 项七轮教训：_follow_anchor 的调用处
+# 引用了 SWP_ASYNCWINDOWPOS，局部赋值行却没定义它 → 每次 NameError，而异常
+# 被 _log（SB_DEBUG 门控）吞掉，跟随死了三天没人看见。提到模块级 + 单测钉住。
+SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS = 0x1, 0x4, 0x10, 0x4000
+MINI_TITLE = 'Memex · 快搜'
+MAIN_TITLE = 'Memex'
 
 
 def icon_file():
@@ -188,6 +209,18 @@ def _log_always(msg):
         pass
 
 
+def _metric(feature, status='ok', sub=None, err=''):
+    """第 277 项：窗口侧的埋点（热键/悬浮球/更新/托盘）。
+
+    统计失败绝不能影响主流程，所以这里永远不抛。
+    """
+    try:
+        import feature_metrics
+        feature_metrics.add(feature, status, sub=sub, err=str(err or '')[:120])
+    except Exception:
+        pass
+
+
 def _startup_report(text):
     """启动/初始化失败时先落一份本机报告（第 162 项）。
 
@@ -226,7 +259,7 @@ def _die(msg):
     最常见的就是依赖没装全（pypdf / pymupdf / rapidocr）。"""
     try:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(None, msg, 'Second Brain · 第二大脑', 0x10)
+        ctypes.windll.user32.MessageBoxW(None, msg, 'Memex', 0x10)
     except Exception:
         print(msg)
     _startup_report(msg)
@@ -312,7 +345,11 @@ def _start_server(port):
     try:
         srv = brain.make_server(port)
     except Exception:
-        import traceback
+        # 第 239 项：这里原本有一句局部 `import traceback`，它把整个函数的
+        # traceback 变成了局部名 —— 于是下面「启动监听失败」那个 except 里
+        # 一用就抛 UnboundLocalError，把真正的失败原因（NameError 等）吃掉，
+        # 用户看到的弹窗是「窗口启动失败：UnboundLocalError: traceback」，
+        # 完全没法查。模块顶部已经 import traceback，别再在函数里重复导。
         _START_ERR[0] = traceback.format_exc()
         _log_always('make_server FAILED (port %d):%s%s' % (port, chr(10), _START_ERR[0]))
         return None
@@ -321,6 +358,7 @@ def _start_server(port):
     try:
         brain.start_watcher()
     except Exception:
+        # 监听起不来不该拦着用户用软件（他还能点「更新」），所以只记日志。
         _log_always('start_watcher FAILED:%s' % traceback.format_exc())
     return srv
 
@@ -574,21 +612,31 @@ def system_dark():
         return False
 
 
+_LAST_THEME = {'dark': None, 'bg': None}
+
+
 def effective_dark():
     """界面主题（auto/dark/light）→ 现在到底是不是深色。
 
     第 105 项把 settings.json 的读取收口成 _settings_read() 时这里漏改了，
     AttributeError 被 except 吞成「读不到设置」→ theme=dark 时标题栏永远不变深
     （2026-11-07 用户切深色才发现）。"""
+    if _LAST_THEME.get('dark') is not None:
+        return bool(_LAST_THEME['dark'])
     try:
         import brain as _b
-        th = (_b._settings_read() or {}).get('theme', 'auto')
+        s = _b._settings_read() or {}
+        th = s.get('theme', 'auto')
+        pal = s.get('palette', 'auto')
     except Exception:
         th = 'auto'
-    if th == 'dark':
+        pal = 'auto'
+    if th == 'dark' or pal == 'dark':
         return True
-    if th == 'light':
+    if th == 'light' or pal == 'light':
         return False
+    if pal in ('navy', 'forest', 'charcoal', 'ember', 'dusk', 'deep'):
+        return True
     return system_dark()
 
 
@@ -630,42 +678,163 @@ def _hex_rgb(x):
         return None
 
 
-def paint_frame(hwnd, dark=None, bg=None):
-    """把窗口外框刷成界面底色（第 184 项）。
+def _dwm_set(hwnd, attr, value):
+    """一条 DwmSetWindowAttribute，失败/老系统一律当没设。"""
+    try:
+        import ctypes
+        v = ctypes.c_int(int(value))
+        return ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), int(attr), ctypes.byref(v), 4) == 0
+    except Exception:
+        return False
 
-    这里要治的是**三个不同来源**的白，缺一个都还会剩一条白边：
-    1. `DWMWA_BORDER_COLOR`（34）—— 最外那 1px 描边；
-    2. `DWMWA_CAPTION_COLOR`（35）—— 顶部那条「标题带」。样式位摘了 WS_CAPTION
-       之后，WinForms/DWM 仍会按 FormBorderStyle 在顶部留一条 caption 带，
-       **它的颜色不受 Form.BackColor 影响**，实测只能用它压（设成界面底色后白带消失）；
-    3. 左右/下三边的填充 —— 由 Form.BackColor 决定，在 create_window 里给
-       `background_color` 就定下来了。
-    Win10 不认 34/35，返回非 0，忽略即可。
+
+def _colorref(r, g, b):
+    return (int(b) << 16) | (int(g) << 8) | int(r)
+
+
+# 已经设过一次的 (hwnd, 色) —— 只用来省掉重复的 RedrawWindow，不靠它判断「系统有没有重置」
+_FRAME_APPLIED = {'key': None}
+
+
+def apply_frame(hwnd, dark=None, bg=None, redraw=True):
+    """第 342 项：把窗口顶部那条 caption 带 + 四周边框刷成界面底色。
+
+    根因（2026-11-19 量出来的，DPR 150% 的机器上）：
+      · `GetWindowRect` 比 `GetClientRect` 四边各多 **10px**（≈6.7 CSS px），
+        顶边那 10px 就是 DWM 画的 caption 带，**不在网页里**，遮罩也盖不到；
+      · 它是系统色，默认白/浅灰 —— 深色主题下就是「标题上面还有一层白」；
+      · 写 `DWMWA_CAPTION_COLOR(35)` 能压住，但**会被系统重置**：
+        切深色（属性 20/19）、窗口激活/失活、缩放变化都会把它打回默认白，
+        所以用户「切换主题也不行」—— 设一次不够，得有人一直盯着（见 _frame_keeper）。
+
+    另外两条：
+      · `DWMWA_BORDER_COLOR(34)` 同样刷底色（系统开着「标题栏显示强调色」时边框会是彩色）；
+      · `DWMWA_SYSTEMBACKDROP_TYPE(38) = DWMSBT_NONE`：不要 Mica/亚克力，
+        否则这条带会映出壁纸渐变（截图里那条蓝色斜纹带就是这么来的）。
+    ⚠️ 不要设 `DWMWA_NCRENDERING_POLICY(2) = DWMNCRP_DISABLED`：实测那样反而多出一条白带。
     """
     if not hwnd:
         return False
-    # bg 优先：主题配色（暖纸 / 夜航蓝…）不是标准深浅色，只有前端知道确切底色
+    if dark is None and _LAST_THEME.get('dark') is not None:
+        dark = _LAST_THEME['dark']
+    if bg is None and _LAST_THEME.get('bg') is not None:
+        bg = _LAST_THEME['bg']
     r, g, b = bg if bg else ui_bg_rgb(dark)
-    try:
-        import ctypes
-        # COLORREF 是 0x00BBGGRR
-        v = ctypes.c_int((b << 16) | (g << 8) | r)
-        hr = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            ctypes.c_void_p(hwnd), 34, ctypes.byref(v), 4)
-        # 顶部白带（caption 带）：不设这条，标题栏上方永远压着一条 8-9px 的白
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            ctypes.c_void_p(hwnd), 35, ctypes.byref(v), 4)
+    cr = _colorref(r, g, b)
+    key = (int(hwnd), cr)
+    first = _FRAME_APPLIED['key'] != key
+    # 先关掉 Mica / 亚克力：它会让这条带透出壁纸
+    _dwm_set(hwnd, 38, 1)
+    ok_cap = _dwm_set(hwnd, 35, cr)          # 顶部 caption 带
+    ok_bd = _dwm_set(hwnd, 34, cr)           # 最外 1px 描边
+    if redraw and first:
         try:
-            # 改完描边要立刻重画这一帧，否则滚动/拖动时旧的白边才会被覆盖掉
-            u = ctypes.windll.user32
-            u.RedrawWindow(ctypes.c_void_p(hwnd), None, None,
-                           _RDW_FRAME | _RDW_INVALIDATE | _RDW_UPDATENOW)
+            import ctypes
+            ctypes.windll.user32.RedrawWindow(
+                ctypes.c_void_p(hwnd), None, None, _RDW_FRAME | _RDW_INVALIDATE)
         except Exception:
             pass
-        return hr == 0
-    except Exception as e:
-        _log('paint_frame failed: %r' % (e,))
+    if first:
+        _FRAME_APPLIED['key'] = key
+        _log('apply_frame hwnd=%s rgb=%s,%s,%s cap=%s border=%s' % (hwnd, r, g, b, ok_cap, ok_bd))
+    return ok_cap or ok_bd
+
+
+def frame_invisible(hwnd, bg=None):
+    """旧名保留（第 342 项）：等价于 apply_frame(hwnd, bg=bg)。"""
+    return apply_frame(hwnd, bg=bg)
+
+
+def paint_frame(hwnd, dark=None, bg=None):
+    """第 184 项的入口，现由 apply_frame 实现（第 342 项合并，避免两套逻辑打架）。"""
+    return apply_frame(hwnd, dark, bg)
+
+
+def set_window_background(win, rgb=None):
+    """第 359 项：把窗口（WinForms Form + 里面的浏览器控件）背景刷成界面底色。
+
+    为什么非要有这一步：快搜窗是 frameless，`soft_shadow()` 又把 DWM 边框扩进
+    客户区 1px，`install_child_hit_guard()` 还让 WebView2 四周让出几像素（拖边缘
+    要用）。于是窗口最外圈那一圈（DPI 150% 实测 8~11px）**不在网页里**，画的是
+    WinForms 的 BackColor。mini 建窗写的是 '#FFFFFF' —— 用户把配色换成 cyber /
+    night 之后，右侧就挂着一条白边，网页里怎么改 CSS 都盖不到它。
+
+    ⚠️ 跨线程：通常从 JS API 线程调用；WinForms 属性赋值跨线程不抛异常，
+    这里也一律吞掉失败 —— 刷不上最多留一条细边，不能把 set_dark 带崩。
+    """
+    if win is None:
         return False
+    try:
+        from System.Drawing import Color
+        r, g, b = rgb if rgb else ui_bg_rgb()
+        col = Color.FromArgb(int(r), int(g), int(b))
+        native = getattr(win, 'native', None)
+        if native is None:
+            return False
+        native.BackColor = col
+        try:
+            for c in native.Controls:
+                try:
+                    c.BackColor = col
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 第 363 项：只改 BackColor 不够 —— 那圈非客户区是 DWM 合成的旧表面，
+        # 建窗时画成白的，之后窗口长高只补刷新增的那段，原来那段仍是白的。
+        # 这里显式把 frame 标脏重画一遍（RDW_FRAME 只碰边框，不动网页）。
+        try:
+            import ctypes
+            ctypes.windll.user32.RedrawWindow(
+                ctypes.c_void_p(getattr(native, 'Handle', 0) or 0), None, None,
+                0x0001 | 0x0004 | 0x0100)      # INVALIDATE|ERASE|FRAME
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        _log('set_window_background skipped: %r' % (e,))
+        return False
+
+
+_KEEPER_STOP = threading.Event()
+_KEEPER_TH = {'t': None}
+
+
+def _frame_keeper():
+    """每 3 秒把 caption / 边框色重设一遍（第 342 项）。
+
+    为什么需要循环：Windows 自己会把这些 DWM 属性重置回默认（切深色、激活切换、
+    DPI 变化都会），设一次只能好一会儿。这里只重设属性、不重画（值没变时 DWM 不动）。
+    """
+    while not _KEEPER_STOP.is_set():
+        try:
+            d = _LAST_THEME.get('dark')
+            bg = _LAST_THEME.get('bg')
+            for title in (MAIN_TITLE, MINI_TITLE):
+                hw = find_hwnd(title)
+                if hw:
+                    apply_frame(hw, d, bg, redraw=False)
+        except Exception:
+            pass
+        _KEEPER_STOP.wait(3.0)
+
+
+def start_frame_keeper():
+    """起一个后台线程盯着窗口外框颜色；重复调用无副作用。"""
+    t = _KEEPER_TH.get('t')
+    if t and t.is_alive():
+        return True
+    _KEEPER_STOP.clear()
+    t = threading.Thread(target=_frame_keeper, name='frame-keeper', daemon=True)
+    _KEEPER_TH['t'] = t
+    t.start()
+    _log('frame keeper started')
+    return True
+
+
+def stop_frame_keeper():
+    _KEEPER_STOP.set()
 
 
 def dark_caption(hwnd, dark=True):
@@ -720,6 +889,479 @@ _RDW_FRAME = 0x0400
 _SWP_FLAGS = _SWP_FRAMECHANGED | _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOZORDER
 _WM_NCLBUTTONDOWN, _HTCAPTION = 0x00A1, 2
 _SW_MINIMIZE, _SW_MAXIMIZE, _SW_RESTORE = 6, 3, 9
+_WM_SYSCOMMAND = 0x0112
+_SC_MINIMIZE, _SC_MAXIMIZE, _SC_RESTORE = 0xF020, 0xF030, 0xF120
+
+
+# ——— 第 343 项：把「非客户区」整块吃掉，顶部 caption 带从根上不存在 ———
+# 为什么会有那条带：窗口带着 WS_THICKFRAME（可缩放边框，实测 style=0x160f0000 含 0x00040000），
+# 系统就给它留了 10px 非客户区（DPR 150% 下），顶边那 10px 被 DWM 按 caption 色画出来。
+# 官方解法是：子类化窗口过程，收 WM_NCCALCSIZE(wParam=TRUE) 时直接 return 0 ——
+# 「客户区占满整窗」。这样非客户区厚度 = 0，**没有带子可画**，也就不需要一直盯着改颜色。
+# 缩放/贴边/阴影都保留：WS_THICKFRAME 没摘，DefWindowProc 的命中测试照旧生效。
+# 唯一要照顾的是最大化：带 frame 的窗口最大化时窗口矩形会比工作区各边多出那 10px，
+# 这时必须交回默认处理，否则内容会被裁掉一圈。
+_WM_NCCALCSIZE = 0x0083
+_WM_NCHITTEST = 0x0084
+_WM_SIZE = 0x0005
+_WM_ACTIVATE = 0x0006
+_WM_DPICHANGED = 0x02E0
+_WM_THEMECHANGED = 0x031A
+_HTTRANSPARENT = -1
+_HTLEFT, _HTRIGHT, _HTTOP, _HTTOPLEFT, _HTTOPRIGHT = 10, 11, 12, 13, 14
+_HTBOTTOM, _HTBOTTOMLEFT, _HTBOTTOMRIGHT = 15, 16, 17
+_GWLP_WNDPROC = -4
+_NC = {'proc': None, 'child_proc': None, 'old': {}, 'ours': set()}
+_CHILD_NC = {}          # child hwnd -> (old_proc, our_proc, parent_hwnd)
+
+# ——— 第 363 项：把快搜窗那圈非客户区涂成实色 ———
+# 现象：深色配色下快搜窗右边挂一条白带，而且只到某个高度就断掉。
+# 量出来：那 11px 宽的条在客户区之外（客户区 1118×463 / 窗口 1140×474），
+# 走的是 DWM 的玻璃边框 —— 里面什么都没画，**背后是什么就透什么**：
+# 用户背后那个白窗口就是那条白带，断掉的位置正好是两个窗口的重叠边界。
+# 解法：① 撤掉 DWM 扩进客户区的玻璃面（DwmExtendFrameIntoClientArea 全 0）；
+#        ② 自己处理 WM_NCPAINT，用 GDI 把那三条边刷成当前底色 → 不透明、跟主题走。
+_MATTE = {}             # hwnd -> COLORREF
+_WM_NCPAINT = 0x0085
+
+
+def _paint_matte_frame(hwnd):
+    """把窗口左/右/下三条非客户边刷成 _MATTE[hwnd] 里的颜色（物理像素）。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    u = ctypes.windll.user32
+    g = ctypes.windll.gdi32
+    color = _MATTE[int(hwnd)]
+    wr = wt.RECT()
+    u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(wr))
+    ww, wh = wr.right - wr.left, wr.bottom - wr.top
+    b = _frame_insets(hwnd)
+    hdc = u.GetWindowDC(ctypes.c_void_p(hwnd))
+    if not hdc:
+        return False
+    brush = g.CreateSolidBrush(color)
+    # GetWindowDC 的原点是窗口左上角 → 这里的矩形必须用**窗口内坐标**（0,0 起）
+    bands = (
+        wt.RECT(0, 0, b, wh),                    # 左
+        wt.RECT(ww - b, 0, ww, wh),              # 右
+        wt.RECT(0, wh - b, ww, wh),              # 下
+    )
+    for r in bands:
+        u.FillRect(hdc, ctypes.byref(r), brush)      # FillRect 是 user32 的导出函数
+    g.DeleteObject(brush)
+    u.ReleaseDC(ctypes.c_void_p(hwnd), hdc)
+    _log_always('ncpaint hwnd=%s color=%s b=%s' % (hwnd, color, b))
+    return True
+
+
+def matte_frame(hwnd, rgb=None):
+    """第 363 项：给一扇窗关掉玻璃边框 + 记下底色（幂等，重复调用只更新颜色）。"""
+    if not hwnd:
+        return False
+    key = int(hwnd)
+    rgb = rgb if rgb else (_LAST_THEME.get('bg') or ui_bg_rgb())
+    if isinstance(rgb, str):                 # 前端报上来的是 '#RRGGBB'
+        rgb = _hex_rgb(rgb)
+    if not rgb:
+        rgb = ui_bg_rgb()
+    _MATTE[key] = _colorref(rgb[0], rgb[1], rgb[2])
+    _log_always('matte_frame hwnd=%s rgb=%s color=%s' % (key, rgb, _MATTE[key]))
+    try:
+        import ctypes
+        m = _MARGINS(0, 0, 0, 0)
+        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(ctypes.c_void_p(key), ctypes.byref(m))
+        # pywebview 建窗时给 shadow 窗设过 DWMWA_NCRENDERING_POLICY=DISABLED。
+        # 关掉 NC 渲染，那圈非客户区就永远没人画 —— 直接透出背后的窗口（白条）。
+        # 这里改回 ENABLED，让 WM_NCPAINT 回到我们手里，由 _paint_matte_frame 刷色。
+        dwm = ctypes.windll.dwmapi
+        dwm.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                              ctypes.c_void_p, ctypes.c_uint]
+        dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+        dwm.DwmExtendFrameIntoClientArea.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        v_en = ctypes.c_int(1)                           # DWMNCRP_ENABLED
+        dwm.DwmSetWindowAttribute(ctypes.c_void_p(key), 2, ctypes.byref(v_en), 4)
+        # 最外那 2px 是 DWM 自己的边框色（自绘盖不到），一并刷成同一底色
+        v_bd = ctypes.c_int(_MATTE[key])
+        dwm.DwmSetWindowAttribute(ctypes.c_void_p(key), 34, ctypes.byref(v_bd), 4)  # DWMWA_BORDER_COLOR
+        # DWM 缓存着旧表面：SWP_FRAMECHANGED 让它重算，再连 frame 一起标脏立即刷
+        u = ctypes.windll.user32
+        u.SetWindowPos(ctypes.c_void_p(key), None, 0, 0, 0, 0,
+                       0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)
+        u.RedrawWindow(
+            ctypes.c_void_p(key), None, None, 0x0001 | 0x0004 | 0x0100 | 0x0400)   # +UPDATENOW
+        # 系统不一定给我们发 WM_NCPAINT（缓存表面还在），换色后自己补一遍
+        _paint_matte_frame(key)
+    except Exception as e:
+        _log('matte_frame failed: %r' % (e,))
+        return False
+    return True
+
+
+def _resize_border(hwnd):
+    """边缘拖拽热区有多宽（物理像素）：按 DPI 取 6 个 CSS px。"""
+    try:
+        import ctypes
+        dpi = ctypes.windll.user32.GetDpiForWindow(ctypes.c_void_p(hwnd)) or 96
+        return max(4, int(round(6 * dpi / 96.0)))
+    except Exception:
+        return 8
+
+
+def _frame_insets(hwnd):
+    """系统给的边框厚度（物理像素）：SM_CXSIZEFRAME + SM_CXPADDEDBORDER，按 DPI 取。"""
+    import ctypes
+    u = ctypes.windll.user32
+    try:
+        dpi = u.GetDpiForWindow(ctypes.c_void_p(hwnd)) or 96
+        sm = getattr(u, 'GetSystemMetricsForDpi', None)
+        if sm:
+            return (sm(32, dpi) + sm(92, dpi)) or 10        # CXSIZEFRAME=32, CXPADDEDBORDER=92
+    except Exception:
+        pass
+    return (u.GetSystemMetrics(32) + u.GetSystemMetrics(92)) or 10
+
+
+def _hit_test(hwnd, lparam):
+    """第 343 项：客户区铺满整窗后，边缘缩放要自己给 HT* 码（否则整窗都是 HTCLIENT）。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    u = ctypes.windll.user32
+    if u.IsZoomed(ctypes.c_void_p(hwnd)):
+        return None                       # 最大化时没有边缘可拖
+    x = ctypes.c_short(lparam & 0xFFFF).value
+    y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+    wr = wt.RECT()
+    u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(wr))
+    b = _resize_border(hwnd)
+    left = x <= wr.left + b
+    right = x >= wr.right - b
+    top = y <= wr.top + b
+    bottom = y >= wr.bottom - b
+    if top and left:
+        return _HTTOPLEFT
+    if top and right:
+        return _HTTOPRIGHT
+    if bottom and left:
+        return _HTBOTTOMLEFT
+    if bottom and right:
+        return _HTBOTTOMRIGHT
+    if left:
+        return _HTLEFT
+    if right:
+        return _HTRIGHT
+    if top:
+        return _HTTOP
+    if bottom:
+        return _HTBOTTOM
+    return None
+
+
+
+
+# 第 375 项：子窗转发非客户区按下时要用到的消息号 / 光标资源号（IDC_*）。
+_WM_LBUTTONDOWN = 0x0201
+_WM_LBUTTONDBLCLK = 0x0203
+_WM_NCLBUTTONDBLCLK = 0x00A3
+_WM_SETCURSOR = 0x0020
+_RESIZE_CURSOR = {_HTTOP: 32645, _HTBOTTOM: 32645,           # IDC_SIZENS
+                  _HTLEFT: 32644, _HTRIGHT: 32644,           # IDC_SIZEWE
+                  _HTTOPLEFT: 32642, _HTBOTTOMRIGHT: 32642,  # IDC_SIZENWSE
+                  _HTTOPRIGHT: 32643, _HTBOTTOMLEFT: 32643}  # IDC_SIZENESW
+
+
+def _cursor_pt():
+    """当前鼠标的屏幕坐标（物理像素）。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    p = wt.POINT()
+    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(p)):
+        return None
+    return (p.x, p.y)
+
+
+# 需要挂「边缘让路」的子窗类名前缀。
+# 第 368 项：原来只认 Chrome_ / Intermediate D3D，漏了 **WebView2 的 WinForms 宿主面板**
+# （`WindowsForms10.Window.*`）。它才是 z 序最上面的那个：客户区顶边归零后，顶部 6px
+# 的缩放热区全被它吃掉（回 HTCLIENT），父窗的 WM_NCHITTEST 根本没被问到 → 鼠标在
+# 标题栏最上面拖不出缩放箭头，上下也就拉不动。左右下能动，是因为那三条边还在非客户区。
+# 第 375 项：还漏了真正吃鼠标的那个 —— `Chrome_RenderWidgetHostHWND`（渲染宿主，
+# 它才是 z 序最上面、直接收 WM_LBUTTONDOWN 的窗口；`Chrome_` 前缀匹配不到它，
+# 名字里是 `Chrome_RenderWidget...`，下划线位置不一样）。少了它，按在顶部热区上
+# 会被当成「拖标题栏」，窗口整体跟着鼠标往下走而不是改高度。
+_GUARD_PREFIXES = ('Chrome_', 'Chrome_RenderWidgetHostHWND', 'Intermediate D3D',
+                   'WindowsForms10.Window')
+
+
+def _child_hitproc(hwnd, msg, wparam, lparam):
+    """WebView2 的子窗口盖住了整块客户区，边缘那几像素要让回给父窗口测命中。
+
+    第 375 项：HTTRANSPARENT 只对**同一线程**的窗口有效。WebView2 的宿主面板
+    （WindowsForms10.Window.* / Chrome_*）是另一个线程的窗口，系统不会因为我们
+    回了 HTTRANSPARENT 就把命中转给父窗 —— 于是父窗的 _hit_test 永远轮不到，
+    标题栏最上面那条 6px 热区按下去一点反应都没有（左右下能动，是因为那三边
+    本来就在真正的非客户区里，压根不经过子窗）。
+
+    这里替父窗把这一下翻译成「非客户区按下 / 双击」：父窗的 DefWindowProc 收到
+    就进系统自己的缩放 / 最大化循环，鼠标本来就按着，一路拖过去和原生边框一样。
+    顺带把热区里的鼠标形状自己给（否则「能拉」也看不出来）。
+    """
+    rec = _CHILD_NC.get(int(hwnd))
+    try:
+        if rec and rec[2]:
+            if msg == _WM_NCHITTEST:
+                if _hit_test(rec[2], lparam) is not None:
+                    return _HTTRANSPARENT
+            elif msg == _WM_SETCURSOR:
+                _pt = _cursor_pt()
+                if _pt is not None:
+                    code = _hit_test(rec[2], (_pt[1] << 16) | (_pt[0] & 0xFFFF))
+                    cur = _RESIZE_CURSOR.get(code)
+                    if cur:
+                        ctypes.windll.user32.SetCursor(
+                            ctypes.windll.user32.LoadCursorW(0, cur))
+                        return 1
+    except Exception:
+        pass
+    return _NC_CALL(rec[0] if rec else None, hwnd, msg, wparam, lparam)
+
+
+def install_child_hit_guard(parent):
+    """把 WebView2 的各个子窗口挂上「边缘让路」的过程（重复调用只补新的）。"""
+    if not parent:
+        return 0
+    try:
+        import ctypes
+        if _NC['child_proc'] is None:
+            proto = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+                                      ctypes.c_ssize_t, ctypes.c_ssize_t)
+            _NC['child_proc'] = proto(_child_hitproc)
+        ptr = ctypes.cast(_NC['child_proc'], ctypes.c_void_p).value
+        u = ctypes.windll.user32
+        found = []
+
+        def visit(h, _):
+            cls = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(ctypes.c_void_p(h), cls, 256)
+            if cls.value.startswith(_GUARD_PREFIXES):
+                found.append(int(h))
+            return True
+
+        u.EnumChildWindows(ctypes.c_void_p(parent),
+                           ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                              ctypes.c_void_p)(visit), None)
+        added = 0
+        for ch in found:
+            if ch in _CHILD_NC:
+                continue
+            old = _NC_GET(ctypes.c_void_p(ch), _GWLP_WNDPROC)
+            if not old:
+                continue
+            _CHILD_NC[ch] = (old, _NC['child_proc'], int(parent))
+            _NC_SET(ctypes.c_void_p(ch), _GWLP_WNDPROC, ptr)
+            added += 1
+        if added:
+            _log_always('child hit guard: +%d (total %d)' % (added, len(_CHILD_NC)))
+        start_child_guard_loop(parent)      # 第 368 项：以后新造的子窗也要补挂
+        return added
+    except Exception as e:
+        _log_always('child hit guard failed: %r' % (e,))
+        return 0
+
+
+_GUARD_LOOP = {'parents': set(), 'lock': threading.Lock()}
+
+
+def start_child_guard_loop(parent):
+    """每 8 秒补挂一次。WebView2 会在导航/新建窗口/崩溃恢复时重造子窗，
+    建窗时挂一次不够：后来出现的宿主面板没人管，顶部那 6px 缩放热区又会失效。"""
+    if not parent:
+        return
+    key = int(parent)
+    with _GUARD_LOOP['lock']:
+        if key in _GUARD_LOOP['parents']:
+            return
+        _GUARD_LOOP['parents'].add(key)
+
+    def loop():
+        while True:
+            time.sleep(8)
+            try:
+                install_child_hit_guard(key)
+            except Exception:
+                pass
+
+    threading.Thread(target=loop, daemon=True, name='child-hit-guard').start()
+
+
+
+def _work_rect(hwnd):
+    """取窗口所在显示器的「工作区」（不含任务栏）。第 343 项最大化时要用。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    u = ctypes.windll.user32
+
+    class _MONITORINFO(ctypes.Structure):
+        _fields_ = [('cbSize', ctypes.c_uint32), ('rcMonitor', wt.RECT),
+                    ('rcWork', wt.RECT), ('dwFlags', ctypes.c_uint32)]
+
+    mi = _MONITORINFO()
+    mi.cbSize = ctypes.sizeof(_MONITORINFO)
+    mon = u.MonitorFromWindow(ctypes.c_void_p(hwnd), 2)     # MONITOR_DEFAULTTONEAREST
+    if not mon:
+        return None
+    if not u.GetMonitorInfoW(ctypes.c_void_p(mon), ctypes.byref(mi)):
+        return None
+    return mi.rcWork
+
+
+def _nc_wndproc(hwnd, msg, wparam, lparam):
+    old = _NC['old'].get(int(hwnd))
+    try:
+        if msg == _WM_NCPAINT and int(hwnd) in _MATTE:
+            # 第 363 项：快搜窗那圈非客户区不画的话，DWM 会当玻璃区合成 ——
+            # 于是「后面是什么就透出什么」：深色界面上挂一条白边，其实就是背后
+            # 那个白窗口。这里自己用 GDI 把那三条边涂成界面底色，彻底不透明。
+            try:
+                _paint_matte_frame(int(hwnd))
+                return 0
+            except Exception as _e:
+                _log_always('ncpaint FAILED: %r' % (_e,))
+        if msg == _WM_NCCALCSIZE and wparam == 1:
+            import ctypes
+            import ctypes.wintypes as wt
+            if ctypes.windll.user32.IsZoomed(ctypes.c_void_p(hwnd)):
+                # 最大化：带 WS_THICKFRAME 的窗口在最大化时会比工作区各边多出
+                # 10px（客户区原点能到 (0,0)，说明窗口矩形已经越界）。
+                # 直接把「建议的客户区」改成工作区再交回去，页面就不会被裁掉一圈。
+                work = _work_rect(hwnd)
+                if work is not None and lparam:
+                    rc = ctypes.cast(lparam, ctypes.POINTER(wt.RECT)).contents
+                    rc.left, rc.top, rc.right, rc.bottom = (
+                        work.left, work.top, work.right, work.bottom)
+                    return 0
+                return _NC_CALL(old, hwnd, msg, wparam, lparam)
+            # 非最大化：**只把顶边归零**，左右下仍留系统自己的边框。
+            # 顶边那 10px 就是 caption 带（DWM 画的），归零后它彻底不存在；
+            # 左右下留着，边缘拖拽缩放交给 DefWindowProc（WebView 铺满客户区，
+            # 跨进程子窗吃不住命中测试，靠「自己算热区」那条路走不通）。
+            b = _frame_insets(hwnd)
+            if b > 0 and lparam:
+                rc = ctypes.cast(lparam, ctypes.POINTER(wt.RECT)).contents
+                rc.left += b
+                rc.right -= b
+                rc.bottom -= b
+                # rc.top 不动 → 客户区顶到窗口最上沿
+            return 0
+        if msg == _WM_NCHITTEST:
+            # 非客户区归零后 DefWindowProc 一律回 HTCLIENT → 边缘拖不动，
+            # 所以这里自己算那圈 6px 的缩放热区。
+            code = _hit_test(hwnd, lparam)
+            if code is not None:
+                return code
+    except Exception:
+        pass
+    res = _NC_CALL(old, hwnd, msg, wparam, lparam)
+    if msg in (_WM_ACTIVATE, _WM_SIZE, _WM_DPICHANGED, _WM_THEMECHANGED):
+        # 第 343 项：系统会在激活切换 / 缩放 / DPI 变化 / 换主题时把边框色打回默认。
+        # 顶边已经归零（那条 caption 带不存在了），但左/右/下还留着 10px 边框，
+        # 颜色不对就会变成三条白边 —— 这里按事件补刷，**不再需要每 3 秒轮询的线程**。
+        try:
+            apply_frame(hwnd, redraw=(msg == _WM_DPICHANGED))
+            # 第 363 项：窗口长高时新露出来的那圈边框会用当前底色补刷，**原来那段**
+            # 却保留建窗时的旧色（深色界面下就是顶部那段白边）。这里连 frame 一起标脏。
+            if msg == _WM_SIZE:
+                ctypes.windll.user32.RedrawWindow(
+                    ctypes.c_void_p(hwnd), None, None, 0x0001 | 0x0004 | 0x0100)
+        except Exception:
+            pass
+    return res
+
+
+
+def _nc_make_proc():
+    import ctypes
+    proto = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+                              ctypes.c_ssize_t, ctypes.c_ssize_t)
+    return proto(_nc_wndproc)
+
+
+import ctypes  # noqa: E402  （模块级 import 放这儿是为了上面那段 ctypes 用得上）
+
+_NC_CALL = ctypes.windll.user32.CallWindowProcW
+_NC_CALL.restype = ctypes.c_ssize_t
+_NC_CALL.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                     ctypes.c_ssize_t, ctypes.c_ssize_t]
+_NC_SET = ctypes.windll.user32.SetWindowLongPtrW
+_NC_SET.restype = ctypes.c_void_p
+_NC_SET.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+_NC_GET = ctypes.windll.user32.GetWindowLongPtrW
+_NC_GET.restype = ctypes.c_void_p
+_NC_GET.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+
+def install_nc_guard(hwnd, force=False):
+    """第 343 项：挂上 WM_NCCALCSIZE 子类化，把 10px 非客户区归零（重复调用安全）。
+
+    ⚠️ WinForms 在窗体第一次真正 Show / 重建句柄时会把自己的窗口过程装回去，
+    我们建窗时挂的那份会被顶掉（第 343 项实测：装完内缩还是 10px）。
+    所以调用方不能信一次返回值，要用 `frame_insets() > 0` 判断，必要时 force=True 重挂。
+    """
+    if not hwnd:
+        return False
+    key = int(hwnd)
+    if key in _NC['ours'] and not force:
+        return True
+    try:
+        if _NC['proc'] is None:
+            _NC['proc'] = _nc_make_proc()
+        ptr = ctypes.cast(_NC['proc'], ctypes.c_void_p).value    # 传整数，别传 c_void_p 对象
+        old = _NC_GET(ctypes.c_void_p(hwnd), _GWLP_WNDPROC)
+        if not old:
+            return False
+        # 已经是我们的过程（force 重挂场景）就别把「自己」记成旧过程，否则递归到死
+        if key in _NC['ours'] and old == ptr and key in _NC['old']:
+            old = _NC['old'][key]
+        _NC['old'][key] = old
+        _NC_SET(ctypes.c_void_p(hwnd), _GWLP_WNDPROC, ptr)
+        _NC['ours'].add(key)
+        # 样式没变也要让系统重算一次客户区
+        try:
+            ctypes.windll.user32.SetWindowPos(
+                ctypes.c_void_p(hwnd), None, 0, 0, 0, 0, _SWP_FLAGS)
+        except Exception:
+            pass
+        _log_always('nc_guard installed hwnd=%s force=%s insets=%s' % (
+            hwnd, force, frame_insets(hwnd)))
+        return True
+    except Exception as e:
+        _log_always('nc_guard failed: %r' % (e,))
+        return False
+
+
+
+def snap_zone(rect, work, tol=6):
+    """第 289 项：这扇窗现在落在哪个吸附区？返回 'max' / 'left' / 'right' / None。
+
+    rect / work 都是 (left, top, right, bottom)。判定规则从「越过就算」改成
+    **「只认正好贴住的那条容差带」**：
+      · 顶边：|top - work.top| <= tol          → 最大化
+      · 左边缘：|left - work.left| <= tol      → 左半屏
+      · 右边缘：|right - work.right| <= tol    → 右半屏
+    这样把窗口往屏幕外推（right > work.right + tol）就**不再**被吸回来 ——
+    用户「临时挪开一半」的动作得以保留，只有真正贴边才吸附。
+    """
+    try:
+        rl, rt, rr, rb = rect
+        wl, wt, wr, wb = work
+        if abs(int(rt) - int(wt)) <= tol:
+            return 'max'
+        if abs(int(rl) - int(wl)) <= tol:
+            return 'left'
+        if abs(int(rr) - int(wr)) <= tol:
+            return 'right'
+    except Exception:
+        pass
+    return None
 
 
 def _win_ptr_funcs():
@@ -755,13 +1397,11 @@ def caption_off(hwnd, off=True):
         if want != style:
             put(h, _GWL_STYLE, want)
             u.SetWindowPos(h, None, 0, 0, 0, 0, _SWP_FLAGS)
-        # 返回**读回来的真实状态**：WinForms 会在 resize 时按 FormBorderStyle
-        # 把样式写回去，所以「发过 SetWindowLongPtr」不等于「现在是目标状态」。
-        try:
-            u.RedrawWindow(h, None, None,
-                           _RDW_FRAME | _RDW_INVALIDATE | _RDW_UPDATENOW)
-        except Exception:
-            pass
+            try:
+                u.RedrawWindow(h, None, None,
+                               _RDW_FRAME | _RDW_INVALIDATE)
+            except Exception:
+                pass
         after = get(h, _GWL_STYLE)
         if want != style:
             _log('caption_off hwnd=%s before=%s want=%s after=%s off=%s'
@@ -807,23 +1447,28 @@ def caption_drag(hwnd):
 
 
 def window_cmd(hwnd, cmd):
-    """自绘标题栏三键：min / max（切换）/ restore。"""
+    """自绘标题栏三键：min / max（切换）/ restore。
+
+    使用 PostMessage 发送 WM_SYSCOMMAND（_SC_MINIMIZE / _SC_MAXIMIZE / _SC_RESTORE）：
+    异步非阻塞，不占用/不等待 UI 线程消息循环，杜绝跨线程 ShowWindow 导致的死锁与假死（未响应）。
+    """
     if not hwnd:
         return False
     try:
         ctypes, u, _g, _p = _win_ptr_funcs()
         h = ctypes.c_void_p(hwnd)
         if cmd == 'min':
-            u.ShowWindow(h, _SW_MINIMIZE)
+            u.PostMessageW(h, _WM_SYSCOMMAND, _SC_MINIMIZE, 0)
         elif cmd == 'max':
-            u.ShowWindow(h, _SW_RESTORE if u.IsZoomed(h) else _SW_MAXIMIZE)
+            is_max = bool(u.IsZoomed(h))
+            u.PostMessageW(h, _WM_SYSCOMMAND, _SC_RESTORE if is_max else _SC_MAXIMIZE, 0)
         elif cmd == 'restore':
-            u.ShowWindow(h, _SW_RESTORE)
+            u.PostMessageW(h, _WM_SYSCOMMAND, _SC_RESTORE, 0)
         else:
             return False
         return True
     except Exception as e:
-        _log('window_cmd(%s) failed: %r' % (cmd, e))
+        _log_always('window_cmd(%s) failed: %r' % (cmd, e))
         return False
 
 
@@ -833,6 +1478,193 @@ def window_maximized(hwnd):
         return bool(hwnd) and bool(u.IsZoomed(ctypes.c_void_p(hwnd)))
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------- pywebview 门闩
+# 第 267 项：pywebview 的 Window.show() / load_url() / evaluate_js() 全被
+# _api_call() 包着，进来先 event.wait(20)。其中 evaluate_js 等的是
+# events._pywebviewready —— 它只在 window.py:285 的 load_url() 里被 clear()，
+# 靠页面重载时注入的 JS 再置回去。一旦某次重载没把它置回来，之后**每一次**
+# evaluate_js 都空等 20 秒、再抛 WebViewException: Main window failed to start。
+# 真机日志（13:14:32 begin → 13:14:52 报错，连续四次）就是这个形状：
+# 托盘「设置 / 关于 / 反馈」各点一次，20 秒后掉异常，面板**永远打不开**；
+# 而每次点击的线程 20 秒后还会再 show() 一次，用户关掉的详情栏又被顶回来。
+#
+# 修法不是去等门闩，而是绕开它：直接调 winforms 后端（BrowserView.instances），
+# 与 pywebview 内部同一套实现，只是不经过那层事件等待。
+
+def _pv_backend():
+    try:
+        from webview.platforms import winforms as _wf
+        if hasattr(_wf, 'BrowserView'):
+            return _wf
+    except Exception:
+        pass
+    return None
+
+
+def _pv_has(wf, uid):
+    """后端里真有这个 uid 的窗口实例吗（没有就别假装成功）。"""
+    try:
+        return bool(wf) and uid in getattr(wf.BrowserView, 'instances', {})
+    except Exception:
+        return False
+
+
+def _ui_set_visible(ctrl, tag=''):
+    """把「WebView2 控件 Visible=true」送回 WinForms UI 线程去做。
+
+    第 329 项：14:36 真机死锁。托盘线程（on_menu → show_main）在这里**直接**写
+    `ctrl.Visible = True`；跨线程访问 WinForms 控件要等 UI 线程来取，UI 线程那会儿
+    正忙着建窗/合成，两边互等。现场 py-spy 抓得清清楚楚：
+      MainThread        → create_window (winforms.py:834)
+      Thread-205 on_menu→ _force_webview_visible (app_window.py:3083)   ← 卡在这
+    窗口 Responding=False、8765 不再接受连接，用户看到的就是「一点开详情页整台机器
+    卡死，鼠标键盘都不动」，只能强杀进程。
+
+    改成 BeginInvoke：只往 UI 线程排队，**从不同步等它**；UI 忙就晚一点显示，绝不
+    把调用方（托盘线程 / HTTP 线程）挂死。
+    """
+    def _apply():
+        try:
+            ctrl.Visible = True
+        except Exception as e:
+            _log('force webview visible (%s) apply FAILED: %r' % (tag, e))
+
+    try:
+        from System import Action        # pythonnet（只在这条路径上要）
+        if getattr(ctrl, 'InvokeRequired', True):
+            ctrl.BeginInvoke(Action(_apply))
+        else:
+            _apply()
+        return True
+    except Exception as e:
+        _log('force webview visible (%s) marshal FAILED: %r' % (tag, e))
+        return False
+
+
+def pv_show(win):
+    """显示窗口（绕过 _shown_call）。成功返回 True。"""
+    if win is None:
+        return False
+    uid = str(getattr(win, 'uid', '') or '')
+    wf = _pv_backend()
+    if _pv_has(wf, uid):
+        try:
+            wf.show(uid)
+            return True
+        except Exception as e:
+            _log_always('pv_show backend FAILED: %r' % (e,))
+    try:
+        win.show()
+        return True
+    except Exception as e:
+        # 两条路都失败 → 交给 show_main 的兜底（把快搜窗放回来），别静默吞掉
+        _log_always('pv_show pywebview FAILED: %r' % (e,))
+        raise
+
+
+def pv_hide(win):
+    if win is None:
+        return False
+    uid = str(getattr(win, 'uid', '') or '')
+    wf = _pv_backend()
+    if _pv_has(wf, uid):
+        try:
+            wf.hide(uid)
+            return True
+        except Exception as e:
+            _log_always('pv_hide backend FAILED: %r' % (e,))
+    try:
+        win.hide()
+        return True
+    except Exception as e:
+        _log_always('pv_hide pywebview FAILED: %r' % (e,))
+        return False
+
+
+def pv_load_url(win, url):
+    """整页导航（绕过 _loaded/_ready 门闩，也不清 pywebview 的 ready 事件）。"""
+    if win is None:
+        return False
+    uid = str(getattr(win, 'uid', '') or '')
+    wf = _pv_backend()
+    if _pv_has(wf, uid):
+        try:
+            wf.load_url(url, uid)
+            try:
+                win.real_url = url
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            _log_always('pv_load_url backend FAILED: %r' % (e,))
+    try:
+        win.load_url(url)
+        return True
+    except Exception as e:
+        _log_always('pv_load_url pywebview FAILED: %r' % (e,))
+        return False
+
+
+def pv_eval(win, script):
+    """执行 JS（绕过 _pywebviewready 门闩）。供「导航后补一刀」这类场景用。"""
+    if win is None:
+        return None
+    uid = str(getattr(win, 'uid', '') or '')
+    wf = _pv_backend()
+    if _pv_has(wf, uid):
+        try:
+            return wf.evaluate_js(script, uid, True)
+        except Exception as e:
+            _log_always('pv_eval backend FAILED: %r' % (e,))
+    try:
+        return win.evaluate_js(script)
+    except Exception as e:
+        _log_always('pv_eval pywebview FAILED: %r' % (e,))
+        return None
+
+
+def _bump_hide(app):
+    """用户关窗：作废在飞/排队的 show_main（第 267 项）。
+
+    放进模块函数而不是 App 方法，是因为 preflight 会用 `App.__new__` 造壳
+    直接调 show_main/hide 路径，壳上没有 `_hide_seq` 字段。"""
+    try:
+        app._want_main = False
+    except Exception:
+        pass
+    try:
+        app._hide_seq = int(getattr(app, '_hide_seq', 0) or 0) + 1
+    except Exception:
+        pass
+    return int(getattr(app, '_hide_seq', 0) or 0)
+
+
+def pv_heal_gate(win, tries=12, interval=0.25):
+    """门闩被清空、页面其实活着时，用后端探针证明一次再把事件补回去。
+
+    只补 `_pywebviewready`：它是「页面已就绪」的缓存，不是业务状态；
+    页面真死了探针拿不到 readyState，就不会乱补。"""
+    if not str(getattr(win, 'uid', '') or ''):
+        return False                       # 没 uid 的是测试替身，别去探
+    ev = getattr(getattr(win, 'events', None), '_pywebviewready', None)
+    if ev is None:
+        return False
+    for _ in range(max(1, int(tries))):
+        if ev.is_set():
+            return True
+        time.sleep(interval)
+        try:
+            state = pv_eval(win, 'document.readyState')
+        except Exception:
+            state = None
+        if state in ('interactive', 'complete'):
+            ev.set()
+            _log_always('ready 门闩曾被清空：页面实测可用（readyState=%s），已重设' % state)
+            return True
+    return bool(ev.is_set())
+
 
 def round_corners(hwnd):
     """Win11 的 DWM 圆角；Win10 上这个属性号不被识别，返回非 0，忽略即可。
@@ -869,6 +1701,28 @@ def soft_shadow(hwnd):
         return False
 
 
+def frame_insets(hwnd):
+    """第 343 项：**顶边**非客户区有多厚（只有它是那条 caption 带）。
+
+    第 343 项之后左右下仍留系统边框（那是拖拽缩放用的，正常），所以这里不能再取
+    max(...) —— 否则永远 >0，重挂循环会一直以为「归零没成功」，白跑六轮
+    （第 96 次部署实测 `nc_guard ... force=True insets=11` 连打 6 次就是这个 bug）。
+    """
+    if not hwnd:
+        return 0
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        u = ctypes.windll.user32
+        wr = wt.RECT()
+        u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(wr))
+        pt = wt.POINT(0, 0)
+        u.ClientToScreen(ctypes.c_void_p(hwnd), ctypes.byref(pt))
+        return max(0, pt.y - wr.top)
+    except Exception:
+        return 0
+
+
 def main_window_size(sw, sh, saved=None):
     """主窗口默认大小：跟着屏幕走，而不是写死一个数。
 
@@ -886,16 +1740,18 @@ def main_window_size(sw, sh, saved=None):
     if saved:
         try:
             w, h = int(saved[0]), int(saved[1])
-            # 存的尺寸限制在「新默认的合理区间」：太窄（旧版 760/1040）和太宽（0.9.23 那版
-            # 默认 1840、被 remember 记下来的）都收进来，否则用户看不到新默认
-            if 1100 <= w <= sw + 40 and 560 <= h <= sh + 40:
-                return min(w, 1400), min(h, 900)
+            # 第 206 项：下限必须与 _remember_size() 写入条件（700/480）一致。
+            # 以前写 1100/560，用户把窗口拖成 886×836 后每次启动都被当成「不合理」
+            # 丢掉，强行回到 1306×900 —— 这就是「拖不动 / 拖了没用」的真根因。
+            # 上限只防「比屏幕还大」的坏数据，不再把用户拖大的尺寸压回 1400×900。
+            if 700 <= w <= sw + 40 and 480 <= h <= sh + 40:
+                return min(w, 1600), min(h, 1300)
         except Exception:
             pass
-    # 「宽一点」但没有占满：默认屏宽 50%、高度 62%，夹到 [1180×720, 1400×900]。
-    # 上一版给到 72%/1840，2560 屏上直接 1840 —— 用户的原话是「我只让你宽一半，这宽了两三倍」。
-    mw = int(min(max(1180, sw * 0.50), 1400))
-    mh = int(min(max(720, sh * 0.62), 900))
+    # 第 206 项：默认改成「窄一点、高一点」—— 用户给的图 2 是 886×836，
+    # 而老默认 1306×900 是宽扁的图 1。新装用户也给接近图 2 的比例。
+    mw = int(min(max(980, sw * 0.40), 1150))
+    mh = int(min(max(880, sh * 0.60), 1050))
     # 可用空间优先于「合适尺寸」：留 8% 宽 / 10% 高给任务栏和边距。
     # 2026-11-07 修：原来下限写死 `max(520, ...)`，1366×768 笔记本设 150% 时
     # 逻辑屏只有 910×512、扣掉任务栏可用 472 —— 520 的硬下限直接把窗口顶出屏幕，
@@ -913,10 +1769,18 @@ def main_min_size(mw, mh):
 
     同样不能超过屏幕可用空间：下限比屏幕还高时，窗口最小也超出可视区，
     等于「窗口关不掉」。正常尺寸下结果和旧常量一致（760×520）。
+
+    第 377 项：宽度下限从 560/0.62 抬到 930。原因是界面里有两条固定宽的竖栏 ——
+    左侧筛选 172 + 详情面板 300，加列表四列**能正常显示内容**的宽度（名称 ≥160、
+    类型 76、大小 70、修改时间 118、图标列 16、列间距 24 ≈ 464）和内边距 24，
+    合计 **≈960px**。实测过：把窗口缩到 806px 宽、详情开着，修改时间列被切成
+    「2026/」、类型列变成「文档 · C…」，也就是用户说的「跟截图不一样」。
+    所以下限取 930，再窄就拖不进去；屏幕本身就比 930 窄的（1366×768@150% 逻辑屏
+    910、窗口 837）按默认尺寸锁住，不硬顶出屏幕。
     """
-    w = max(560, min(760, int(mw * 0.62)))
+    w = min(int(mw), max(930, int(mw * 0.62)))
     h = max(360, min(520, int(mh * 0.62)))
-    return min(w, int(mw)), min(h, int(mh))
+    return w, h
 
 
 def env_snapshot(hwnd=None):
@@ -1108,7 +1972,7 @@ def notify_resize(hwnd):
         return False
 
 
-def topmost(hwnd, tries=12):
+def topmost(hwnd, tries=12, pin=True):
     """把快搜窗拉到最前并抢到键盘焦点。
 
     这件事比看上去难，三个坑叠在一起：
@@ -1120,6 +1984,12 @@ def topmost(hwnd, tries=12):
        不产生字符，焦点马上被我们抢走，副作用是看不见的。
 
     抢不到就返回 False —— 调用方需要知道，因为「按键打到别的程序里」比不弹窗更糟。
+
+    ⚠️ pin=True 会设 HWND_TOPMOST，**只给快搜窗（mini）用**。
+    主窗口必须传 pin=False：第 192 项实测，show_main 复用 topmost(hwnd) 会把
+    详细搜索页永久钉在所有程序前面，用户想用别的软件只能先关掉或缩小它。
+    pin=False 会主动设 HWND_NOTOPMOST，顺手把历史遗留的置顶状态也清掉；
+    抢前台（BringWindowToTop / Alt 解锁 / SetForegroundWindow）完全保留。
     """
     if not hwnd:
         return False
@@ -1132,7 +2002,8 @@ def topmost(hwnd, tries=12):
         return False
     for i in range(max(1, tries)):
         try:
-            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+            after = win32con.HWND_TOPMOST if pin else win32con.HWND_NOTOPMOST
+            win32gui.SetWindowPos(hwnd, after, 0, 0, 0, 0,
                                   win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
             if win32gui.GetForegroundWindow() == hwnd:
                 return True
@@ -1140,11 +2011,12 @@ def topmost(hwnd, tries=12):
                 win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
             # AttachThreadInput：把自己的输入队列挂到当前前台线程上，绕过前台锁定
             fg = win32gui.GetForegroundWindow()
-            tid_fg = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+            tids = win32process.GetWindowThreadProcessId(fg) if fg else (0, 0)
+            tid_fg, pid_fg = tids[0], tids[1]
             tid_me = win32api.GetCurrentThreadId()
             attached = False
             try:
-                if tid_fg and tid_fg != tid_me:
+                if tid_fg and tid_fg != tid_me and pid_fg != os.getpid():
                     win32process.AttachThreadInput(tid_me, tid_fg, True)
                     attached = True
                 win32gui.BringWindowToTop(hwnd)
@@ -1182,6 +2054,24 @@ def foreground_is(hwnd):
         return win32gui.GetForegroundWindow() == hwnd
     except Exception:
         return False
+
+
+def _dialog_kind(which):
+    """原生对话框类型常量（第 241 项）。
+
+    pywebview 新的 `webview.FileDialog` 枚举是正式 API；
+    旧的 `webview.FOLDER_DIALOG` / `OPEN_DIALOG` 已标记 deprecated
+    （调用时还会往 stderr 打一行警告），将来会删掉。这里优先用新的，
+    旧的只作兜底。
+    """
+    try:
+        from webview import FileDialog
+        return FileDialog.FOLDER if which == 'FOLDER' else FileDialog.OPEN
+    except Exception:
+        if webview is None:
+            return 20 if which == 'FOLDER' else 10
+        return (webview.FOLDER_DIALOG if which == 'FOLDER'
+                else webview.OPEN_DIALOG)
 
 
 def _is_visible(hwnd):
@@ -1385,6 +2275,7 @@ class Api:
 
     def __init__(self, win=None):
         self._win = win
+        self._app = None           # App 注入：原生对话框后要调 App._force_webview_visible 自愈
         self._open_mini = None      # App 注入：唤出快搜窗（欢迎页按钮用）
         self._hide_main = None      # App 注入：收起详情窗（顶栏/标题栏「快搜」按钮用）
 
@@ -1395,12 +2286,25 @@ class Api:
         既不是浅色也不是深色，只靠 dark 布尔值刷出来的框永远差一截。
         """
         try:
+            self._last_dark = bool(dark)
+            self._last_bg = _hex_rgb(bg) if bg else None
+            _LAST_THEME['dark'] = bool(dark)
+            _LAST_THEME['bg'] = self._last_bg
             _hw = find_hwnd(MAIN_TITLE)
             ok = dark_caption(_hw, bool(dark))
             # 深色开关会把 caption 色重置回系统值 → 顶部白带回来（第 184 项）。
             # 这里必须用前端报来的 dark：页面认的是 localStorage.sb_theme，
             # 用配置猜会在用户切主题那一刻对不上（深框套浅页）。
             paint_frame(_hw, bool(dark), _hex_rgb(bg))
+            # 第 359 项：mini 那圈白边在网页之外，得单独刷窗口背景
+            try:
+                _app = getattr(self, '_app', None)
+                _rgb = self._last_bg or ui_bg_rgb(bool(dark))
+                set_window_background(getattr(_app, 'mini', None), _rgb)
+                set_window_background(getattr(_app, 'main', None), _rgb)
+                matte_frame(getattr(_app, 'hwnd_mini', 0), _rgb)
+            except Exception as e:
+                _log('set_dark backcolor skipped: %r' % (e,))
             _log('set_dark(%s, %s) → %s' % (bool(dark), bg, ok))
             return ok
         except Exception:
@@ -1425,6 +2329,106 @@ class Api:
         except Exception:
             return False
 
+    def read_clipboard_image(self):
+        """读取剪贴板图像。"""
+        try:
+            import snip_ocr
+            return snip_ocr.read_clipboard_image()
+        except Exception as e:
+            return {'has_image': False, 'error': str(e)}
+
+    def ocr_image(self, b64_or_data_url=None):
+        """对传入图像执行离线 OCR 识别。"""
+        try:
+            import snip_ocr
+            return snip_ocr.ocr_base64_image(b64_or_data_url)
+        except Exception as e:
+            return {'ok': False, 'text': '', 'error': str(e)}
+
+    def get_clipboard_history(self, kind='all', q='', limit=60, offset=0):
+        try:
+            import clipboard_mgr
+            return {'ok': True, 'items': clipboard_mgr.list_history(kind=kind, q=q, limit=limit, offset=offset)}
+        except Exception as e:
+            return {'ok': False, 'items': [], 'error': str(e)}
+
+    def copy_clipboard_item(self, item_id):
+        try:
+            import clipboard_mgr
+            ok, msg = clipboard_mgr.copy_item(int(item_id))
+            return {'ok': ok, 'msg': msg}
+        except Exception as e:
+            return {'ok': False, 'msg': str(e)}
+
+    def delete_clipboard_item(self, item_id):
+        try:
+            import clipboard_mgr
+            return {'ok': clipboard_mgr.delete_item(int(item_id))}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def clear_clipboard_history(self):
+        try:
+            import clipboard_mgr
+            return {'ok': clipboard_mgr.clear_history()}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def translate_text(self, text, src_lang='auto', tgt_lang='auto'):
+        try:
+            import translator
+            return translator.translate_text(text, src_lang=src_lang, tgt_lang=tgt_lang)
+        except Exception as e:
+            return {'ok': False, 'msg': str(e), 'results': []}
+
+    def trigger_snip(self, ocr=False, translate=False):
+        """主窗口触发屏幕截图。ocr=False: 纯截图拷入剪贴板; ocr=True: 截图并 OCR 提取;
+        translate=True: 截图 → OCR → 翻译，译文贴在选区原位（卡片自己关，主窗不动）。
+        """
+        try:
+            import snip_ocr
+            _hw = getattr(self._app, 'hwnd_main', None) or find_hwnd(MAIN_TITLE)
+
+            def on_done(st):
+                try:
+                    # 翻译模式：卡片是置顶原生窗口，主窗一 show 就会把它顶掉（Deactivate 即关），
+                    # 所以这里什么都不做，用户关掉卡片后自己回主窗。
+                    if translate:
+                        return
+                    if self._app and hasattr(self._app, 'show_main'):
+                        self._app.show_main()
+                    elif _hw:
+                        user32.ShowWindow(_hw, 9)  # SW_RESTORE
+                        user32.SetForegroundWindow(_hw)
+                        try:
+                            d = getattr(self, '_last_dark', effective_dark())
+                            b = getattr(self, '_last_bg', None)
+                            dark_caption(_hw, d)
+                            paint_frame(_hw, d, b)
+                        except Exception:
+                            pass
+                    if self._win:
+                        self._win.evaluate_js('window.__syncTheme && window.__syncTheme()')
+                        if (st or {}).get('status') == 'done':
+                            import json
+                            st_json = json.dumps(st, ensure_ascii=False)
+                            self._win.evaluate_js(f'window.__onSnipDone && window.__onSnipDone({st_json})')
+                except Exception as e:
+                    _log('Api.trigger_snip on_done: %r' % (e,))
+
+            if translate:
+                return snip_ocr.trigger_snip(on_done=on_done, do_ocr=True, do_translate=True)
+            if self._app and hasattr(self._app, '_win32_hide_main'):
+                self._app._safe_hide_main()
+                self._app._win32_hide_main()
+            elif _hw:
+                user32.ShowWindow(_hw, 0)  # SW_HIDE
+            ok = snip_ocr.trigger_snip(on_done=on_done, do_ocr=bool(ocr))
+            return ok
+        except Exception as e:
+            _log('Api.trigger_snip: %r' % (e,))
+            return False
+
     # ── 自绘标题栏（第 180 项）──────────────────────────────────────
     # 前端只负责画；窗口动作全在这里做。拖动必须交给系统（WM_NCLBUTTONDOWN），
     # 自己按像素 MoveWindow 会丢掉 Aero Snap、还会和 WebView2 的刷新打架。
@@ -1435,24 +2439,201 @@ class Api:
         except Exception:
             return False
 
+    def titlebar_resize_start(self, edge='top'):
+        """第 375 项：标题栏最上面那条（顶边 6px）是缩放热区，但它落在**客户区**里 ——
+        按下去先被 WebView2 的渲染窗接走（跨进程子窗，HTTRANSPARENT 无效），父窗的
+        命中测试轮不到，系统的缩放循环也起不来。之前试过在子窗里转发
+        WM_NCLBUTTONDOWN(HTTOP)，这层窗口栈（WinForms 宿主）会把它当成拖动。
+
+        所以自己来：起手记下光标和窗口矩形，拖动时按光标真值改 top/height，
+        和 titlebar_move（第 217/218 项）同一套思路 —— 不依赖 JS 的 screenY
+        （WebView2 里那个值拖动期间会冻结）。
+        """
+        try:
+            hwnd = self._tb_hwnd()
+            if not hwnd:
+                return None
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            h = ctypes.c_void_p(hwnd)
+            if u.IsZoomed(h):
+                return None                     # 最大化时顶边不是缩放区
+            pt = ctypes.wintypes.POINT()
+            if not u.GetCursorPos(ctypes.byref(pt)):
+                return None
+            r = ctypes.wintypes.RECT()
+            u.GetWindowRect(h, ctypes.byref(r))
+            dpi = u.GetDpiForWindow(h) or 96
+            self._rz_origin = {
+                'edge': edge or 'top',
+                'cx': int(pt.x), 'cy': int(pt.y),
+                'left': int(r.left), 'top': int(r.top),
+                'right': int(r.right), 'bottom': int(r.bottom),
+                'min_h': int(round(480 * dpi / 96.0)),
+            }
+            _log_always('resize_start(%s) cursor=(%d,%d) win=(%d,%d,%d,%d)' % (
+                edge, pt.x, pt.y, r.left, r.top, r.right, r.bottom))
+            return dict(self._rz_origin)
+        except Exception as e:
+            _log_always('titlebar_resize_start failed: %r' % (e,))
+            return None
+
+    def titlebar_resize_move(self):
+        """拖动中按帧调用：只改 top / height，左右不动（左右下本来就在真非客户区里）。"""
+        st = getattr(self, '_rz_origin', None)
+        if not st:
+            return False
+        try:
+            hwnd = self._tb_hwnd()
+            if not hwnd:
+                return False
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            h = ctypes.c_void_p(hwnd)
+            pt = ctypes.wintypes.POINT()
+            if not u.GetCursorPos(ctypes.byref(pt)):
+                return False
+            edge = st['edge']
+            new_top, new_bottom = st['top'], st['bottom']
+            if edge == 'top':
+                new_top = st['top'] + (int(pt.y) - st['cy'])
+            elif edge == 'bottom':
+                new_bottom = st['bottom'] + (int(pt.y) - st['cy'])
+            # 下限：高度不能小于 480 CSS px（和「记住尺寸」的阈值一致）
+            if new_bottom - new_top < st['min_h']:
+                if edge == 'top':
+                    new_top = new_bottom - st['min_h']
+                else:
+                    new_bottom = new_top + st['min_h']
+            # 上限：别把标题栏拖出工作区（拖上去就够不着了）
+            try:
+                work = _work_rect(hwnd)
+                if work is not None and new_top < work.top:
+                    new_top = work.top
+                    if new_bottom - new_top < st['min_h']:
+                        new_bottom = new_top + st['min_h']
+            except Exception:
+                pass
+            w = st['right'] - st['left']
+            hh = new_bottom - new_top
+            u.SetWindowPos(h, None, st['left'], new_top, w, hh,
+                           _SWP_NOZORDER | _SWP_NOACTIVATE)
+            return True
+        except Exception as e:
+            _log_always('titlebar_resize_move failed: %r' % (e,))
+            return False
+
+    def titlebar_resize_end(self):
+        self._rz_origin = None
+        try:
+            self._remember_size()
+        except Exception:
+            pass
+        return True
+
+    def titlebar_drag_start(self):
+        """第 217 项：拖动开始 —— 记住「光标 ↔ 窗口」的相对关系。
+
+        为什么不用 JS 的 e.screenX：WebView2 无边框窗口里 pointer 事件的
+        screenX/screenY 在拖动期间会冻结（dx 恒 0 → 永远不发帧，216 项
+        日志实锤：rect 每次都到、move 一帧不到）。改成 Python 侧
+        GetCursorPos 读系统真值，窗口跟着真光标走，JS 只报
+        「开始/拖动中/松手」三个事件。最大化时先还原（SetWindowPos 对
+        最大化窗口被忽略），并把窗口横向摆到光标下方（沿用 182 项手感）。"""
+        try:
+            hwnd = self._tb_hwnd()
+            if not hwnd:
+                return None
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            h = ctypes.c_void_p(hwnd)
+            pt = ctypes.wintypes.POINT()
+            if not u.GetCursorPos(ctypes.byref(pt)):
+                return None
+            if u.IsZoomed(h):
+                u.ShowWindow(h, _SW_RESTORE)
+                for _ in range(50):
+                    time.sleep(0.01)
+                    if not u.IsZoomed(h):
+                        break
+                r = ctypes.wintypes.RECT()
+                u.GetWindowRect(h, ctypes.byref(r))
+                w = int(r.right - r.left)
+                x = max(int(pt.x) - w // 2, 8)
+                wa = _monitor_work(u.MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST))
+                if wa:
+                    x = max(wa[0] + 8, min(x, wa[2] - w - 8))
+                u.SetWindowPos(h, None, x, int(r.top), 0, 0,
+                               _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
+            r = ctypes.wintypes.RECT()
+            u.GetWindowRect(h, ctypes.byref(r))
+            self._drag_origin = {'cx': int(pt.x), 'cy': int(pt.y),
+                                 'wx': int(r.left), 'wy': int(r.top)}
+            _log_always('drag_start cursor=(%d,%d) win=(%d,%d) %dx%d'
+                        % (pt.x, pt.y, r.left, r.top,
+                           r.right - r.left, r.bottom - r.top))
+            return dict(self._drag_origin)
+        except Exception as e:
+            _log_always('titlebar_drag_start failed: %r' % (e,))
+            return None
+
+    def titlebar_drag_move(self):
+        """第 217 项：拖动中（前端 16ms 一调）—— 按光标位移挪窗口。
+
+        坐标全部来自 GetCursorPos（OS 真值），前端只报「还在拖」，
+        彻底绕开 e.screenX 冻结 / DPI 单位换算这两类坑。"""
+        try:
+            drag = getattr(self, '_drag_origin', None)
+            if not drag:
+                return False
+            ctypes, u, _g, _p = _win_ptr_funcs()
+            pt = ctypes.wintypes.POINT()
+            if not u.GetCursorPos(ctypes.byref(pt)):
+                return False
+            dx = int(pt.x) - drag['cx']
+            dy = int(pt.y) - drag['cy']
+            if abs(dx) + abs(dy) < 2:
+                return True
+            ok = self.titlebar_move(drag['wx'] + dx, drag['wy'] + dy)
+            if not ok:
+                self._drag_origin = None   # 挪不动（窗口没了等）：结束本次拖动
+            return ok
+        except Exception as e:
+            _log_always('titlebar_drag_move failed: %r' % (e,))
+            return False
+
     def titlebar_cmd(self, cmd):
         """min / max / close。close 走 pywebview 的 destroy，让 closing 钩子照常跑。"""
         try:
             c = str(cmd or '')
+            hwnd = self._tb_hwnd()
+            if c in ('min', 'close') and getattr(self, '_app', None):
+                try:
+                    self._app._remember_size()
+                except Exception:
+                    pass
             if c == 'close':
                 if self._win is not None:
-                    self._win.destroy()
-                    return True
+                    try:
+                        self._win.destroy()
+                        return True
+                    except Exception as e:
+                        # 第 267 项：destroy 也是 @_shown_call 包着的，异常时别让
+                        # 「点关闭没反应」复现 —— 直接走 hide_main 收进托盘。
+                        _log_always('titlebar_cmd close: destroy 失败，改直接隐藏: %r' % (e,))
+                        app = getattr(self, '_app', None)
+                        if app is not None:
+                            app.hide_main()
+                        return True
                 return False
-            return window_cmd(find_hwnd(MAIN_TITLE), c)
+            _log_always('titlebar_cmd(%r) hwnd=%s' % (c, hwnd))
+            return window_cmd(hwnd, c)
         except Exception as e:
-            _log('titlebar_cmd(%r) failed: %r' % (cmd, e))
+            _log_always('titlebar_cmd(%r) failed: %r' % (cmd, e))
             return False
 
     def titlebar_state(self):
         """最大化状态 → 前端换 □ / ❐ 图标。"""
         try:
-            return {'max': window_maximized(find_hwnd(MAIN_TITLE))}
+            hwnd = self._tb_hwnd()
+            return {'max': window_maximized(hwnd)}
         except Exception:
             return {'max': False}
 
@@ -1465,20 +2646,34 @@ class Api:
         改成前端逐帧报坐标 + 这里 SetWindowPos，100% 可控、不依赖消息循环。
         """
         try:
-            hwnd = find_hwnd(MAIN_TITLE)
+            hwnd = self._tb_hwnd()
             if not hwnd:
+                _log_always('titlebar_rect: find_hwnd 落空（标题=%r）' % MAIN_TITLE)
                 return None
             ctypes, u, _g, _p = _win_ptr_funcs()
             r = ctypes.wintypes.RECT()
             if not u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
                 return None
-            return {'x': int(r.left), 'y': int(r.top),
-                    'max': bool(u.IsZoomed(ctypes.c_void_p(hwnd)))}
+            zoomed = bool(u.IsZoomed(ctypes.c_void_p(hwnd)))
+            # 每次拖动起手指调一次，落一行：rect 与 max 状态是排查「拖不动」的第一现场
+            _log_always('titlebar_rect -> (%d,%d) %dx%d max=%s'
+                        % (r.left, r.top, r.right - r.left, r.bottom - r.top, zoomed))
+            return {'x': int(r.left), 'y': int(r.top), 'max': zoomed}
         except Exception as e:
             # 用 _log_always：这类异常（名字写错、结构缺失）会被吞成「功能没反应」，
             # 只在调试日志里可见等于没有 —— 必须落到常规错误日志
             _log_always('titlebar_rect failed: %r' % (e,))
             return None
+
+    def titlebar_dbg(self, x0=None, y0=None, sx=None, sy=None):
+        """第 216 项拖动诊断：前端 onMove 首次越过 3px 阈值时把原始坐标过桥。
+
+        用途：日志里「titlebar_dbg 有而 titlebar_move 无」= rAF 被冻结
+        （WebView2 对判定为遮挡的窗口会停掉 requestAnimationFrame，换成
+        setTimeout 之前就是这症状）；「titlebar_dbg 也没有」= e.screenX
+        冻结（dx 恒 0，3px 阈值永远过不去）。一-log分明。"""
+        _log_always('titlebar_dbg start=(%s,%s) now=(%s,%s)' % (x0, y0, sx, sy))
+        return True
 
     def titlebar_restore(self, mouse_x=None):
         """拖动开始时如果在最大化状态：先还原，再把窗口摆到鼠标下方（第 182 项）。
@@ -1488,14 +2683,22 @@ class Api:
         还原后按鼠标在标题栏的水平位置反推窗口左上角，人手感接近原生。
         """
         try:
-            hwnd = find_hwnd(MAIN_TITLE)
+            hwnd = self._tb_hwnd()
+            _log_always('titlebar_restore called mouse_x=%s hwnd=%s' % (mouse_x, hwnd))
             if not hwnd:
                 return None
             ctypes, u, _g, _p = _win_ptr_funcs()
             h = ctypes.c_void_p(hwnd)
             if u.IsZoomed(h):
                 u.ShowWindow(h, _SW_RESTORE)
-                time.sleep(0.02)
+                # 第 216 项：还原是异步的 —— 固定 sleep 20ms 后读到的经常还是
+                # 最大化矩形，拿它算 w/x 全错，拖动目标就飞了。轮询到真还原。
+                for _ in range(30):
+                    time.sleep(0.01)
+                    if not u.IsZoomed(h):
+                        break
+                _log_always('titlebar_restore: 还原 %s'
+                            % ('完成' if not u.IsZoomed(h) else '超时'))
             r = ctypes.wintypes.RECT()
             if not u.GetWindowRect(h, ctypes.byref(r)):
                 return None
@@ -1511,10 +2714,33 @@ class Api:
                 x = max(wa[0] + 8, min(x, wa[2] - w - 8))
             u.SetWindowPos(h, None, x, int(r.top), 0, 0,
                            _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
+            _log_always('titlebar_restore -> (%d,%d) w=%d mouse_x=%s'
+                        % (x, int(r.top), w, mouse_x))
             return {'x': x, 'y': int(r.top)}
         except Exception as e:
             _log_always('titlebar_restore failed: %r' % (e,))
             return None
+
+    def _tb_hwnd(self):
+        """拖动链路的主窗句柄：优先用 rect 探明并缓存的那一个（第 216 项）。
+
+        为什么不再每次 find_hwnd(MAIN_TITLE)：进程里可能短暂存在第二个
+        同名 'Memex' 窗口（托盘/WebView2 辅助窗），EnumWindows 按 Z 序返回
+        hits[0] —— 撞上谁就用谁，拖动就时好时坏。rect 每次拖动起手指都会
+        先探一次主窗（rect 日志证明拿到的就是真窗），把它缓存下来给
+        move/restore 复用；句柄失效（IsWindow=0）才重新找。
+        """
+        cached = getattr(self, '_tb_hwnd_cached', 0)
+        try:
+            u, _wt = _win()
+            if cached and u and u.IsWindow(ctypes.c_void_p(cached)):
+                return cached
+        except Exception:
+            pass
+        hwnd = find_hwnd(MAIN_TITLE)
+        if hwnd:
+            self._tb_hwnd_cached = hwnd
+        return hwnd
 
     def titlebar_move(self, x, y):
         """把窗口挪到屏幕坐标 (x, y)，尺寸不变（第 182 项）。
@@ -1523,17 +2749,34 @@ class Api:
         只 SetWindowPos，不重新布局、不动焦点、不触发 WebView2 刷新。
         """
         try:
-            hwnd = find_hwnd(MAIN_TITLE)
+            hwnd = self._tb_hwnd()
             if not hwnd:
+                _log_always('titlebar_move(%s,%s): find_hwnd 落空' % (x, y))
                 return False
             ctypes, u, _g, _p = _win_ptr_funcs()
-            u.SetWindowPos(ctypes.c_void_p(hwnd), None, int(x), int(y), 0, 0,
-                           _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE)
-            # 只记第一次：这一行能区分「前端没调到」和「调到了但窗口不动」
-            if not getattr(self, '_tb_move_logged', False):
+            h = ctypes.c_void_p(hwnd)
+            # 第 216 项：最大化窗口的 SetWindowPos 会被系统静默忽略（返回 True 但不动）
+            # —— 182 项文档写明的坑。JS 侧的 restore 是异步的，可能没赶上第一帧；
+            # 这里每帧自愈：发现还处于最大化就先还原（轮询到真还原），再挪。
+            zoomed = bool(u.IsZoomed(h))
+            if zoomed:
+                u.ShowWindow(h, _SW_RESTORE)
+                for _ in range(50):
+                    time.sleep(0.01)
+                    if not u.IsZoomed(h):
+                        break
+                _log_always('titlebar_move: 拖动时最大化 → 已还原 (%s)'
+                            % ('完成' if not u.IsZoomed(h) else '超时'))
+            ok = bool(u.SetWindowPos(h, None, int(x), int(y), 0, 0,
+                                     _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE))
+            # 第 216 项排查期曾每帧都记；拖动已确认修好（218 项），改回
+            # 「首次成功记一条 + 失败必记」，日志量回落。
+            if ok and not getattr(self, '_tb_move_logged', False):
                 self._tb_move_logged = True
                 _log_always('titlebar_move 首次调用 → %s,%s' % (x, y))
-            return True
+            if not ok:
+                _log_always('titlebar_move(%s,%s) SetWindowPos FAILED' % (x, y))
+            return ok
         except Exception as e:
             _log_always('titlebar_move(%s,%s) failed: %r' % (x, y, e))
             return False
@@ -1544,9 +2787,10 @@ class Api:
         摘掉 WS_CAPTION 后系统不再提供 Aero Snap，而拖动改成了自己 SetWindowPos，
         所以这两条得自己补。只在「贴着边缘松手」时动手，平时什么都不做。
         容差 6px：太小了用户拖不准，太大了窗口从边缘弹开很突兀。
+        第 289 项：只认「正好贴住」的容差带 —— 拖出屏幕（想临时藏一部分）不吸附。
         """
         try:
-            hwnd = find_hwnd(MAIN_TITLE)
+            hwnd = self._tb_hwnd()
             if not hwnd:
                 return False
             ctypes, u, _g, _p = _win_ptr_funcs()
@@ -1559,15 +2803,17 @@ class Api:
             if not wa:
                 return False
             wl, wt_, wr, wb = wa
-            tol = 6
+            # 第 289 项：只认「正好贴住边缘」的容差带；拖出屏幕不再吸回半屏
+            zone = snap_zone((int(r.left), int(r.top), int(r.right), int(r.bottom)),
+                             (wl, wt_, wr, wb), tol=6)
             sw = _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_SHOWWINDOW
-            if int(r.top) <= wt_ + tol:
+            if zone == 'max':
                 u.ShowWindow(h, _SW_MAXIMIZE)
                 return True
-            if int(r.left) <= wl + tol:
+            if zone == 'left':
                 u.SetWindowPos(h, None, wl, wt_, (wr - wl) // 2, wb - wt_, sw)
                 return True
-            if int(r.right) >= wr - tol:
+            if zone == 'right':
                 half = (wr - wl) // 2
                 u.SetWindowPos(h, None, wl + half, wt_, half, wb - wt_, sw)
                 return True
@@ -1608,28 +2854,129 @@ class Api:
                     had = bool(_g(ctypes.c_void_p(hwnd), -16) & _WS_CAPTION)
                 except Exception:
                     had = False
-                if not caption_off(hwnd, True):
-                    self.custom_titlebar = False
-                    _log('custom titlebar: 守卫发现样式被写回且摘不回来，退回系统标题栏')
-                    try:
-                        import brain as _b
-                        _b.TITLEBAR_ACTIVE = False
-                    except Exception:
-                        pass
-                    return
-                if had or not prev_had_caption:
-                    # 写回刚发生 / 第一轮：外框底色与 caption 带要重新压一遍
+                if had:
+                    if not caption_off(hwnd, True):
+                        self.custom_titlebar = False
+                        _log_always('custom titlebar: 守卫发现样式被写回且摘不回来，退回系统标题栏')
+                        try:
+                            import brain as _b
+                            _b.TITLEBAR_ACTIVE = False
+                        except Exception:
+                            pass
+                        return
                     paint_frame(hwnd)
                 prev_had_caption = had
             except Exception as e:
                 _log('titlebar guard: %r' % (e,))
                 return
 
+    # ── 原生文件对话框（第 241 项）────────────────────────────────
+    # pywebview 的 JS API 是**另起线程**执行的（webview/util.py: `Thread(target=_call)`），
+    # 而 winforms 后端的 create_file_dialog 是**唯一没有 Invoke 回 UI 线程**的窗口操作
+    # （set_title / hide / show / destroy_window / create_confirmation_dialog 全都有
+    # `if self.InvokeRequired: self.Invoke(...)`）。
+    # 于是原生对话框跑在 MTA 后台线程上，owner 却是 UI 线程的主窗 ——
+    # 模态对话框会跨线程 disable/enable 这个 WebView2 宿主，控制器把渲染层藏起来，
+    # 用户看到的就是「点上传文件夹 → 主窗白屏」。概率性 = 取决于线程时序。
+    #
+    # 修法：自己把对话框 Invoke 回 UI 线程再弹，并返回后自愈渲染层。
+    def _ui_dialog(self, dialog_type):
+        """在 WinForms UI 线程上弹原生对话框，返回路径列表（取消/失败 = []）。
+
+        不直接调 `self._win.create_file_dialog`：那个入口带着 @_shown_call，
+        内部会等 events.shown（主窗 hidden 时永不置位 → 卡满 20 秒），
+        而且最终还是落到没有 Invoke 的那个后端函数上。
+        """
+        win = self._win
+        if win is None:
+            return []
+        try:
+            uid = win.uid
+        except Exception:
+            return []
+        try:
+            from webview.platforms import winforms as _wf
+        except Exception:
+            return []
+        form = None
+        try:
+            form = _wf.BrowserView.instances.get(uid)
+        except Exception:
+            form = None
+        if form is None:
+            return []
+
+        out = []
+
+        def _run():
+            try:
+                picked = _wf.create_file_dialog(dialog_type, '', False, '', (), uid)
+                if picked:
+                    out.extend(list(picked))
+            except Exception as e:
+                _log_always('原生对话框失败: %r' % (e,))
+
+        try:
+            from System import Func, Type
+        except Exception:
+            Func = Type = None
+        try:
+            if Func is not None and hasattr(form, 'InvokeRequired'):
+                if form.InvokeRequired:
+                    # Invoke 是同步的：UI 线程弹完（用户选完/取消）才返回，
+                    # 这里等的就是这个结果，不会丢。
+                    form.Invoke(Func[Type](_run))
+                else:
+                    _run()
+            else:
+                _run()
+        except Exception as e:
+            _log_always('原生对话框调度失败: %r' % (e,))
+            return []
+        return out
+
+    def _after_native_dialog(self):
+        """原生对话框关掉后：主窗可能被跨线程 disable 过，检查渲染层并自愈。
+
+        这是白屏的**兜底**：即使前面的调度仍有遗漏，只要渲染子窗被藏了就唤醒它，
+        顺便把 WebView2 控件自身的 Visible 设回 true（第 109/111 项的根因修法）。
+        """
+        try:
+            hwnd = self._win32_hwnd_main()
+            if not hwnd:
+                return
+            if _render_children_visible(hwnd):
+                return
+            _log_always('原生对话框后检测到渲染层被藏，执行自愈')
+            revive_webview(hwnd)
+            try:
+                app = self._app
+                if app is not None and hasattr(app, '_force_webview_visible'):
+                    app._force_webview_visible()
+            except Exception:
+                pass
+        except Exception as e:
+            _log('after_native_dialog: %r' % (e,))
+
+    def _win32_hwnd_main(self):
+        """主窗 HWND（优先缓存，兜底按标题找）。"""
+        try:
+            h = self.hwnd_main
+            if h:
+                return h
+        except Exception:
+            pass
+        try:
+            return find_hwnd(MAIN_TITLE)
+        except Exception:
+            return None
+
     def pick_folder(self):
         if webview is None or self._win is None:
             return ''
         try:
-            picked = self._win.create_file_dialog(webview.FOLDER_DIALOG)
+            picked = self._ui_dialog(_dialog_kind('FOLDER'))
+            self._after_native_dialog()
             if picked:
                 return picked[0]
         except Exception:
@@ -1641,7 +2988,8 @@ class Api:
         if webview is None or self._win is None:
             return ''
         try:
-            picked = self._win.create_file_dialog(webview.OPEN_DIALOG)
+            picked = self._ui_dialog(_dialog_kind('OPEN'))
+            self._after_native_dialog()
             if picked:
                 return picked[0]
         except Exception:
@@ -1657,7 +3005,7 @@ class Api:
         if not p or not brain.ev_recent(p):
             return False
         try:
-            os.startfile(p)
+            app_entries.launch(p)
         except Exception:
             return False
         try:
@@ -1698,13 +3046,25 @@ class Api:
         """在资源管理器里选中这个文件（主窗口 Ctrl+Enter）。
 
         footer 一直写着「Ctrl+Enter 定位」，但主窗口以前根本没接这个动作——
-        按下去走的是 open_path（直接打开）。补上原生桥。"""
+        按下去走的是 open_path（直接打开）。补上原生桥。
+
+        第 319 项：**不再要求 ev_recent 白名单**。定位只是「在资源管理器里选中」，
+        不执行任何东西，安全面上跟 open_path（会跑 .exe）不是一个量级；
+        而白名单 5 分钟就过期、还会被下一次搜索整体替换，用户右键「定位」
+        得到的却是「浏览器里没有『定位』」这句完全指错方向的话（11-19 实测截图）。
+        现在只要路径真的存在就放行。"""
         p = str(p or '')
-        if not p or not brain.ev_recent(p):
+        if not p:
+            return False
+        try:
+            np = os.path.normpath(p)
+        except Exception:
+            return False
+        if not (os.path.exists(np) or brain.ev_recent(p)):
             return False
         try:
             import subprocess
-            subprocess.Popen(['explorer', '/select,', os.path.normpath(p)])
+            subprocess.Popen(['explorer', '/select,', np])
             return True
         except Exception:
             return False
@@ -1746,7 +3106,7 @@ class MiniApi:
         ok = False
         if p and brain.ev_recent(p):
             try:
-                os.startfile(p)
+                app_entries.launch(p)
                 ok = True
             except Exception:
                 ok = False
@@ -1797,6 +3157,114 @@ class MiniApi:
         self._app.show_main(q)
         return True
 
+    # ── 原生文件对话框（第 241 项）────────────────────────────────
+    # 快搜窗的设置页有「➕ 手动添加文件夹」，页面里调的是 `api.pick_folder()`。
+    # 以前 MiniApi **没有**这个方法 → JS 侧 `api.pick_folder` 是 undefined，
+    # 一调就 TypeError，只能退回 prompt() 手输路径；桌面版明明能弹原生选择框。
+    # 这里转给主窗的 Api（同一套 UI 线程调度 + 渲染层自愈）。
+    def pick_folder(self):
+        try:
+            api = getattr(self._app, 'main_api', None)
+            if api is not None and hasattr(api, 'pick_folder'):
+                return api.pick_folder()
+        except Exception as e:
+            _log('MiniApi.pick_folder: %r' % (e,))
+        return ''
+
+    def pick_file(self):
+        try:
+            api = getattr(self._app, 'main_api', None)
+            if api is not None and hasattr(api, 'pick_file'):
+                return api.pick_file()
+        except Exception as e:
+            _log('MiniApi.pick_file: %r' % (e,))
+        return ''
+
+    def read_clipboard_image(self):
+        """快搜窗读取剪贴板图像。"""
+        try:
+            import snip_ocr
+            return snip_ocr.read_clipboard_image()
+        except Exception as e:
+            return {'has_image': False, 'error': str(e)}
+
+    def ocr_image(self, b64_or_data_url=None):
+        """快搜窗对传入图像执行离线 OCR 识别。"""
+        try:
+            import snip_ocr
+            return snip_ocr.ocr_base64_image(b64_or_data_url)
+        except Exception as e:
+            return {'ok': False, 'text': '', 'error': str(e)}
+
+    def get_clipboard_history(self, kind='all', q='', limit=60, offset=0):
+        try:
+            import clipboard_mgr
+            return {'ok': True, 'items': clipboard_mgr.list_history(kind=kind, q=q, limit=limit, offset=offset)}
+        except Exception as e:
+            return {'ok': False, 'items': [], 'error': str(e)}
+
+    def copy_clipboard_item(self, item_id):
+        try:
+            import clipboard_mgr
+            ok, msg = clipboard_mgr.copy_item(int(item_id))
+            return {'ok': ok, 'msg': msg}
+        except Exception as e:
+            return {'ok': False, 'msg': str(e)}
+
+    def delete_clipboard_item(self, item_id):
+        try:
+            import clipboard_mgr
+            return {'ok': clipboard_mgr.delete_item(int(item_id))}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def clear_clipboard_history(self):
+        try:
+            import clipboard_mgr
+            return {'ok': clipboard_mgr.clear_history()}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def translate_text(self, text, src_lang='auto', tgt_lang='auto'):
+        try:
+            import translator
+            return translator.translate_text(text, src_lang=src_lang, tgt_lang=tgt_lang)
+        except Exception as e:
+            return {'ok': False, 'msg': str(e), 'results': []}
+
+    def trigger_snip(self, ocr=False, translate=False):
+        """快搜窗触发屏幕截图。ocr=False: 纯截图拷入剪贴板; ocr=True: 截图并 OCR 提取;
+        translate=True: 截图 → OCR → 翻译，译文贴在选区原位（快搜窗让位，不再抢焦点）。"""
+        try:
+            import snip_ocr
+            was_mini = bool(getattr(self._app, 'mini_visible', False))
+
+            def on_done(st):
+                # 翻译模式：卡片是置顶原生窗口，把快搜窗 show 回来会激活它 → 卡片立刻关，
+                # 所以这条路径不还原快搜窗（用户复制完按热键再叫出来即可）。
+                if translate:
+                    return
+                if was_mini:
+                    try:
+                        self._app._from_snip = True
+                        self._app.show_mini()
+                        wnd = getattr(self._app, 'mini', None)
+                        if wnd and (st or {}).get('status') == 'done':
+                            import json
+                            st_json = json.dumps(st, ensure_ascii=False)
+                            wnd.evaluate_js(f'window.__onSnipDone && window.__onSnipDone({st_json})')
+                    except Exception as e:
+                        _log('MiniApi.trigger_snip on_done: %r' % (e,))
+
+            if was_mini:
+                self._app.hide_mini()
+            ok = snip_ocr.trigger_snip(on_done=on_done, do_ocr=bool(ocr),
+                                      do_translate=bool(translate))
+            return ok
+        except Exception as e:
+            _log('MiniApi.trigger_snip: %r' % (e,))
+            return False
+
 
 # ------------------------------------------------------------------ 命名事件（跨进程激活第一个实例）
 def _kernel32_event():
@@ -1840,9 +3308,37 @@ class App:
         self.tray = None
         self.mini_visible = False
         self.hotkey = None
+        self.floating_ball_mgr = None
         self._hide_hint_given = False
         self._want_main = False      # 用户主动要求显示主窗（silent 守卫据此让路）
         self._lock = threading.Lock()
+        # 第 267 项：托盘面板「点了没反应 / 关了又弹出来」的两把锁
+        # ① _show_lock：同一时刻只允许一次 show_main 在飞（后台线程各自跑会互相顶窗口）
+        # ② _hide_seq：用户每关一次主窗就 +1，在飞的 show_main 发现序号变了就放弃，
+        #    不再「20 秒后醒来」把窗口重新弹出来。
+        self._show_lock = threading.Lock()
+        self._hide_seq = 0
+        self._panel_lock = threading.Lock()
+        self._panel_req = None
+        self._panel_worker_on = False
+        # 第 197 项：自动弹出 / 文件夹里直接打字
+        self.typewatch = None
+        self.clickwatch = None          # 第 307 项：鼠标钩子（点文件夹让对话框跟过去）
+        self._alive = True
+        self._auto_ok = True
+        self._type_ok = True
+        self._auto_last = 0
+        self._auto_dlg = 0
+        self._auto_muted = {}
+        # 第 198 项：贴角模式。记录锚点（右/下边、宽度、dpr），
+        # 每次长高都按它重算 y —— 底边钉住、往上长，不会顶出窗口。
+        self._dock = None
+        # 第 229 项二轮：钩子线程 / 0.15s 轮询 / 拖动追逐线程三处都会调
+        # _follow_anchor，不加锁就是「旧位置后写覆盖新位置」的乱序抖动。
+        self._follow_lock = threading.Lock()
+        self._rescale_lock = threading.Lock()
+        self._rescale_ts = 0.0
+        self._drag_move = False
 
     # -- 窗口 ---------------------------------------------------------
     def create(self):
@@ -1856,10 +3352,14 @@ class App:
             MINI_TITLE, f'{self.url}/mini',
             width=MINI_W, height=MINI_H, x=x, y=y,
             frameless=True, on_top=True, resizable=False, easy_drag=False,
-            hidden=True, background_color='#FFFFFF', js_api=self.mini_api,
-            text_select=False, focus=True, min_size=(MINI_W, 96),
+            # 第 359 项：frameless + 扩边框 + 子窗口让路之后，窗口最外圈有几像素
+            # 不归网页画、只认 WinForms BackColor。以前写死 '#FFFFFF'，换成深色
+            # 配色后右边就挂一条白边；这里至少让启动时和主题一致（运行期见 set_dark）。
+            hidden=True, background_color=ui_bg_hex(), js_api=self.mini_api,
+            text_select=False, focus=True, min_size=(MINI_W_MIN, 88),
         )
         self.main_api = Api()
+        self.main_api._app = self      # 原生对话框后要调 App._force_webview_visible 自愈（第 241 项）
         self.main_api._open_mini = lambda: self.show_mini()
         self.main_api._hide_main = self.hide_main
         sw, sh = screen_logical_size()
@@ -1909,9 +3409,16 @@ class App:
         )
         self.main_api._win = self.main
         self.main.events.closing += self._on_main_closing
+        self.main.events.resized += self._on_main_resized
 
     def _late_dark_caption(self, tries=6):
-        """窗口刚建好时 DWM 还不接受属性；等一会儿再刷，并随每次显示重刷。"""
+        """窗口刚建好时 DWM 还不接受属性；等一会儿再刷，并随每次显示重刷。
+
+        第 343 项：顺手确认「非客户区归零」到底成没成 —— WinForms 在窗体第一次真正
+        Show / 重建句柄时会把窗口过程装回去，建窗时挂的那份就被顶掉了（实测内缩还是 10px）。
+        这里用 `frame_insets() > 0` 判断、必要时 force 重挂，最多试 tries 次。
+        """
+        settled = False
         for _ in range(tries):
             time.sleep(0.6)
             try:
@@ -1920,21 +3427,86 @@ class App:
                 if hw:
                     # 深色开关会重置 caption 色 → 顶部白带回来（第 184 项），必须补刷
                     paint_frame(hw)
-                if ok:
-                    _log('dark caption applied (%s)' % effective_dark())
-                    return
+                    try:
+                        if frame_insets(hw) > 0:
+                            install_nc_guard(hw, force=True)
+                            _log('nc retry: insets now %s' % frame_insets(hw))
+                    except Exception as e:
+                        _log('nc retry failed: %r' % (e,))
+                    try:
+                        install_child_hit_guard(hw)
+                    except Exception:
+                        pass
+                if ok and hw and frame_insets(hw) == 0 and not settled:
+                    settled = True
+                    _log('dark caption + nc guard settled (%s)' % effective_dark())
             except Exception as e:
                 _log('dark caption retry failed: %r' % (e,))
-        _log('dark caption gave up')
+        if not settled:
+            _log('dark caption gave up')
 
     def _remember_size(self):
         """把用户拖出来的窗口大小记住，下次按这个开（不会因为换分辨率炸掉）。"""
         try:
-            import brain as _b
-            w, h = self.main.width, self.main.height
+            hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
+            u, wt = _win()
+            if hwnd and u:
+                try:
+                    if u.IsZoomed(ctypes.c_void_p(hwnd)) or u.IsIconic(ctypes.c_void_p(hwnd)):
+                        _log('remember_size: 窗口最大化/最小化中，不覆盖保存普通尺寸')
+                        return
+                except Exception:
+                    pass
+            w, h = 0, 0
+            if hwnd and u and wt:
+                try:
+                    rc = wt.RECT()
+                    if u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rc)):
+                        # ⚠️ 这里存的必须是**逻辑（CSS）像素**：建窗时 `main_window_size`
+                        # 拿它和逻辑屏尺寸比。历史上 `window_dpr(hwnd)` 在这条路径上
+                        # 会返回 1.0（本机 150% 屏实测），于是把物理 1717×1456 原样写进
+                        # settings，下次启动当成 CSS 又乘 1.5 → 窗口一次比一次大
+                        # （第 96/97 次实测落在 2576×2184）。改用 screen_metrics 的 dpr
+                        # （它就是居中用的那个，日志里稳定 1.50），再拿 window_dpr 兜底。
+                        dpr = 0
+                        try:
+                            dpr = float(screen_metrics()[2] or 0)
+                        except Exception:
+                            dpr = 0
+                        if dpr <= 0:
+                            dpr = window_dpr(hwnd) or 1.0
+                        w = int(round((rc.right - rc.left) / dpr))
+                        h = int(round((rc.bottom - rc.top) / dpr))
+                        _log('remember_size: 物理 %sx%s / dpr %.2f → 存 %sx%s' % (
+                            rc.right - rc.left, rc.bottom - rc.top, dpr, w, h))
+                except Exception:
+                    pass
+            if not (w and h) and self.main:
+                try:
+                    w, h = int(self.main.width), int(self.main.height)
+                except Exception:
+                    pass
             if 700 <= int(w) <= 4000 and 480 <= int(h) <= 3000:
+                self._main_w, self._main_h = int(w), int(h)
+                import brain as _b
                 _b._settings_mark('win_w', int(w))
                 _b._settings_mark('win_h', int(h))
+                _log_always('remember_size: 记住用户窗口尺寸 %dx%d' % (int(w), int(h)))
+        except Exception as e:
+            _log('remember_size FAILED: %r' % (e,))
+
+    def _on_main_resized(self, *args, **kwargs):
+        """用户拖拽边框调整大小时：防抖 250ms 自动落盘记住尺寸，绝不漏掉。"""
+        try:
+            t = getattr(self, '_resize_timer', None)
+            if t is not None:
+                t.cancel()
+        except Exception:
+            pass
+        try:
+            self._resize_timer = threading.Timer(0.25, self._remember_size)
+            self._resize_timer.daemon = True
+            self._resize_timer.start()
         except Exception:
             pass
 
@@ -1946,6 +3518,8 @@ class App:
         让 FormClosing 先走完 cancel 流程。"""
         _log(f'_on_main_closing tray={self.tray} ok={getattr(self.tray,"ok",None)}')
         self._remember_size()
+        # 第 267 项：用户自己点了关闭 —— 立刻作废所有在飞/排队的 show_main。
+        _bump_hide(self)
         if self.tray is not None and self.tray.ok:
             threading.Timer(0.05, self._safe_hide_main).start()
             self._hint_once()
@@ -1981,6 +3555,7 @@ class App:
     def _win32_hide_main(self):
         """Win32 直接 SW_HIDE：跨线程必生效，渲染层会级联藏起来（第 109/121 项验证过）。"""
         try:
+            _bump_hide(self)
             hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
             if hwnd:
                 ctypes.windll.user32.ShowWindow(ctypes.c_void_p(hwnd), 0)
@@ -2007,9 +3582,13 @@ class App:
 
     def _safe_hide_main(self):
         """在 closing 事件之外 hide 主窗口，避开 WinForms FormClosing 的时序陷阱。"""
+        # 第 267 项：同 hide_main —— 关窗要作废在飞的 show_main，否则会被顶回来。
+        _bump_hide(self)
         try:
-            self.main.hide()
-            _log_always('_safe_hide_main ok')   # exe 模式 _log 不落盘——hide 是否执行是白屏排查的第一线索
+            if pv_hide(self.main):
+                _log_always('_safe_hide_main ok')   # exe 模式 _log 不落盘——hide 是否执行是白屏排查的第一线索
+            else:
+                _log_always('_safe_hide_main: pv_hide 返回 False')
         except Exception as e:
             _log(f'_safe_hide_main FAILED: {e}')
 
@@ -2027,7 +3606,7 @@ class App:
             win32gui.Shell_NotifyIcon(
                 win32gui.NIM_MODIFY,
                 (self.tray._hwnd, 0, win32gui.NIF_INFO, 0, None, '',
-                 '第二大脑', '已收进托盘：双击 Ctrl 唤出快搜，托盘图标打开详细搜索',
+                 'Memex', '已收进托盘：双击 Ctrl 唤出快搜，托盘图标打开详细搜索',
                  win32con.NIIF_INFO, 6000))
         except Exception:
             pass
@@ -2083,9 +3662,42 @@ class App:
         except Exception:
             pass
 
+    def _tray_tip_loop(self):
+        """第 224 项：扫描/索引时把托盘悬停提示换成实时进度，结束恢复。
+
+        每 2s 读一次 brain.PROG（state/phase/done/total —— 索引管线现成的
+        进度状态），只在文本变化时才打 NIM_MODIFY。扫描让位给主流程：
+        循环里任何异常都吞掉，线程永不干扰主程序。"""
+        last = None
+        names = {'discover': '扫描文件', 'names': '扫描文件名', 'index': '建正文索引'}
+        while self._alive:
+            try:
+                import brain as _b
+                pr = getattr(_b, 'PROG', None) or {}
+                if pr.get('state') == 'busy':
+                    name = names.get(pr.get('phase') or '', '索引更新中')
+                    done, total = pr.get('done', 0), pr.get('total', 0)
+                    tip = ('Memex（%s %s/%s）' % (name, done, total)) if total else ('Memex（%s…）' % name)
+                else:
+                    tip = 'Memex（双击 Ctrl 唤出快搜）'
+                if tip != last and self.tray is not None:
+                    self.tray.set_tip(tip)
+                    last = tip
+            except Exception:
+                pass
+            time.sleep(2)
+
     def after_start(self):
         self.hwnd_mini = wait_hwnd(MINI_TITLE)
         self.hwnd_main = wait_hwnd(MAIN_TITLE)
+        # 第 277 项：走到这里说明 WebView2 窗口真的起来了。运行标记推进到 ready，
+        # 下次启动若发现停在 boot/ui，报告里就能看出「死在启动的哪一步」。
+        try:
+            error_report.mark_stage('ready')
+            import breadcrumb
+            breadcrumb.add('app', ev='ready')
+        except Exception:
+            pass
         # 环境快照：用户报「窗口不对/看不到」时，这一行就是现场数据。
         try:
             _log_always('[env] %s silent=%s target=%dx%d'
@@ -2094,6 +3706,17 @@ class App:
         except Exception:
             pass
         threading.Thread(target=self._watch_loaded_or_fallback, daemon=True).start()
+        # 第 224 项：托盘悬停提示跟随索引进度（扫描/建索引时显示 N/M，结束恢复）
+        threading.Thread(target=self._tray_tip_loop, daemon=True).start()
+        # 屏幕截图与 RapidOCR 离线模型后台预热（消除首次使用时的 2~3 秒动态加载延迟）
+        def _bg_prewarm_snip():
+            time.sleep(2.0)
+            try:
+                import snip_ocr
+                snip_ocr.prewarm()
+            except Exception as e:
+                _log('snip prewarm error: %r' % (e,))
+        threading.Thread(target=_bg_prewarm_snip, daemon=True, name='snip-prewarm').start()
         # silent 模式主窗口按非 hidden 创建（见 create 里的说明），等 Form.Shown
         # 真正置位、events.shown 可用之后再收起来。用事件而不是固定 sleep：
         # 窗口只露出一瞬间，开机自启不会闪一大下。
@@ -2117,11 +3740,15 @@ class App:
             self.custom_titlebar = caption_off(self.hwnd_main, True)
             if self.custom_titlebar:
                 round_corners(self.hwnd_main)
+                # 第 343 项：把 10px 非客户区整块吃掉 —— 客户区占满整窗后，
+                # 顶部那条 caption 带**根本不存在**，不用再靠定时刷颜色去压。
+                install_nc_guard(self.hwnd_main)
                 paint_frame(self.hwnd_main)
+                frame_invisible(self.hwnd_main)
                 _log('custom titlebar: WS_CAPTION stripped')
             else:
                 _log('custom titlebar: 摘除失败，退回系统标题栏')
-        self._fit_main_size()
+        self._fit_main_size(initial=True)   # 只有启动这一趟允许校正 DPI 换算
         # ⚠️ 必须在 _fit_main_size **之后**再确认一次样式位。
         # 实测（第 181 项）：日志已经打过 stripped，可 fit 里一旦真的 resize，
         # WinForms 会按 FormBorderStyle 把 WS_CAPTION 原样写回来 ——
@@ -2149,6 +3776,22 @@ class App:
         self._dbg_autohelp()
         round_corners(self.hwnd_mini)
         soft_shadow(self.hwnd_mini)
+        # 第 363 项：快搜窗那圈边框不要玻璃（玻璃=透出背后的窗口=白边）
+        matte_frame(self.hwnd_mini, _LAST_THEME.get('bg') or ui_bg_rgb())
+        # 第 343 项：快搜窗同样把非客户区归零，顶部才不会有 caption 带
+        install_nc_guard(self.hwnd_mini)
+        frame_invisible(self.hwnd_mini)
+        # 第 359 项：mini 的窗口底色（那圈白边）也要跟着当前主题走
+        _bg_fix = _LAST_THEME.get('bg') or ui_bg_rgb()
+        set_window_background(self.mini, _bg_fix)
+        set_window_background(self.main, _bg_fix)
+        # 子窗口（WebView2）要把边缘几像素让出来，否则边缘拖不动
+        install_child_hit_guard(self.hwnd_main)
+        install_child_hit_guard(self.hwnd_mini)
+        # 第 342/343 项：顶边已经归零 → 那条 caption 带**不存在**；
+        # 左右下的边框色改由 `_nc_wndproc` 在 WM_ACTIVATE / WM_SIZE / WM_DPICHANGED /
+        # WM_THEMECHANGED 时按事件补刷（apply_frame 幂等）。
+        # 所以这里**不再起那个每 3 秒轮询的守护线程** —— 用户明确不要多出来的后台开销。
         # 两扇窗都换图标（标题栏 / Alt-Tab / 任务栏读的是同一个 WM_SETICON）
         apply_window_icon(self.hwnd_main)
         try:
@@ -2159,8 +3802,13 @@ class App:
         if self.start_mini:
             self.show_mini()
         self.hotkey = self._install_hotkey()
+        try:
+            self._sync_floating_ball()
+        except Exception:
+            pass
         self.start_tray()
         self._start_activate_listener()
+        self._start_auto_watch()
 
     def _start_activate_listener(self):
         """让第一个实例监听一个命名事件：第二个实例启动时只 SetEvent，
@@ -2203,7 +3851,7 @@ class App:
         self._act_thread = t
         _log('activate listener: 命名事件 SecondBrain_Activate_v1 已监听')
 
-    def _force_webview_visible(self):
+    def _force_webview_visible(self, target='all'):
         """把 WebView2 控件自身的 Visible 设回 true（根因修复）。
 
         silent 启动隐藏主窗口时，WebView2 控制器的 IsVisible 被设成 false，渲染层
@@ -2211,18 +3859,36 @@ class App:
         合成时重新藏回，所以必须直接动控件。pywebview 的 Window.native 是
         BrowserForm，其 .webview 就是 .NET 的 WebView2 控件。属性名跨版本可能变，
         整段包在 try 里，失败就退回 revive_webview 的治标逻辑。"""
-        try:
-            impl = getattr(self.main, 'native', None)
-            if impl is None:
-                return
-            ctrl = getattr(impl, 'webview', None)
-            if ctrl is None:
-                return
-            ctrl.Visible = True
-        except Exception as e:
-            _log('force webview visible FAILED: %r' % (e,))
+        targets = []
+        if target in ('all', 'main') and getattr(self, 'main', None):
+            targets.append(('main', self.main))
+        if target in ('all', 'mini') and getattr(self, 'mini', None):
+            targets.append(('mini', self.mini))
+        for tag, win in targets:
+            try:
+                impl = getattr(win, 'native', None)
+                if impl is None:
+                    continue
+                ctrl = getattr(impl, 'webview', None)
+                if ctrl is None:
+                    continue
+                _ui_set_visible(ctrl, tag)
+            except Exception as e:
+                _log('force webview visible (%s) FAILED: %r' % (tag, e))
 
-    def _fit_main_size(self):
+    def _late_revive_mini_loop(self, timeout=3.0, interval=0.15):
+        """快搜窗 show 后的短轮询自愈：确保 WebView2 渲染层子窗全部可见。"""
+        end = time.time() + timeout
+        while time.time() < end:
+            if not getattr(self, 'mini_visible', False) or not getattr(self, 'hwnd_mini', 0):
+                return
+            if _render_children_visible(self.hwnd_mini):
+                return
+            revive_webview(self.hwnd_mini, quiet=True)
+            self._force_webview_visible(target='mini')
+            time.sleep(interval)
+
+    def _fit_main_size(self, initial=False):
         """保证主窗口的 CSS 视口 ≈ 设计尺寸（_main_w × _main_h），**所有缩放档同一套逻辑**。
 
         为什么不再按 DPR 分支：旧实现是「dpr==1 直接 return，dpr>1 就 resize」，于是
@@ -2255,24 +3921,172 @@ class App:
             # 容差见 needs_fit：100% / 150% 的正常机器都返回 False，什么都不做。
             if not needs_fit(cur_w, cur_h, tw, th):
                 return
+            if not initial:
+                # 第 206 项：窗口已经用过，尺寸再和设计值不一样，只可能是用户
+                # 自己拖出来的。以前这里无条件 set_client_size()，用户每从托盘
+                # 唤出一次窗口就被拉回 1306×900，等于「拖了白拖」。
+                # 现在改成：把设计值更新成用户尺寸并记住，绝不反向改窗口。
+                self._main_w, self._main_h = int(cur_w), int(cur_h)
+                try:
+                    import brain as _b
+                    _b._settings_mark('win_w', int(cur_w))
+                    _b._settings_mark('win_h', int(cur_h))
+                except Exception:
+                    pass
+                _log_always('fit_main_size: 保留用户尺寸 %dx%d（不再拉回 %dx%d）'
+                            % (int(cur_w), int(cur_h), tw, th))
+                return
             ok = set_client_size(hwnd, tw, th)
             _log_always('fit_main_size: %s → client=%s visible_after=%s'
                         % ('resized' if ok else 'FAILED', get_client_size(hwnd), _is_visible(hwnd)))
         except Exception as e:
             _log('fit_main_size FAILED: %r' % (e,))
 
-    def place_mini(self):
-        """把快搜窗摆到鼠标所在的那块屏上（单屏时就是原来的居中 + 17%）。"""
+    def _move_hwnd(self, hwnd, x, y):
+        """物理像素 SetWindowPos（只定位不改尺寸），mini.move() 的替代品。
+
+        第 212 项实锤：pywebview 的 winforms move() 给 SetWindowPos 传
+        **None 当 cx/cy**，而本进程给 user32.SetWindowPos 设了 c_int argtypes
+        （全局共享，_win_ptr_funcs / 检查隐藏子窗口两处）—— None 一进来就是
+        ArgumentError argument 5，所以 mini.move() 在本进程**从来没成功过**，
+        place_mini 的兜底一直是坏的（窗口会停在上一次显示的位置）。
+        这里统一走自己的 ctypes 调用，不再依赖 pywebview 的 move。"""
+        u, _wt = _win()
+        if not u or not hwnd:
+            return False
         try:
-            cur = cursor_monitor_rect()
-            prim = primary_monitor_rect()
-            if cur and prim and cur != prim:
-                self._place_mini_on(cur)
-            else:
-                x, y = mini_origin(self.hwnd_mini)
-                self.mini.move(x, y)
+            SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+            return bool(u.SetWindowPos(ctypes.c_void_p(hwnd), None, int(x), int(y),
+                                       0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
         except Exception as e:
-            _log('place_mini FAILED: %r' % (e,))
+            _log_always('_move_hwnd FAILED: %r' % (e,))
+            return False
+
+    def _place_main_on_cursor(self):
+        """第 308 项：主窗口出现在**鼠标所在的那块屏**（多显示器 / 混合 DPI）。
+
+        历史行为：建窗时按主屏算居中，副屏用户点托盘/悬浮球，窗口弹到另一块屏，
+        感觉像「没打开」。这里只在两种情况下动窗口：
+          ① 窗口所在的显示器 ≠ 鼠标所在显示器；
+          ② 窗口明显不在自己那块屏的工作区里（比如 DPI 切换后被放大出界）。
+        用户自己摆好的位置（同屏且在区内）一律不动，避免「每次显示都跳」。
+        """
+        try:
+            u, wt = _win()
+            hwnd = self.hwnd_main or find_hwnd(MAIN_TITLE)
+            if not u or not hwnd:
+                return
+            pt = wt.POINT()
+            if not u.GetCursorPos(ctypes.byref(pt)):
+                return
+            hm_cursor = u.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+            work = _monitor_work(hm_cursor)
+            if not work:
+                return
+            hm_win = u.MonitorFromWindow(ctypes.c_void_p(hwnd), MONITOR_DEFAULTTONEAREST)
+            wr = wt.RECT()
+            u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(wr))
+            w = int(wr.right - wr.left)
+            h = int(wr.bottom - wr.top)
+            if w <= 0 or h <= 0:
+                return
+            L, T, R, B = work
+            inside = (wr.left >= L and wr.top >= T and wr.right <= R and wr.bottom <= B)
+            same = bool(hm_win) and int(hm_win) == int(hm_cursor)
+            if same and inside:
+                return
+            x = L + max(0, (R - L - w) // 2)
+            y = T + max(0, (B - T - h) // 2)
+            x = max(L, min(x, R - w))
+            y = max(T, min(y, B - h))
+            SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+            u.SetWindowPos(ctypes.c_void_p(hwnd), None, int(x), int(y), 0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+            _log_always('place_main: cursor=(%d,%d) work=%s same=%s inside=%s -> (%d,%d) %dx%d'
+                        % (int(pt.x), int(pt.y), work, same, inside, x, y, w, h))
+            notify_resize(hwnd)
+        except Exception as e:
+            _log('place_main FAILED: %r' % (e,))
+
+    def place_mini(self, tray=False):
+        """双击 Ctrl（桌面上）的落点：跟着鼠标附近弹，别固定在中下。
+
+        用户 23:44 反馈：「在桌面启动的应该跟随鼠标附近弹出或者居中以上弹出，
+        而不是固定一个中下地方」。以前用 `mini.move(x, y)`（逻辑像素）走
+        pywebview 的 DPI 换算，4K@150% 下容易落到屏幕下半截；这里统一按
+        **物理像素** SetWindowPos，只定位不改尺寸（SWP_NOSIZE）。
+        拿不到鼠标 / 显示器信息时回退到 mini_origin()（居中 + 17% 高度）。
+
+        tray=True（第 212~215 项）：托盘点击的落点 —— **屏幕正中**（水平垂直
+        都居中）。迭代史：贴鼠标/右下角挡托盘图标（212）→ 偏上视线竖跳（213）→
+        底边贴任务栏会盖住任务栏图标（214）→ 用户拍板「就放中间」。
+        双击 Ctrl「鼠标在哪弹在哪」的特性不受影响（tray=False 路径原样）。
+        """
+        try:
+            u, wt = _win()
+            hwnd = self.hwnd_mini
+            if not u or not hwnd:
+                x, y = mini_origin(hwnd)
+                self._move_hwnd(self.hwnd_mini, x, y)
+                return
+            wr = wt.RECT()
+            u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(wr))
+            dpr = window_dpr(hwnd) or 1.0
+            w = int(wr.right - wr.left) or int(round(MINI_W * dpr))
+            h = int(wr.bottom - wr.top) or int(round(MINI_H * dpr))
+            pt = wt.POINT()
+            got = False
+            try:
+                got = bool(u.GetCursorPos(ctypes.byref(pt)))
+            except Exception:
+                pass
+            work = None
+            if got:
+                try:
+                    hmon = u.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+                    work = _monitor_work(hmon)
+                except Exception:
+                    pass
+            if not work:
+                work = cursor_monitor_rect() or primary_monitor_rect()
+            if not work:
+                x, y = mini_origin(hwnd)
+                self._move_hwnd(hwnd, x, y)
+                return
+            L, T, R, B = work
+            gap = int(round(18 * dpr))
+            if tray:
+                # 第 215 项：托盘点击 = 屏幕正中（水平垂直都居中）。
+                # 迭代：212 右下角挡图标、213 偏上视线跳、214 底边贴任务栏
+                # 会盖住任务栏图标 —— 用户拍板「就放中间」。
+                x = L + max(0, (R - L - w) // 2)
+                y = T + max(0, (B - T - h) // 2)
+            elif got:
+                x = int(pt.x) + gap
+                y = int(pt.y) + gap
+                # 右下放不下就翻到鼠标左上，始终留在工作区里
+                if x + w > R - gap:
+                    x = int(pt.x) - w - gap
+                if y + h > B - gap:
+                    y = int(pt.y) - h - gap
+            else:
+                x = L + max(0, (R - L - w) // 2)
+                y = T + int(round((B - T) * 0.17))
+            x = max(L + gap, min(x, R - w - gap))
+            y = max(T + gap, min(y, B - h - gap))
+            SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+            ok = bool(u.SetWindowPos(ctypes.c_void_p(hwnd), None, x, y, 0, 0,
+                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
+            _log_always('place_mini: cursor=(%s,%s) work=%s -> (%d,%d) %dx%d tray=%s ok=%s'
+                        % (int(pt.x) if got else '-', int(pt.y) if got else '-',
+                           work, x, y, w, h, tray, ok))
+        except Exception as e:
+            _log_always('place_mini FAILED: %r' % (e,))
+            try:
+                x, y = mini_origin(self.hwnd_mini)
+                self._move_hwnd(self.hwnd_mini, x, y)
+            except Exception:
+                pass
 
     def _place_mini_on(self, rect):
         """把快搜窗摆到 rect 这块显示器上（物理像素定位）。
@@ -2313,34 +4127,99 @@ class App:
             _log('hotkey → show')
             self.show_mini()
 
-    def show_mini(self):
+    def show_mini(self, near_wnd=0, dock=False, tray=False, origin=''):
+        """near_wnd / dock：贴着这个窗口摆成小窗（第 198 项）。
+
+        dock=False 是双击 Ctrl 的老行为：大窗、鼠标附近。
+        tray=True（第 212 项）：托盘点击 —— 右下角贴边落点，别甩到屏幕左边。
+        origin='type'（第 244 项）：在 Windows 文件夹里**打字**唤出。这种要
+        「跟资源管理器一样」：不置顶、点文件夹空白处就收起、再打字再出来。
+        文件对话框吸附（origin='dialog'）仍保留第 205 项的失焦不收起。"""
         try:
             if not self.hwnd_mini:
                 self.hwnd_mini = wait_hwnd(MINI_TITLE, 2.0)
-            _log(f'show_mini begin mini={self.mini} hwnd={self.hwnd_mini}')
+            _log_always(f'show_mini begin near={near_wnd} dock={dock} tray={tray} origin={origin} hwnd={self.hwnd_mini}')
             self.mini.show()
             self.mini_visible = True
-            self.place_mini()          # 位置矫正放在 show 之后：move 本身会触发显示
-            if not topmost(self.hwnd_mini):
-                _log(f'show_mini topmost FAIL fg={foreground_desc()}')
-                # 抢焦点失败时最坏的情况是「用户以为在搜索框里打字，其实打进了别的程序」。
-                # 真正 Hide 一次再 Show 走的是系统「激活新显示窗口」的路径，一定拿得到。
-                try:
-                    self.mini.hide()
-                    time.sleep(0.06)
-                    self.mini.show()
-                    self.place_mini()
-                    _log(f'retry topmost ok={topmost(self.hwnd_mini)} fg={foreground_desc()}')
-                    self.mini_visible = True
-                except Exception:
-                    pass
+            self._mini_origin = origin
+            # 第 343 项：快搜窗显示后同样确认一次非客户区归零（WinForms 会重装窗口过程）
             try:
-                self.mini.evaluate_js('window.__onShow&&window.__onShow()')
+                hm = self.hwnd_mini or find_hwnd(MINI_TITLE)
+                if hm and frame_insets(hm) > 0:
+                    install_nc_guard(hm, force=True)
+                if hm:
+                    install_child_hit_guard(hm)
+                    # 第 359 项：显示前把窗口底色按当前配色刷一遍（重装过程/DWM 重置
+                    # 都可能把那一圈打回默认白）
+                    set_window_background(self.mini, _LAST_THEME.get('bg') or ui_bg_rgb())
+                    matte_frame(hm, _LAST_THEME.get('bg') or ui_bg_rgb())
+            except Exception:
+                pass
+            # 第 244 项：打字唤出的头 2 秒是 WebView2 起焦点 + replay 按键的窗口，
+            # 这段时间里的 blur 是初始化副作用，不能当成「用户点了空白处」。
+            # _on_type() 把按键送完会立刻把 guard 归零，用户随时可以点空白处收起。
+            if origin == 'type':
+                self._type_guard = time.time() + 2.0
+                # 不继承上一次「文件对话框」残留的 _auto_dlg：否则 hide_mini()
+                # 会写 30 秒静音、还把焦点抢回那个旧对话框（用户明明点的是
+                # 资源管理器空白处）。
+                self._auto_dlg = 0
+            self._mini_mode = 'dock' if (near_wnd and dock) else 'large'
+            if near_wnd and dock:
+                self.place_mini_near(near_wnd)
+            else:
+                self._dock = None
+                if near_wnd:
+                    self.place_mini_near(near_wnd)
+                else:
+                    # 从「贴角小窗」切回双击 Ctrl 的大窗：宽度必须显式还原，
+                    # 否则前端算出来的高度没变时 resize() 会提前 return，永远停在 460。
+                    # 第 212 项：resize 失败不许连累 place_mini —— 以前它俩共用一个
+                    # try，resize 一抛 place_mini 就被跳过，窗口停在上次的位置
+                    #（托盘点右下角、弹在左下角就是这么来的）。
+                    try:
+                        self.mini.resize(MINI_W, MINI_H)
+                    except Exception as e:
+                        _log_always('mini resize non-fatal: %r' % (e,))
+                    self.place_mini(tray=tray)   # 位置矫正放在 show 之后：move 本身会触发显示
+            # 第 244 项：打字唤出 / 文件对话框吸附的快搜窗**不置顶**（跟触发窗口同一 Z 序）。
+            # topmost(pin=False) 会主动设 HWND_NOTOPMOST，但抢前台完全保留 ——
+            # 打字必须把焦点拿到搜索框，否则按键会打进资源管理器。
+            # 只有热键唤出的大窗 / 托盘点击才置顶。
+            is_docked = bool(near_wnd or dock or getattr(self, '_dock', None))
+            pin = (origin != 'type') and not bool(dock or near_wnd or origin == 'dialog' or is_docked)
+            # 治白屏：WebView2 渲染层子窗口唤醒 + 控件 Visible 设回 True
+            self._force_webview_visible(target='mini')
+            revive_webview(self.hwnd_mini, quiet=True)
+            threading.Thread(target=self._late_revive_mini_loop, daemon=True).start()
+            if not topmost(self.hwnd_mini, pin=pin):
+                _log_always(f'show_mini focus FAIL fg={foreground_desc()}')
+                time.sleep(0.04)
+                topmost(self.hwnd_mini, tries=3, pin=pin)
+            try:
+                from_snip = bool(getattr(self, '_from_snip', False))
+                self._from_snip = False
+                js_arg = '{from_snip: true}' if from_snip else '{}'
+                self.mini.evaluate_js(f'window.__onShow&&window.__onShow({js_arg})')
             except Exception:
                 pass
             _log('show_mini done')
         except Exception as e:
             _log(f'show_mini EXCEPTION: {type(e).__name__}: {e}')
+
+    def _drop_dock(self):
+        """锚点窗口已销毁：收起贴角小窗，但**不**写 30 秒静音。
+
+        用户关掉「选择文件」再开一次，应该立刻重新吸附，不该被 hide_mini()
+        的 _auto_muted 挡住半分钟。"""
+        _log('drop dock: anchor gone')
+        try:
+            self.mini.hide()
+        except Exception:
+            pass
+        self.mini_visible = False
+        self._dock = None
+        self._auto_dlg = 0
 
     def hide_mini(self):
         _log('hide_mini')
@@ -2349,6 +4228,19 @@ class App:
         except Exception:
             pass
         self.mini_visible = False
+        self._dock = None
+        # 用户自己收起的（Esc / 点了别处 / 跳完目录）：这个对话框别再自动弹回来。
+        # 30 秒后解除，够他重新点一次「另存为」再进来。
+        if self._auto_dlg:
+            try:
+                self._auto_muted[self._auto_dlg] = time.time() + 30
+            except Exception:
+                pass
+            try:
+                quick_switch.focus_window(self._auto_dlg)
+            except Exception:
+                pass
+            self._auto_dlg = 0
 
     def on_mini_blur(self):
         """失焦处理：见 MiniApi.blurred 的说明。返回 True 表示真的收起了。
@@ -2358,6 +4250,26 @@ class App:
         （Alt+Tab / Win），这时候赖着不收反而烦人，必须收起。"""
         if not self.mini_visible:
             return False
+        # 第 244 项：**在文件夹里打字唤出**的快搜窗，用户停止输入、点了文件夹
+        # 空白处（资源管理器重新拿回焦点）就收起 —— 不能一直占着一块地方。
+        # 再随便打几个字会走 _on_type → show_mini(origin='type') 重新弹出。
+        # 头 2 秒是 WebView2 起焦点 + replay 按键的初始化期，那段 blur 不是用户
+        # 点的，忽略（_on_type 送完键会把 guard 归零）。
+        if getattr(self, '_mini_origin', '') == 'type':
+            if time.time() < getattr(self, '_type_guard', 0):
+                _log('blur → 打字唤出初始化期，忽略')
+                return False
+            _log('blur → 打字唤出，点空白处收起')
+            self.hide_mini()
+            return True
+        # 第 205 项：贴角（吸附）模式失焦**一律不收起**。
+        # 用户点对话框里的文件名框、或者拖动对话框，WebView2 都会先收到 blur；
+        # 以前直接 hide_mini()，于是「一点就没、一拖就没」，吸附根本无从谈起。
+        # 不再 topmost 抢焦点，避免和用户正在点的窗口来回拉扯。
+        # Esc / 点结果跳目录 / 锚点窗口被销毁仍照常收起。
+        if self._dock:
+            _log('blur → dock 模式，保持吸附不收起')
+            return False
         time.sleep(0.14)               # 等焦点切换稳定，别被中间态骗了
         if foreground_is(self.hwnd_mini):
             _log('blur → 前台还是自己，忽略')
@@ -2366,7 +4278,7 @@ class App:
         _log(f'blur since_resize={since:.2f} cursor_in={cursor_inside(self.hwnd_mini)} '
              f'fg={foreground_desc()}')
         if since < 0.7 or (since < 1.6 and cursor_inside(self.hwnd_mini)):
-            topmost(self.hwnd_mini, tries=5)   # resize 的副作用，抢回来
+            topmost(self.hwnd_mini, tries=5, pin=(not bool(self._dock)))   # resize 的副作用，抢回来
             return False
         self.hide_mini()
         return True
@@ -2374,12 +4286,24 @@ class App:
     def resize_mini(self, h):
         if not self.mini_visible:
             return                     # 隐藏状态下 resize 会让窗口自己蹦出来
-        h = max(96, min(int(h), 1000))
-        _log(f'resize → {h}')
+        h = max(88, min(int(h), 1000))
+        dock = self._dock
+        if dock:
+            # 贴角小窗：宽度是 place_mini_near 按触发窗口算出来的，
+            # 高度也不许超过那个窗口的可用高度（内容再多就靠行数上限挡）。
+            w = int(dock.get('wcss') or MINI_W_SMALL)
+            h = min(h, int(dock.get('maxh') or 1000))
+        else:
+            # 第 202 项：贴角模式下 _dock 偶尔为空（hide_mini/fallback），
+            # 旧代码直接回退 MINI_W=760，会把刚收窄的小窗又撑成半屏。
+            w = MINI_W if getattr(self, '_mini_mode', 'large') == 'large' else MINI_W_SMALL
+        _log(f'resize → {h} w={w}')
         try:
-            self.mini.resize(MINI_W, h)
+            self.mini.resize(w, h)
         except Exception:
             return
+        if dock:
+            self._dock_move(h)
         # 改窗口尺寸会让 WebView2 重新布局，实测有约三分之一概率把激活状态弄丢，
         # 表现为「结果刚出来，窗口就自己关了」（失焦逻辑干的）。
         # 记个时间窗，这段时间内的失焦一律当作 resize 的副作用抢回来。
@@ -2389,11 +4313,53 @@ class App:
             time.sleep(0.12)
             if self.mini_visible and not foreground_is(self.hwnd_mini):
                 _log('refocus 抢焦点')
-                topmost(self.hwnd_mini, tries=4)
+                topmost(self.hwnd_mini, tries=4, pin=(not bool(self._dock)))
         threading.Thread(target=_refocus, daemon=True).start()
 
+    def _ui_hang_watchdog(self):
+        """窗口消息循环卡死时，把线程栈落进 debug.log。
+
+        第 329 项：14:36 那次死锁（`ctrl.Visible` 跨线程），事后要靠 py-spy 挂进
+        活着的进程才抓到现场。这里每 3 秒给主窗发一条 WM_NULL（SMTO_ABORTIFHUNG），
+        连续两次超时就 dump 一份 —— 下次再「点了就卡死」，日志里直接有答案。
+        """
+        import ctypes
+        last = 0.0
+        streak = 0
+        while True:
+            try:
+                time.sleep(3)
+                hwnd = int(getattr(self, 'hwnd_main', 0) or 0)
+                if not hwnd:
+                    hwnd = int(find_hwnd(MAIN_TITLE) or 0)
+                    if hwnd:
+                        self.hwnd_main = hwnd
+                if not hwnd:
+                    streak = 0
+                    continue
+                res = ctypes.c_size_t(0)
+                ok = ctypes.windll.user32.SendMessageTimeoutW(
+                    ctypes.c_void_p(hwnd), 0, 0, 0,
+                    0x0001 | 0x0002,        # SMTO_BLOCK | SMTO_ABORTIFHUNG
+                    2000, ctypes.byref(res))
+                if ok:
+                    streak = 0
+                    continue
+                streak += 1
+                if streak >= 2 and time.time() - last > 120:
+                    last = time.time()
+                    _log_always('UI 无响应：连续 %d 次 WM_NULL 超时（hwnd=%d），dump 线程栈'
+                                % (streak, hwnd))
+                    try:
+                        import brain as _bb
+                        _bb._dump_thread_stacks('UI 无响应 hwnd=%d' % hwnd)
+                    except Exception as e:
+                        _log('ui hang dump FAILED: %r' % (e,))
+            except Exception:
+                pass
+
     # -- 主窗口 -------------------------------------------------------
-    def show_main(self, q=None, panel=None, focus=None):
+    def show_main(self, q=None, panel=None, focus=None, lock_timeout=0):
         """从快搜窗跳过来：show 主窗口 + 设搜索词。
 
         这里【绝不能】在出错时退回 webbrowser.open。那是「窗口组件加载失败就退到
@@ -2404,7 +4370,48 @@ class App:
 
         新界面是 React，只认 /web/?q= 与 ?panel=。旧模板那句
         `qEl.value=…;go()` 在 React 里必然 ReferenceError，别再注入它。
+
+        第 267 项：外面加两层面板防护 ——
+        ① `_show_lock`：同一时刻只许一次在飞，托盘三连点不会变成三条线程互顶；
+        ② `_hide_seq`：进来先记下"用户关过几次窗"，中途用户把详情栏关了，
+           本次就不再导航、也不再把窗口按上去（这正是「关了又自己弹出来」）。
         """
+        seq = int(getattr(self, '_hide_seq', 0) or 0)
+        lock = getattr(self, '_show_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._show_lock = lock
+        if not lock.acquire(blocking=False):
+            # 托盘 worker 带 lock_timeout：它已经把这次面板请求从队列里取走了，
+            # 直接跳过就等于把这次点击丢了 —— 短等一次，别让「点了没反应」以新形式复现。
+            got = False
+            if lock_timeout:
+                try:
+                    got = lock.acquire(timeout=float(lock_timeout))
+                except Exception:
+                    got = False
+            if not got:
+                _log_always('show_main: 已有一次显示在进行，跳过这次重复触发（panel=%r）' % (panel,))
+                return
+        try:
+            if seq != int(getattr(self, '_hide_seq', 0) or 0) or not getattr(self, '_alive', True):
+                _log_always('show_main: 排队期间用户已关闭窗口/程序退出，放弃本次显示')
+                return
+            self._show_main_once(q, panel, focus, seq)
+            # 第 343 项：WinForms 有可能在显示时把窗口过程装回去，显示完再确认一次
+            try:
+                hw = self.hwnd_main or find_hwnd(MAIN_TITLE)
+                if hw and frame_insets(hw) > 0:
+                    install_nc_guard(hw, force=True)
+                if hw:
+                    install_child_hit_guard(hw)
+            except Exception:
+                pass
+        finally:
+            lock.release()
+
+    def _show_main_once(self, q=None, panel=None, focus=None, seq=0):
+        """show_main 的实现体（只在拿到 _show_lock 后被调用）。"""
         qs = []
         if q:
             qs.append('q=' + quote(q))
@@ -2429,7 +4436,9 @@ class App:
             _log_always(f'show_main begin q={q!r} hwnd={hwnd} '
                  f'visible={_is_visible(hwnd)} loaded={getattr(self, "_main_loaded", False)}')
 
-            self.main.show()
+            # 第 267 项：走后端直连显示，不用 Window.show() 那层 _shown_call 门闩。
+            if not pv_show(self.main):
+                _log_always('show_main: pv_show 失败，退回 Win32 兜底显示')
 
             # pywebview 的 show() 在窗口被 hide 过之后偶尔不生效（Form.Visible 卡
             # 在 False）。用 Win32 ShowWindow 兜底，直接对原生句柄发 SW_SHOW。
@@ -2462,6 +4471,8 @@ class App:
                 notify_resize(hwnd)
                 # 尺寸兜底校正：正常机器这里 dev<=5% 直接返回，不产生任何窗口操作。
                 self._fit_main_size()
+                # 第 308 项：多显示器 / 混合 DPI 下，把窗口放到鼠标所在那块屏
+                self._place_main_on_cursor()
                 # 外壳 show 起来了，WebView2 的渲染子窗口却可能还藏着（silent 启动
                 # 必现）：不唤醒的话用户看到的就是一整块白窗口。
                 revive_webview(hwnd)
@@ -2480,18 +4491,27 @@ class App:
                 _log_always('show_main: 恢复快搜窗也失败\n' + traceback.format_exc())
             return
 
-        # ② 导航带上搜索词。第一次必须用 load_url（此时 _pywebviewready 还没置位，
-        #    evaluate_js 会一直等到超时）；之后改用整页导航，React 会读 ?q= 直接出结果。
+        # ② 导航带上搜索词。
+        #    第 267 项：不论首屏还是后续，一律走后端 pv_load_url 整页导航。
+        #    原来后续那次走 `self.main.evaluate_js('location.href=…')`，
+        #    它被 pywebview 的 `_pywebviewready` 门闩挡着：门闩一旦被清空，
+        #    每次托盘点击都空等 20 秒再抛异常 → 面板永远打不开。
+        #    React 只认 URL 参数，整页导航本来就是最确定的一条路（第 250/263 项同款）。
+        if seq != int(getattr(self, '_hide_seq', 0) or 0) or not self._want_main:
+            _log_always('show_main: 显示途中用户已关掉详情栏，放弃导航（不再顶窗口）')
+            return
         try:
             if not getattr(self, '_main_loaded', False):
-                self.main.load_url(target)
+                pv_load_url(self.main, target)
                 self._main_loaded = True
             elif panel or rel != getattr(self, '_main_target', ''):
                 # panel 必须每次都重新导航：React 的 ?panel= 只在挂载时读一次，
                 # 用户关掉抽屉再点同一个托盘菜单，URL 没变也得强制重载才打得开。
-                import json as _j
-                self.main.evaluate_js('location.href=' + _j.dumps(rel))
+                pv_load_url(self.main, target)
             self._main_target = rel
+            # 导航后补一刀：页面若因重载把 ready 事件丢了，用探针实测后补回去，
+            # 免得别的代码路径（evaluate_js）又回到「空等 20 秒」。
+            threading.Thread(target=pv_heal_gate, args=(self.main,), daemon=True).start()
         except Exception:
             _log_always('show_main: 主窗口导航失败（窗口已显示，可点托盘「打开详细搜索」）\n'
                         + traceback.format_exc())
@@ -2505,28 +4525,34 @@ class App:
 
         threading.Thread(target=_late_revive, daemon=True).start()
 
-        # ④ 抢前台，失败也不影响前面几步
+        # ④ 抢前台，失败也不影响前面几步。
+        #    ⚠️ 主窗口绝不能 pin：那会把它永久钉在所有程序前面（第 192 项）。
         try:
-            ok = topmost(hwnd)
+            ok = topmost(hwnd, pin=False)
             _log_always(f'show_main topmost={ok} visible_now={_is_visible(hwnd)} '
                  f'fg={foreground_desc()}')
         except Exception:
             _log_always('show_main: 抢前台失败\n' + traceback.format_exc())
 
     def hide_main(self):
+        # 第 267 项：只要用户关窗，就把 `_want_main` 放掉、把 `_hide_seq` +1。
+        # 在飞/排队的 show_main 看到序号变了会主动放弃，不会再「20 秒后醒来」
+        # 把刚关掉的详情栏顶回来。
+        _bump_hide(self)
         try:
-            self.main.hide()
+            self._remember_size()
         except Exception:
             pass
+        pv_hide(self.main)
 
-    # -- 钩子 / 托盘 ---------------------------------------------------
+    # -- 钩子 / 托盘 / 悬浮球 -------------------------------------------
     def _install_hotkey(self):
-        """装热键前先看设置：用户可能在前端关掉了双击 Ctrl。
+        """装热键前先看设置：用户可能在前端关掉了快捷键。
 
-        设置存在 settings.json 的 hotkey 字段，默认开。关掉后 stop hook，
-        再次开启重新 start。前端 /api/hotkey 读写这个文件。"""
+        设置存在 settings.json 的 hotkey 与 hotkey_mode 字段，默认开（double_ctrl）。
+        关掉后 stop hook，再次开启重新 start。前端 /api/settings 或 /api/hotkey 读写。"""
         if not self._hotkey_enabled():
-            _log('双击 Ctrl 热键已被设置关闭，不安装')
+            _log('快捷键已被设置关闭，不安装')
             self._hk_paused = True
             return None
         self._hk_paused = False
@@ -2535,9 +4561,10 @@ class App:
         except Exception:
             return None
         try:
-            hk = hotkey.start_double_ctrl(self._hotkey_fired)
+            mode = self._hotkey_mode()
+            hk = hotkey.start_hotkey(self._hotkey_fired, mode=mode)
             if hk is None:
-                print('双击 Ctrl 热键没能装上（不影响其它功能）')
+                print('全局快捷键没能装上（不影响其它功能）')
             return hk
         except Exception as e:
             print('热键安装失败:', e)
@@ -2579,6 +4606,19 @@ class App:
         return True
 
     @staticmethod
+    def _hotkey_mode():
+        """读 settings.json 的 hotkey_mode 字段。'double_ctrl' | 'alt_space' | 'ctrl_space'。"""
+        import json as _j
+        try:
+            p = App._settings_path()
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+                return d.get('hotkey_mode', 'double_ctrl')
+        except Exception:
+            pass
+        return 'double_ctrl'
+
+    @staticmethod
     def _set_hotkey(on):
         import json as _j
         p = App._settings_path()
@@ -2595,11 +4635,12 @@ class App:
         """前端调 /api/hotkey 切换时，通过 js_api 调到这里，实时启停热键。"""
         _log(f'set_hotkey on={on}')
         App._set_hotkey(on)
+        mode = self._hotkey_mode()
         if on and self.hotkey is None:
             # 重新装
             import hotkey
             try:
-                self.hotkey = hotkey.start_double_ctrl(self._hotkey_fired)
+                self.hotkey = hotkey.start_hotkey(self._hotkey_fired, mode=mode)
                 self._hk_paused = False
             except Exception as e:
                 _log(f'set_hotkey re-install FAILED: {e}')
@@ -2612,11 +4653,1002 @@ class App:
                 pass
             self.hotkey = None
             self._hk_paused = True
+            return True
+        if on and self.hotkey is not None:
+            self.hotkey.set_mode(mode)
         return True
+
+    # -- 桌面悬浮球 ----------------------------------------------------
+    @staticmethod
+    def _floating_ball_enabled():
+        import json as _j
+        try:
+            p = App._settings_path()
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+                return bool(d.get('floating_ball', False))
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _floating_ball_pos():
+        import json as _j
+        try:
+            p = App._settings_path()
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+                return d.get('floating_ball_x', -1), d.get('floating_ball_y', -1)
+        except Exception:
+            pass
+        return -1, -1
+
+    @staticmethod
+    def _save_floating_ball_pos(x, y):
+        import json as _j
+        try:
+            p = App._settings_path()
+            d = {}
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+            d['floating_ball_x'] = int(x)
+            d['floating_ball_y'] = int(y)
+            p.write_text(_j.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+    @staticmethod
+    def _set_floating_ball(enabled):
+        import json as _j
+        try:
+            p = App._settings_path()
+            d = {}
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+            d['floating_ball'] = bool(enabled)
+            p.write_text(_j.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+    def _sync_floating_ball(self, force=False):
+        """按 settings.json 把悬浮球拉起 / 收起。
+
+        第 269 项：以前每 ~2.4 秒才跑一次（埋在 `_auto_loop` 的 `tick % 16` 块里），
+        用户在设置里点开关后要等好几秒球才出现 / 消失，感觉「很卡」。
+        现在 `_auto_loop` 每拍都调这里，函数自己用 settings.json 的 mtime 做闸门：
+        文件没变只花一次 stat（微秒级），变了才真读。开关 ~0.15 秒内生效。
+        """
+        want_ball = self._floating_ball_enabled()
+        try:
+            import floating_ball
+            try:
+                floating_ball.set_logger(_log_always)
+            except Exception:
+                pass
+        except Exception:
+            return
+        if not self.floating_ball_mgr:
+            self.floating_ball_mgr = floating_ball.get_manager(
+                on_click=self._on_ball_click,
+                on_snip=self._on_ball_snip,
+                on_detail=self._on_ball_detail,
+                on_translate=self._on_ball_translate,
+                on_settings=self._on_ball_settings,
+                on_disable=self._on_ball_disable,
+                on_pos_changed=App._save_floating_ball_pos
+            )
+        is_running = self.floating_ball_mgr.is_running()
+        self._ball_last_want = bool(want_ball)
+        if want_ball and not is_running:
+            x, y = self._floating_ball_pos()
+            _log_always(f'floating_ball: 拉起 x={x} y={y}')
+            self.floating_ball_mgr.start(x=x, y=y)
+        elif not want_ball and is_running:
+            _log_always('floating_ball: 收起')
+            self.floating_ball_mgr.stop()
+
+    def _sync_home_compact(self):
+        """第 275 项：把 settings 里的 qs_home_compact 推给已开着的快搜窗。
+
+        快搜窗的 HTML 是开窗那一刻从 /mini 拉的，值已经落进模板里了；窗口本身
+        是复用的，用户改完设置如果不推这一下，就得等下次重启才看到效果 ——
+        那正是本项目最烦的「改了没生效」。所以这里跟悬浮球一样，用 mtime 做闸门。
+        """
+        try:
+            stamp = App._settings_path().stat().st_mtime_ns
+        except Exception:
+            stamp = 0
+        if stamp == getattr(self, '_hc_stamp', None):
+            return
+        self._hc_stamp = stamp
+        on = False
+        cnt = 4
+        show = True
+        try:
+            import json as _j
+            p = App._settings_path()
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+                on = bool(d.get('qs_home_compact', False))
+                show = bool(d.get('qs_home_show', True))
+                try:
+                    cnt = max(1, min(10, int(d.get('qs_home_count', 4) or 4)))
+                except Exception:
+                    cnt = 4
+        except Exception:
+            on = False
+            cnt = 4
+            show = True
+        if getattr(self, '_hc_last', None) == (on, cnt, show):
+            return
+        self._hc_last = (on, cnt, show)
+        wnd = getattr(self, 'mini', None)
+        if wnd is None:
+            return
+        try:
+            wnd.evaluate_js('window.__setHomeShow&&window.__setHomeShow(%s)'
+                            % ('true' if show else 'false'))
+            wnd.evaluate_js('window.__setHomeCompact&&window.__setHomeCompact(%s)'
+                            % ('true' if on else 'false'))
+            wnd.evaluate_js('window.__setHomeCount&&window.__setHomeCount(%d)' % cnt)
+        except Exception as e:
+            _log_always(f'home_compact push failed: {type(e).__name__}: {e}')
+
+    def _sync_floating_ball_fast(self):
+        """每拍调用的薄壳：settings.json 没变就只 stat 一次，什么都不做。"""
+        try:
+            stamp = App._settings_path().stat().st_mtime_ns
+        except Exception:
+            stamp = 0
+        if not getattr(self, '_ball_seen', False) or stamp != getattr(self, '_ball_stamp', None):
+            self._ball_stamp = stamp
+            self._ball_seen = True
+            self._sync_floating_ball()
+            return
+        # 文件没变：只在「该在却没在」时补一次（STA 线程被异常带走等）
+        mgr = self.floating_ball_mgr
+        if getattr(self, '_ball_last_want', False) and mgr is not None and not mgr.is_running():
+            _log_always('floating_ball: 发现掉了，重新拉起')
+            self._sync_floating_ball(force=True)
+
+    def _on_ball_click(self):
+        """悬浮球单击：快搜栏没开就开，已在前台就收。
+
+        第 269 项：以前这里直接接 `toggle_mini`，而 `toggle_mini` 靠
+        `self.mini_visible` 这个缓存值判断；万一缓存和真实可见性对不上，
+        点一下就被判成「已经开着 → 收起」，看起来就是点了没反应。
+        现在以**真实前台**为准，并把每一步打进 debug.log（`_log_always`），
+        下次真机再出问题不用猜。"""
+        try:
+            vis = bool(self.mini_visible)
+            fg = bool(self.hwnd_mini) and foreground_is(self.hwnd_mini)
+            _log_always(f'ball click: mini_visible={vis} fg={fg} hwnd={self.hwnd_mini}')
+            if vis and fg:
+                self.hide_mini()
+            else:
+                self.show_mini()
+        except Exception as e:
+            _log_always(f'ball click EXCEPTION: {type(e).__name__}: {e}')
+            raise
+
+    def _on_ball_snip(self):
+        try:
+            import snip_ocr
+            snip_ocr.trigger_snip(on_done=None, do_ocr=False)
+        except Exception as e:
+            _log('ball snip error: %r' % (e,))
+
+    def _on_ball_detail(self):
+        """悬浮球右键「详细搜索框」：直接开主窗口（第 287 项）。
+
+        以前悬浮球只能唤快搜，想开主窗口得先在快搜里点「展示更多」，两步。
+        这里不带 q：主窗口有自己记住的最近搜索词，别用快搜里那半截输入覆盖它。
+        """
+        try:
+            _log_always('ball detail → show_main')
+            self.show_main()
+        except Exception as e:
+            _log('ball detail FAILED: %r' % (e,))
+
+    def _on_ball_translate(self):
+        """悬浮球右键「聚合翻译」（第 287 项）：主窗口 + ?panel=translate。
+
+        聚合翻译本身是主窗口里的弹层（frontend TranslateModal），不是独立窗口；
+        这里走和第 267 项托盘面板同一条 open_panel 通道（单飞 worker + 最新请求胜出），
+        页面自己在启动时把弹层摊开 —— 不再用 evaluate_js 注入。
+        """
+        try:
+            _log_always('ball translate → open_panel(translate)')
+            self.open_panel('translate')
+        except Exception as e:
+            _log('ball translate FAILED: %r' % (e,))
+
+    def _on_ball_settings(self):
+        try:
+            self.show_main()
+        except Exception:
+            pass
+
+    def _on_ball_disable(self):
+        try:
+            App._set_floating_ball(False)
+            if self.floating_ball_mgr:
+                self.floating_ball_mgr.stop()
+        except Exception:
+            pass
 
     def _hotkey_fired(self):
         with self._lock:
             self.toggle_mini()
+
+    # -- 第 197 项：自动弹出 + 直接打字 -------------------------------
+    @staticmethod
+    def _auto_prefs():
+        """settings.json 里的 auto_popup / type_search，默认都开。
+
+        每 2.4 秒重读一次，用户在设置里一关就立刻停手，不用重启程序。
+        """
+        import json as _j
+        try:
+            p = App._settings_path()
+            if p.exists():
+                d = _j.loads(p.read_text(encoding='utf-8'))
+                return bool(d.get('auto_popup', True)), bool(d.get('type_search', True))
+        except Exception:
+            pass
+        return True, True
+
+    @staticmethod
+    def _qs_style():
+        """第 245 项：弹窗样式定稿，只剩方案1（rich，带正文片段的卡片）。
+
+        方案2（Listary 式紧凑表）已下线。保留这个函数是为了不改动
+        _mini_params / dock rect 日志的调用形态；**永远返回 'rich'**，
+        老 settings.json 里残留的 'tbl' 也不会让下线样式复活。
+        """
+        return 'rich'
+
+    def _start_auto_watch(self):
+        """一个后台线程盯「文件对话框出现了没」，外加装打字钩子。
+
+        为什么轮询而不挂钩子：文件对话框是别的进程建的，SetWinEventHook 要跨进程
+        回调，对方一卡事件就丢。0.4 秒一拍 EnumWindows 的开销实测可以忽略。
+        """
+        try:
+            self._auto_ok, self._type_ok = App._auto_prefs()
+        except Exception:
+            pass
+        try:
+            threading.Thread(target=self._auto_loop, daemon=True,
+                             name='sb-autowatch').start()
+        except Exception as e:
+            _log('auto watch FAILED: %r' % (e,))
+        self._install_typewatch()
+        self._install_anchor_hook()
+        self._install_clickwatch()
+
+    def _install_typewatch(self):
+        try:
+            import typewatch
+        except Exception as e:
+            _log('typewatch import FAILED: %r' % (e,))
+            return
+        try:
+            self.typewatch = typewatch.start(self._on_type, self._type_active,
+                                            is_dialog=quick_switch.is_file_dialog)
+            _log('typewatch ok=%s' % bool(self.typewatch))
+        except Exception as e:
+            self.typewatch = None
+            _log('typewatch install FAILED: %r' % (e,))
+
+    def _install_clickwatch(self):
+        """第 307 项：在资源管理器文件区点一下，已开着的文件对话框跟到那个目录。
+
+        用户原话：「在另存为或者选择文件夹的时候，点击另一个已经打开了文件夹，
+        选择文件夹这里就自动跳转选择那个文件夹的路径，就不用去找了。」
+
+        判定放在 follow_click 里（只认 CabinetWClass/ExploreWClass 的**文件区**，
+        工具栏/地址栏/状态栏都不算），跳转复用 quick_switch.jump()。
+        """
+        try:
+            import follow_click
+        except Exception as e:
+            _log('follow_click import FAILED: %r' % (e,))
+            return
+        try:
+            self.clickwatch = follow_click.start(self._on_folder_click,
+                                                 enabled=self._blank_jump_on)
+            _log('clickwatch ok=%s' % bool(self.clickwatch))
+        except Exception as e:
+            self.clickwatch = None
+            _log('clickwatch install FAILED: %r' % (e,))
+
+        # 第 329 项：UI 卡死看门狗（只写日志，不弹窗、不杀进程）
+        try:
+            threading.Thread(target=self._ui_hang_watchdog, daemon=True,
+                             name='ui-hang-watch').start()
+        except Exception as e:
+            _log('ui hang watchdog start FAILED: %r' % (e,))
+
+    @staticmethod
+    def _blank_jump_on():
+        """设置 → 文件搜索 → 「点一下对话框跟过去」。读不到就按开（出厂默认开）。"""
+        try:
+            import json as _j
+            p = App._settings_path()
+            if p.exists():
+                return bool(_j.loads(p.read_text(encoding='utf-8')).get('blank_jump', True))
+        except Exception:
+            pass
+        return True
+
+    def _on_folder_click(self, hwnd):
+        """在资源管理器里点了一下 → 若有开着的文件对话框，把它挪到当前目录。"""
+        try:
+            if not self._blank_jump_on():
+                return
+            path = quick_switch.window_folder(int(hwnd or 0))
+            if not path:
+                return
+            dlg, _fe, _ae = quick_switch.find_dialog()
+            if not dlg:
+                return
+            import follow_click
+            if not follow_click.should_jump(path, quick_switch.dialog_dir(dlg)):
+                return
+            res = quick_switch.jump(path)
+            _log('blank_jump: %s → %s (%s)' % (path, (res or {}).get('mode'),
+                                               (res or {}).get('ok')))
+        except Exception as e:
+            _log('blank_jump FAILED: %r' % (e,))
+
+    def _install_anchor_hook(self):
+        """第 229 项：全局位置事件钩子（零抖动跟随的主力，对标 Listary）。
+
+        Windows 只支持全局挂（不限于单窗口），回调首行按 hwnd 过滤，非锚点
+        事件一次比较就返回。钩子线程常驻消息循环；quit() 里 Unhook + WM_QUIT。"""
+        try:
+            threading.Thread(target=self._anchor_hook_thread, daemon=True,
+                             name='sb-anchorhook').start()
+        except Exception as e:
+            _log('anchor hook start FAILED: %r' % (e,))
+
+    def _anchor_hook_thread(self):
+        import ctypes
+        from ctypes import wintypes as _wt
+        u = ctypes.windll.user32
+        EVENT_OBJECT_LOCATIONCHANGE = 0x8004
+        EVENT_SYSTEM_MOVESIZESTART = 0x000A
+        EVENT_SYSTEM_MOVESIZEEND = 0x000B
+        WINEVENT_OUTOFCONTEXT = 0
+        OBJID_WINDOW = 0
+        WINEVENTPROC = ctypes.WINFUNCTYPE(
+            None, ctypes.c_void_p, _wt.DWORD, _wt.HWND,
+            _wt.LONG, _wt.LONG, _wt.DWORD, _wt.DWORD, _wt.DWORD)
+        app = self
+
+        def cb(_hook, _ev, hwnd, idobj, _idchild, _tid, _tevt, _tms):
+            try:
+                # 拖动期间是事件风暴：第一行过滤必须比 _follow_anchor 还早
+                if not hwnd or idobj != OBJID_WINDOW:
+                    return
+                d = app._dock
+                if not d or int(hwnd or 0) != int(d.get('hwnd') or 0):
+                    return
+                if _ev in (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND):
+                    # 模态移动循环开/关：追逐线程的开关（见 _on_drag_move_toggle）
+                    app._on_drag_move_toggle(_ev == EVENT_SYSTEM_MOVESIZESTART)
+                    return
+                app._follow_anchor()
+            except Exception:
+                pass
+
+        hook_cb = WINEVENTPROC(cb)
+        self._anchor_cb = hook_cb          # 防 GC：回调必须比钩子活得久
+        hook = u.SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,
+                                 EVENT_OBJECT_LOCATIONCHANGE, None,
+                                 hook_cb, 0, 0, WINEVENT_OUTOFCONTEXT)
+        self._anchor_hook = int(hook or 0)
+        hook2 = u.SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART,
+                                  EVENT_SYSTEM_MOVESIZEEND, None,
+                                  hook_cb, 0, 0, WINEVENT_OUTOFCONTEXT)
+        self._anchor_hook2 = int(hook2 or 0)
+        self._anchor_tid = int(ctypes.windll.kernel32.GetCurrentThreadId())
+        if not hook:
+            _log('anchor hook SetWinEventHook FAILED')
+            return
+        _log_always('anchor hook ok: LOCATIONCHANGE+MOVESIZE tid=%s'
+                    % self._anchor_tid)
+        msg = _wt.MSG()
+        lp = ctypes.byref(msg)
+        while u.GetMessageW(lp, None, 0, 0) > 0:
+            u.TranslateMessage(lp)
+            u.DispatchMessageW(lp)
+        _log('anchor hook loop exit')
+
+    def _on_drag_move_toggle(self, started):
+        """第 229 项二轮：用户开始/结束**拖动**锚点窗口（模态移动循环）。
+
+        WinEvent 不保证送达（系统忙会丢），只靠 LOCATIONCHANGE 跟随仍可能一顿
+        一顿。拖动期间开一个 ~6ms 的追逐线程用 GetWindowRect 硬追，确定性
+        ~150Hz 采样 —— Listary 手感的关键在这段；MOVESIZEEND 后收尾再贴一次。"""
+        self._drag_move = started
+        try:
+            _log_always('drag chase %s: hwnd=%s'
+                        % ('start' if started else 'end',
+                           (self._dock or {}).get('hwnd')))
+        except Exception:
+            pass
+        if started:
+            try:
+                if self.mini_visible and self.hwnd_mini:
+                    u, _ = _win()
+                    if u:
+                        SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+                        u.SetWindowPos(ctypes.c_void_p(self.hwnd_mini), ctypes.c_void_p(0), 0, 0, 0, 0,
+                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                threading.Thread(target=self._chase_thread, daemon=True,
+                                 name='sb-chase').start()
+            except Exception as e:
+                _log('chase start FAILED: %r' % (e,))
+
+    def _chase_thread(self):
+        while self._drag_move and self._alive:
+            try:
+                self._follow_anchor()
+            except Exception:
+                pass
+            time.sleep(0.006)
+        # 收尾再贴一次：MOVESIZEEND 事件可能抢在最后一次摆位之前到
+        try:
+            self._follow_anchor()
+        except Exception:
+            pass
+
+    def _type_active(self):
+        """钩子每按一个键都会问一次，必须无阻塞：只读内存里的开关。"""
+        return bool(self._type_ok and self._alive and not self.mini_visible)
+
+    @staticmethod
+    def _type_mini_should_hide(origin, visible, guard, foreground_is_mini):
+        """第 244 项：打字唤出的快搜窗该不该因「前台已不是自己」收起。
+
+        为什么不只靠页面的 blur 事件：WebView2 在跨进程焦点切换时偶尔不发
+        `window.blur`（用户点了资源管理器空白处、或者 Alt+Tab 到别的程序，
+        小窗还赖在屏幕上）。所以 _auto_loop 每 0.15 秒用这条纯函数兜一次底。
+        纯函数是为了能单测打表，不依赖真实窗口。
+        """
+        return (origin == 'type' and bool(visible)
+                and time.time() >= (guard or 0)
+                and not foreground_is_mini)
+
+    def _auto_loop(self):
+        tick = 0
+        dlg = 0
+        while self._alive:
+            # 第 205 项：拖动对话框时要「紧紧跟着」，0.4s 一拍肉眼能看出拖影，
+            # 改成 0.15s；跟随每拍都做，开销只有两次 GetWindowRect。
+            time.sleep(0.15)
+            tick += 1
+            try:
+                self._follow_anchor()
+            except Exception:
+                pass
+            if self.mini_visible and getattr(self, '_dock', None) and self.hwnd_mini:
+                try:
+                    d_hwnd = self._dock.get('hwnd')
+                    is_active = bool(getattr(self, '_drag_move', False)
+                                     or (d_hwnd and (quick_switch.is_foreground_dialog(d_hwnd) or foreground_is(d_hwnd)))
+                                     or foreground_is(self.hwnd_mini))
+                    u, _ = _win()
+                    if u:
+                        SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+                        after = ctypes.c_void_p(-1) if is_active else ctypes.c_void_p(-2)
+                        u.SetWindowPos(ctypes.c_void_p(self.hwnd_mini), after, 0, 0, 0, 0,
+                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                except Exception:
+                    pass
+            # 第 244 项：打字唤出的小窗，前台不再是自己（点了文件夹空白处 /
+            # 切到别的程序）就收起。放在 re-dock 之前，别让对话框吸附逻辑把
+            # 一个该收起的窗口又贴回去。
+            try:
+                if App._type_mini_should_hide(
+                        getattr(self, '_mini_origin', ''), self.mini_visible,
+                        getattr(self, '_type_guard', 0),
+                        foreground_is(self.hwnd_mini)):
+                    _log('type mini: 前台已不是自己 → 收起')
+                    # 别让 hide_mini() 顺手写 30 秒静音、把焦点抢回某个旧对话框：
+                    # 用户点的是文件夹空白处，下次打字必须能立刻再弹出来。
+                    self._auto_dlg = 0
+                    self.hide_mini()
+            except Exception:
+                pass
+            if tick % 16 == 1:                   # 约 2.4 秒刷一次开关
+                try:
+                    self._auto_ok, self._type_ok = App._auto_prefs()
+                except Exception:
+                    pass
+                try:
+                    mode = self._hotkey_mode()
+                    on = self._hotkey_enabled()
+                    if not on and self.hotkey is not None:
+                        self.hotkey.stop()
+                        self.hotkey = None
+                        self._hk_paused = True
+                    elif on and self.hotkey is None:
+                        import hotkey
+                        self.hotkey = hotkey.start_hotkey(self._hotkey_fired, mode=mode)
+                        self._hk_paused = False
+                    elif on and self.hotkey is not None and getattr(self.hotkey, 'mode', None) != mode:
+                        self.hotkey.set_mode(mode)
+                except Exception:
+                    pass
+            # 第 269 项：悬浮球开关要「点一下就动」。以前和上面的热键同步一起
+            # 压在 `tick % 16`（约 2.4 秒）里，用户点完设置要等几秒才看到球，
+            # 观感就是卡。现在每拍都过一遍（settings.json 没变只 stat 一次）。
+            try:
+                self._sync_floating_ball_fast()
+            except Exception:
+                pass
+            # 第 275 项：快搜窗「最近记录紧凑显示」开关也要点完就变。
+            # 同样只在 settings.json 的 mtime 变了才 push（没变只 stat 一次）。
+            try:
+                self._sync_home_compact()
+            except Exception:
+                pass
+            # find_dialog() 要枚举顶层窗口 + 递归查子窗口，降频到 0.3 秒一次
+            if tick % 2 == 0:
+                try:
+                    dlg = quick_switch.find_dialog()[0]
+                except Exception:
+                    dlg = 0
+            if dlg != self._auto_last:
+                # 对话框换了 / 没了：让已经开着的快搜窗刷新提示条与推荐
+                if self.mini_visible:
+                    try:
+                        self.mini.evaluate_js('window.__onDialog&&window.__onDialog()')
+                    except Exception:
+                        pass
+                self._auto_last = dlg
+            if self.mini_visible and tick % 14 == 0:   # 约 2.1 秒重拉候选目录
+                try:
+                    self.mini.evaluate_js('window.__onDirs&&window.__onDirs()')
+                except Exception:
+                    pass
+            # 第 229 项六轮：mini 还开着但吸附在**别的**对话框上 —— 用户换了新
+            # 对话框（旧的可能没关），锚点还在旧窗口上，拖新对话框小窗纹丝不动。
+            # 六轮补刀：_dock 为空的**大窗**（双击 Ctrl 弹的快搜窗）也吃这条 ——
+            # 用户 15:48 双击 Ctrl 弹大窗、16:0x 打开文件夹对话框，auto-popup 因
+            # 「mini 已开」被跳过，大窗不跟随 = 「拖对话框不动弹」的另一半。
+            # 前台是新对话框 → 换锚重贴/就地吸附，Listary 同款行为。
+            if (dlg and self.mini_visible
+                    and (not self._dock
+                         or int(self._dock.get('hwnd') or 0) != int(dlg))):
+                try:
+                    if quick_switch.is_foreground_dialog(dlg):
+                        _log_always('re-dock: anchor %s -> %s'
+                                    % (self._dock.get('hwnd'), dlg))
+                        self._auto_dlg = dlg
+                        self.place_mini_near(dlg)
+                        try:
+                            self.mini.evaluate_js(
+                                'window.__rescale&&window.__rescale(%s)'
+                                % json.dumps({'maxh': self._dock.get('maxh')},
+                                             ensure_ascii=False))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if not self._auto_ok or not dlg or self.mini_visible:
+                continue
+            if self._auto_muted.get(dlg, 0) > time.time():
+                continue
+            try:
+                if not quick_switch.is_foreground_dialog(dlg):
+                    continue
+            except Exception:
+                continue
+            _log('auto popup: dialog=%s' % dlg)
+            self._auto_dlg = dlg
+            self.show_mini(near_wnd=dlg, dock=True, origin='dialog')
+            try:
+                self.mini.evaluate_js(
+                    'window.__autoShow&&window.__autoShow(%s)'
+                    % json.dumps(self._mini_params(), ensure_ascii=False))
+            except Exception:
+                pass
+
+    def _mini_params(self, **kw):
+        """宿主推给页面的参数：小窗标记 + 可用高度上限 + 固定样式（第 199/245 项）。"""
+        d = self._dock or {}
+        out = {'small': True, 'style': App._qs_style()}
+        if d.get('maxh'):
+            out['maxh'] = int(d['maxh'])
+        out.update(kw)
+        return out
+
+    def _on_type(self, ev):
+        """在文件夹里直接打字：弹快搜窗，把刚才那几个键送进去。
+
+        跑在钩子的消费线程里，可以慢；钩子那边正在等 release()，最多等 2 秒。
+        """
+        tw = self.typewatch
+        try:
+            hwnd = int((ev or {}).get('hwnd') or 0)
+            if not self._type_active():
+                if tw:
+                    tw.release()
+                return
+            scope = ''
+            try:
+                scope = quick_switch.folder_for(hwnd)
+            except Exception:
+                scope = ''
+            _log('type -> show mini scope=%r origin=type' % (scope or ''))
+            self.show_mini(near_wnd=hwnd, dock=True, origin='type')
+            try:
+                self.mini.evaluate_js(
+                    'window.__autoShow&&window.__autoShow(%s)'
+                    % json.dumps(self._mini_params(scope=scope or ''),
+                                 ensure_ascii=False))
+            except Exception:
+                pass
+            # 等焦点真的落到快搜窗：show() 到 WebView2 拿到焦点要一两百毫秒，
+            # 这期间按的键钩子还在替我们吞着，所以不会漏字。
+            ok = False
+            for _ in range(60):
+                if foreground_is(self.hwnd_mini):
+                    ok = True
+                    break
+                time.sleep(0.02)
+            keys = tw.release() if tw else []
+            # 第 244 项：按键送完就立刻解除「初始化保护」，此后用户点文件夹
+            # 空白处（blur）马上收起；没送完之前不收，避免打字被打断。
+            # 焦点没抢到时留 5 秒，让用户有机会点一下小窗，别一闪就没。
+            self._type_guard = 0.0 if ok else time.time() + 5.0
+            if not keys:
+                return
+            import typewatch
+            if ok:
+                typewatch.replay(keys)
+                _log('type replay %d keys' % len(keys))
+            else:
+                # 焦点没抢过来就别注入，否则字会打进资源管理器（还会选中一堆文件）。
+                # 退化成「把能还原的字符填进搜索框」，剩下的用户接着打。
+                txt = typewatch.keys_to_text(keys)
+                _log('type focus FAILED, fallback text=%r' % txt)
+                if txt:
+                    try:
+                        self.mini.evaluate_js(
+                            'window.__autoQuery&&window.__autoQuery(%s)'
+                            % json.dumps(txt, ensure_ascii=False))
+                    except Exception:
+                        pass
+        except Exception as e:
+            _log('on_type FAILED: %r' % (e,))
+            try:
+                if tw:
+                    tw.release()
+            except Exception:
+                pass
+
+    def _work_rect(self):
+        """屏幕工作区（排除任务栏），物理像素；拿不到返回 None。"""
+        try:
+            u, wt = _win()
+            if not u:
+                return None
+            r = wt.RECT()
+            # SPI_GETWORKAREA = 0x0030
+            if u.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+                return (int(r.left), int(r.top), int(r.right), int(r.bottom))
+        except Exception:
+            pass
+        try:
+            return cursor_monitor_rect() or primary_monitor_rect()
+        except Exception:
+            return None
+
+    def _dock_xy(self, actual_w, actual_h):
+        """按锚点窗口当前 rect 算小窗位置。对话框=外部下方居中；文件夹=右下角贴角。
+
+        第 202 项：Listary 那种「长在文件夹上」的手感 —— 不抢戏、水平居中、
+        在对话框**外面**；文件夹移动时 `_follow_anchor()` 会带着它一起走。
+        """
+        d = self._dock or {}
+        left, top, right, bottom = d.get('rect') or (0, 0, 0, 0)
+        padx = int(d.get('padx') or 0)
+        pady = int(d.get('pady') or 0)
+        gap = int(d.get('gap') or 0)
+        if d.get('mode') == 'dlg':
+            x = int(round(left + (right - left - actual_w) / 2.0))
+            work = self._work_rect()
+            if work:
+                L, T, R, B = work
+                fits_below = bool(bottom + actual_h + gap <= B)
+                fits_above = bool(top - actual_h - gap >= T)
+                if fits_below:
+                    y = bottom + gap
+                elif fits_above:
+                    y = top - actual_h - gap
+                else:
+                    y = max(top + gap, bottom - actual_h - pady)
+                x = max(L + gap, min(x, R - actual_w - gap))
+                y = max(T + gap, min(y, B - actual_h - gap))
+            else:
+                fits_below = d.get('fits_below', True)
+                if fits_below:
+                    y = bottom + gap
+                else:
+                    y = max(top + gap, bottom - actual_h - pady)
+                x = max(left + padx, min(x, right - actual_w - padx))
+        else:
+            x = max(left + padx, right - padx - actual_w)
+            y = max(top + pady, bottom - pady - actual_h)
+            # 硬钳制：窗口实测宽度再离谱，右边界也不许越出触发窗口
+            x = min(x, right - padx - actual_w)
+        # 副屏在左/上方时坐标可以是负数，不能 max(0) 截到主屏去
+        return int(x), int(y)
+
+    def _rescale_dock(self, d):
+        """第 229 项：锚点对话框尺寸变化 → 宽度=对话框宽×0.5（上限 720）、
+        高度上限重算，页面 __rescale 重排行数。宽差 <16 css px 不动，防拖拽抖动。
+
+        七轮起**在跟随锁外**跑，且 120ms 自节流 + 独立锁（同一时刻只允许一个
+        rescale 在飞）—— 里面有 mini.resize / evaluate_js 跨线程调用，可能长时间
+        阻塞，绝不能让它拖死跟随本身。begin/end 都留 _log_always 实锤。"""
+        try:
+            now = time.time()
+            if now - self._rescale_ts < 0.12:
+                return
+            if not self._rescale_lock.acquire(False):
+                return
+            self._rescale_ts = now
+            _log_always('dock rescale begin: hwnd=%s' % (d.get('hwnd'),))
+            left, top, right, bottom = d.get('rect') or (0, 0, 0, 0)
+            dpr = d.get('dpr') or window_dpr(self.hwnd_mini) or 1.0
+            is_dlg = d.get('mode') == 'dlg'
+            win_w_css = (right - left) / dpr
+            avail_h = max(200.0, (bottom - top - 2 * int(d.get('pady') or 0)) / dpr)
+            if is_dlg:
+                w_css = int(round(max(MINI_W_MIN, min(720, win_w_css * 0.5,
+                                                      win_w_css - 28))))
+            else:
+                w_css = int(round(max(MINI_W_MIN, min(MINI_W_SMALL, win_w_css - 28))))
+            maxh_css = int(round(min(MAXH_CAP, max(MAXH_MIN,
+                                                   avail_h * (0.72 if is_dlg else 0.50)))))
+            if abs(w_css - int(d.get('wcss') or 0)) < 16 \
+                    and maxh_css == int(d.get('maxh') or 0):
+                return
+            d['wcss'] = w_css
+            d['maxh'] = maxh_css
+            try:
+                self.mini.resize(w_css, MINI_H_SMALL)
+            except Exception:
+                pass
+            wr = wt.RECT()
+            u.GetWindowRect(ctypes.c_void_p(self.hwnd_mini), ctypes.byref(wr))
+            d['w'] = int(wr.right - wr.left) or d.get('w')
+            d['h'] = int(wr.bottom - wr.top) or d.get('h')
+            try:
+                self.mini.evaluate_js('window.__rescale&&window.__rescale(%s)'
+                                      % json.dumps({'maxh': maxh_css}, ensure_ascii=False))
+            except Exception:
+                pass
+            _log_always('dock rescale: wcss=%s maxh=%s' % (w_css, maxh_css))
+        except Exception as e:
+            _log('rescale FAILED: %r' % (e,))
+        finally:
+            try:
+                self._rescale_lock.release()
+            except Exception:
+                pass
+
+    def _follow_anchor(self):
+        """锚点窗口移动/缩放时，小窗跟着走（尺寸变化交给 _rescale_dock）。
+
+        第 229 项：跟随主力换成 SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE)
+        全局位置钩子 —— 拖动对话框时每帧都有事件，小窗逐帧贴上去（Listary 手感）；
+        0.15s 轮询保留作兜底（rect 没变就什么也不做）。227① 曾写过头一版钩子，
+        被 cp 覆盖回退后没进 63 次重打的 exe（CArchive 解剖实锤），这次连同
+        preflight 守卫一起补上，防再丢。
+        """
+        d = self._dock
+        if not d or not self.mini_visible or not self.hwnd_mini:
+            return
+        # 第 229 项二轮 ①：读-算-写必须原子。钩子线程 / 0.15s 轮询 / 追逐线程
+        # 三处并发进来，不加锁就会出现「读旧 rect 的写者后到、把位置拽回去」的
+        # 乱序抖动；拿不到锁直接放弃（下一个事件马上就来，不值得排队等旧活）。
+        if not self._follow_lock.acquire(False):
+            _log('follow skip: lock busy')
+            return
+        rescale_needed = False
+        try:
+            u, wt = _win()
+            if not u:
+                return
+            if not u.IsWindow(ctypes.c_void_p(d['hwnd'])):
+                self._drop_dock()
+                return
+            r = wt.RECT()
+            if not u.GetWindowRect(ctypes.c_void_p(d['hwnd']), ctypes.byref(r)):
+                return
+            rect = (int(r.left), int(r.top), int(r.right), int(r.bottom))
+            old = d.get('rect')
+            if rect == old:
+                return
+            d['rect'] = rect
+            # 第 229 项七轮：只**标记**尺寸变化，重算挪到锁外做 —— rescale 里有
+            # mini.resize / evaluate_js 这类跨线程调用，在锁内一旦阻塞，锁就永远
+            # 不放，钩子/轮询/追逐三条跟随路一起冻结 = 「小窗留在原地不动」
+            # （16:28 用户拖动实测：chase 正常触发但小窗纹丝不动，第一嫌疑）。
+            if old and (rect[2] - rect[0] != old[2] - old[0]
+                        or rect[3] - rect[1] != old[3] - old[1]):
+                rescale_needed = True
+            if d.get('mode') == 'dlg':
+                work = self._work_rect()
+                if work:
+                    maxh_px = int(round(int(d.get('maxh') or 300) * float(d.get('dpr') or 1.0)))
+                    d['fits_below'] = bool(rect[3] + maxh_px <= work[3] - int(d.get('gap') or 0))
+            wr = wt.RECT()
+            u.GetWindowRect(ctypes.c_void_p(self.hwnd_mini), ctypes.byref(wr))
+            aw = int(wr.right - wr.left) or int(d.get('w') or 0)
+            ah = int(wr.bottom - wr.top) or int(d.get('h') or 0)
+            x, y = self._dock_xy(aw, ah)
+            # ② SWP_ASYNCWINDOWPOS：mini 归 pywebview GUI 线程所有，跨线程
+            #   SetWindowPos 默认要等对方处理 WM_WINDOWPOSCHANGING，GUI 一卡
+            #   回调就排队堆旧位置 —— 异步投递立即返回。
+            # Z 序同步：拖动中或当前锚点/自己处于前台时，浮在非置顶层顶端（HWND_TOP，不设 SWP_NOZORDER），
+            # 保证拖动遇到其他普通窗口时不被压在底下看不见；被第三方窗口主动激活遮挡时仍能正常被盖住。
+            is_active = bool(getattr(self, '_drag_move', False)
+                             or quick_switch.is_foreground_dialog(d.get('hwnd'))
+                             or foreground_is(d.get('hwnd'))
+                             or foreground_is(self.hwnd_mini))
+            HWND_TOPMOST = ctypes.c_void_p(-1)
+            HWND_NOTOPMOST = ctypes.c_void_p(-2)
+            if is_active:
+                u.SetWindowPos(ctypes.c_void_p(self.hwnd_mini), HWND_TOPMOST, x, y, 0, 0,
+                               SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+            else:
+                u.SetWindowPos(ctypes.c_void_p(self.hwnd_mini), HWND_NOTOPMOST, x, y, 0, 0,
+                               SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+            _log('follow anchor: %s -> (%d,%d)' % (rect, x, y))
+        except Exception as e:
+            _log('follow_anchor FAILED: %r' % (e,))
+        finally:
+            self._follow_lock.release()
+        if rescale_needed:
+            # 锁外重算：就算 pywebview 调用卡住，也只是这一帧的缩放晚了，
+            # 跟随本身（钩子/轮询/追逐）照常跑
+            try:
+                self._rescale_dock(d)
+            except Exception as e:
+                _log('rescale dispatch FAILED: %r' % (e,))
+
+    def place_mini_near(self, hwnd):
+        """小窗贴到触发窗口上：文件对话框=外部正下方居中；文件夹=右下角贴角。
+
+        第 202 项改动（QA 报告 P0-A）：
+        - `create_window(min_size=(MINI_W,96))` 会把 Form.MinimumSize 锁成
+          1140x144 physical @1.5，420/440 的 resize 全被钳回 760 —— 已把
+          min_size 降到 (MINI_W_MIN,88)。
+        - 尺寸**只有 `mini.resize()` 一个写入者**，SetWindowPos 只定位（SWP_NOSIZE）；
+          设置后读回真实尺寸，用它算 x，保证 `x + 实际宽 <= right - padx`。
+        """
+        try:
+            u, wt = _win()
+            if not u or not hwnd or not self.hwnd_mini:
+                return
+            r = wt.RECT()
+            if not u.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
+                raise RuntimeError('GetWindowRect failed')
+            left, top, right, bottom = int(r.left), int(r.top), int(r.right), int(r.bottom)
+            dpr = window_dpr(self.hwnd_mini) or 1.0
+            win_w_css = (right - left) / dpr
+            win_h_css = (bottom - top) / dpr
+            # 太小的窗口不贴角：回到桌面模式，顺手把尺寸还原成大窗，
+            # 免得「页面是小窗样式、窗口还是上一次的尺寸」（QA BUG-02）。
+            if win_w_css < MINI_W_MIN + 40 or win_h_css < 220:
+                self._dock = None
+                self._mini_mode = 'large'
+                try:
+                    self.mini.resize(MINI_W, MINI_H)
+                except Exception:
+                    pass
+                self.place_mini()
+                return
+            padx = int(round(14 * dpr))
+            try:
+                is_dlg = bool(quick_switch.is_file_dialog(hwnd))
+            except Exception:
+                is_dlg = False
+            pady = int(round((106 if is_dlg else 42) * dpr))
+            gap = 0        # 第 205 项：零间隙，视觉上「长在对话框底边上」
+            # 第 229 项（227③ 恢复）：对话框模式宽度 = 对话框宽 × 0.5（上限 720），
+            # 水平居中、底边贴对话框下沿；资源管理器文件夹仍用 MINI_W_SMALL。
+            if is_dlg:
+                w_css = int(round(max(MINI_W_MIN, min(720, win_w_css * 0.5,
+                                                      win_w_css - 28))))
+            else:
+                w_css = int(round(max(MINI_W_MIN, min(MINI_W_SMALL, win_w_css - 28))))
+            avail_h = max(200.0, (bottom - top - 2 * pady) / dpr)
+            maxh_css = int(round(min(MAXH_CAP,
+                                     max(MAXH_MIN, avail_h * (0.72 if is_dlg else 0.50)))))
+            maxh_px = int(round(maxh_css * dpr))
+            work = self._work_rect()
+            B = work[3] if work else bottom + maxh_px + 100
+            fits_below = bool(bottom + maxh_px <= B - gap)
+            self._mini_mode = 'dock'
+            # 唯一尺寸入口：pywebview.resize 收逻辑像素，内部自己乘 dpr
+            try:
+                self.mini.resize(w_css, MINI_H_SMALL)
+            except Exception:
+                pass
+            # 读回实际尺寸（MinimumSize / DWM 都可能改它），后面一律按实测值定位
+            wr = wt.RECT()
+            u.GetWindowRect(ctypes.c_void_p(self.hwnd_mini), ctypes.byref(wr))
+            aw = int(wr.right - wr.left) or int(round(w_css * dpr))
+            ah = int(wr.bottom - wr.top) or int(round(MINI_H_SMALL * dpr))
+            self._dock = {'hwnd': hwnd, 'rect': (left, top, right, bottom),
+                          'mode': 'dlg' if is_dlg else 'folder',
+                          'wcss': w_css, 'w': aw, 'h': ah, 'dpr': dpr,
+                          'maxh': maxh_css, 'padx': padx, 'pady': pady, 'gap': gap,
+                          'fits_below': fits_below}
+            x, y = self._dock_xy(aw, ah)
+            SWP_NOSIZE, SWP_NOACTIVATE = 0x1, 0x10
+            u.SetWindowPos(ctypes.c_void_p(self.hwnd_mini), ctypes.c_void_p(0), x, y, 0, 0,
+                           SWP_NOSIZE | SWP_NOACTIVATE)
+            try:
+                wr2 = wt.RECT()
+                u.GetWindowRect(ctypes.c_void_p(self.hwnd_mini), ctypes.byref(wr2))
+                _log_always('dock rect %.0fx%.0f css (physical %dx%d dpr=%.2f '
+                            'style=%s dlg=%s mode=%s x=%d y=%d)'
+                            % ((wr2.right - wr2.left) / (dpr or 1.0),
+                               (wr2.bottom - wr2.top) / (dpr or 1.0),
+                               wr2.right - wr2.left, wr2.bottom - wr2.top, dpr,
+                               App._qs_style(), is_dlg, self._dock['mode'],
+                               int(wr2.left), int(wr2.top)))
+            except Exception:
+                pass
+            _log('place_mini_near: (%d,%d) %dx%d dlg=%s for %s'
+                 % (x, y, aw, ah, is_dlg, hwnd))
+        except Exception as e:
+            _log('place_mini_near FAILED: %r' % (e,))
+            try:
+                self._dock = None
+                self._mini_mode = 'large'
+                self.mini.resize(MINI_W, MINI_H)
+                self.place_mini()
+            except Exception:
+                pass
+
+    def _dock_move(self, h_css):
+        """高度变了就按锚点重摆；对话框仍在外部下方居中，文件夹仍贴右下。"""
+        d = self._dock
+        if not d:
+            return
+        try:
+            u, _wt = _win()
+            if not u or not self.hwnd_mini:
+                return
+            hpx = int(round(int(h_css) * (d.get('dpr') or 1.0)))
+            d['h'] = hpx
+            x, y = self._dock_xy(int(d.get('w') or 0), hpx)
+            SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+            is_active = bool(getattr(self, '_drag_move', False)
+                             or quick_switch.is_foreground_dialog(d.get('hwnd'))
+                             or foreground_is(d.get('hwnd'))
+                             or foreground_is(self.hwnd_mini))
+            HWND_TOPMOST = ctypes.c_void_p(-1)
+            HWND_NOTOPMOST = ctypes.c_void_p(-2)
+            if is_active:
+                u.SetWindowPos(ctypes.c_void_p(self.hwnd_mini), HWND_TOPMOST, x, y, 0, 0,
+                               SWP_NOSIZE | SWP_NOACTIVATE)
+            else:
+                u.SetWindowPos(ctypes.c_void_p(self.hwnd_mini), HWND_NOTOPMOST, x, y, 0, 0,
+                               SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception as e:
+            _log('dock_move FAILED: %r' % (e,))
 
     def start_tray(self):
         try:
@@ -2627,13 +5659,15 @@ class App:
             self.tray = tray.Tray(
                 # 「打开详细搜索」带上快搜窗最后在搜的词，接着刚才的继续查
                 on_main=lambda: self.show_main(brain.LAST_Q or None),
-                on_mini=lambda: self.show_mini(),
+                # 第 212~215 项：托盘点击带 tray=True —— 屏幕正中弹出，
+                # 不贴鼠标、不占右下角、不压任务栏。
+                on_mini=lambda: self.show_mini(tray=True),
                 on_quit=self.quit,
                 on_settings=self.tray_settings,
                 on_about=self.tray_about,
                 on_feedback=self.tray_feedback,
                 on_help=self.tray_help,
-                tip='第二大脑（双击 Ctrl 唤出快搜）',
+                tip='Memex（双击 Ctrl 唤出快搜）',
             )
             if not self.tray.start():
                 self.tray = None
@@ -2643,6 +5677,11 @@ class App:
             _start_auto_update(self)
         except Exception as e:
             _log('start auto-update failed: %r' % (e,))
+        try:
+            import clipboard_mgr
+            clipboard_mgr.start_listener()
+        except Exception as e:
+            _log('start clipboard listener failed: %r' % (e,))
 
     def _dbg_autohelp(self):
         """临时诊断：SB_AUTOHELP=1 时 8 秒后自己点一次「使用帮助」，把 traceback 写进日志。"""
@@ -2662,16 +5701,40 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def open_panel(self, name, focus=None):
-        """托盘里点「设置 / 关于 / 使用帮助」：把主窗口叫出来并直接摊开对应的面板。
+        """托盘里点「设置 / 关于 / 使用帮助 / 反馈」：把主窗口叫出来并摊开对应面板。
 
         以前的做法是 show_main() 之后 evaluate_js 注入——那条路有两个坑：
         页面没加载完注入必然失败；加载中调 evaluate_js 还会把线程卡住。
         现在面板走 URL 参数，页面自己在启动时摊开，稳。
+
+        第 267 项：托盘每点一次就是一条独立线程，各自 show_main() + 导航。
+        用户连点三下（设置→关于→反馈）会变成三条线程抢同一个窗口，
+        谁最后醒来谁把窗口按上去 —— 表现为「设置点了没反应，接着关掉详情栏
+        又自己弹回来」。这里改成**单飞 worker + 最新请求胜出**：
+        只留一条工作线程，后来的请求覆盖前一条，跑完再看一眼有没有新请求。
         """
-        try:
-            self.show_main(panel=name, focus=focus)
-        except Exception as e:
-            _log(f'open_panel({name}) FAILED: {e}')
+        with self._panel_lock:
+            self._panel_req = (name, focus)
+            already = self._panel_worker_on
+            self._panel_worker_on = True
+        if already:
+            return
+        threading.Thread(target=self._panel_worker, daemon=True,
+                         name='tray-panel').start()
+
+    def _panel_worker(self):
+        while True:
+            with self._panel_lock:
+                req = self._panel_req
+                self._panel_req = None
+                if req is None:
+                    self._panel_worker_on = False
+                    return
+            name, focus = req
+            try:
+                self.show_main(panel=name, focus=focus, lock_timeout=3.0)
+            except Exception:
+                _log_always('panel_worker show_main FAILED\n' + traceback.format_exc())
 
     # _main_js() 已删：托盘三个面板早在 v0.9.46 就全改成 open_panel() 走 URL 参数，
     # 这个「show_main() + evaluate_js 注入」的应急口子没有任何调用者，而且无参
@@ -2690,7 +5753,7 @@ class App:
     def tray_about(self):
         self.open_panel('about')
 
-    def tray_balloon(self, text, title='第二大脑'):
+    def tray_balloon(self, text, title='Memex'):
         """托盘气泡：不依赖 WebView，界面白屏时也能给出反馈。"""
         try:
             import win32con
@@ -2737,6 +5800,49 @@ class App:
         关库放到后台并最多等 300ms —— SQLite WAL 本身崩溃安全，没必要为了 checkpoint
         让用户盯着图标等；超时就直接退出，日志里会留下 done=False 供排查。
         """
+        self._alive = False
+        # 第 277 项：正常退出要把运行标记写成 clean，否则下次启动会误判成崩溃。
+        # 顺带把指标与面包屑落盘 —— 托盘退出后进程就没了，内存里的计数不写就丢。
+        try:
+            error_report.mark_clean()
+        except Exception:
+            pass
+        try:
+            import feature_metrics
+            feature_metrics.flush(True)
+        except Exception:
+            pass
+        try:
+            import breadcrumb
+            breadcrumb.persist({'exit': 'clean'})
+        except Exception:
+            pass
+        try:
+            self._remember_size()
+        except Exception:
+            pass
+        try:
+            if self.typewatch:
+                self.typewatch.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'clickwatch', None):
+                self.clickwatch.stop()
+        except Exception:
+            pass
+        # 第 229 项：摘掉位置钩子并结束它的消息循环（daemon 线程，进程退也会回收）
+        try:
+            import ctypes as _ct
+            _u = _ct.windll.user32
+            if getattr(self, '_anchor_hook', 0):
+                _u.UnhookWinEvent(_ct.c_void_p(self._anchor_hook))
+            if getattr(self, '_anchor_hook2', 0):
+                _u.UnhookWinEvent(_ct.c_void_p(self._anchor_hook2))
+            if getattr(self, '_anchor_tid', 0):
+                _u.PostThreadMessageW(self._anchor_tid, 0x0012, 0, 0)   # WM_QUIT
+        except Exception:
+            pass
         t0 = time.perf_counter()
         marks = []
 
@@ -2747,6 +5853,9 @@ class App:
             if self.hotkey:
                 self.hotkey.stop()
             mark('hotkey')
+            if getattr(self, 'floating_ball_mgr', None):
+                self.floating_ball_mgr.stop()
+            mark('floating_ball')
             if self.tray:
                 self.tray.quit()
             mark('tray')
@@ -2832,7 +5941,7 @@ def _activate_running():
         import ctypes
         u = ctypes.windll.user32
         u.FindWindowW.restype = ctypes.c_void_p     # 64 位下别把 HWND 截成 int
-        for title in ('Second Brain · 第二大脑', '第二大脑（双击 Ctrl 唤出快搜）'):
+        for title in ('Memex', 'Memex（双击 Ctrl 唤出快搜）'):
             hwnd = u.FindWindowW(None, title)
             if hwnd:
                 u.ShowWindow(ctypes.c_void_p(hwnd), 9)   # SW_RESTORE
@@ -2868,6 +5977,81 @@ def _single_instance():
     except Exception as e:
         _log(f'single instance FAILED: {e}')
         return True
+
+
+def _clean_webview_cache(profile):
+    """启动时清掉 WebView2 的缓存目录（体积评估第 3 节 #5 / 5′）。
+
+    实测 `%LOCALAPPDATA%\\Memex\\App\\webview-profile` 72.7 MB，构成：
+    - 纯缓存（Cache / Code Cache / ShaderCache…）：≈9 MB，删了只多一次本地静态文件重读；
+    - WebView2 自己下载的组件（component_crx_cache 21.4 / WidevineCdm 21.9 /
+      Subresource Filter 12.3）：≈55 MB。界面是本地 127.0.0.1 的 HTML，不用 DRM、
+      不需要广告过滤规则，所以这些也能删 —— 前提是启动参数里带了
+      `--disable-component-update`（见 _component_update_off），否则它下次又下载回来。
+
+    只删这些「可再生」目录，**绝不碰** Cookies / Local Storage / Network /
+    Preferences —— 删了等于用户每次重启都掉登录态和界面语言。
+    目录可能正被 WebView2 子进程占用（先跑 _cleanup_orphan_webview 再调这里），
+    删不掉的单文件忽略即可，不能因此让启动失败。
+    """
+    import shutil
+
+    base = Path(profile) / 'EBWebView'
+    if not base.is_dir():
+        return 0
+    # WebView2（Chromium）缓存目录名：老版本在 EBWebView/Default 下，
+    # 着色器缓存在 EBWebView 根，两处都扫一遍。
+    names = ('Cache', 'Code Cache', 'GPUCache', 'GPUPersistentCache',
+             'GrShaderCache', 'ShaderCache', 'DawnCache', 'DawnGraphiteCache',
+             'DawnWebGPUCache', 'CacheStorage', 'ScriptCache')
+    # 5′：WebView2 自下载的组件。带空格的名字原样匹配，别写成前缀/通配。
+    comps = ('component_crx_cache', 'extensions_crx_cache', 'WidevineCdm',
+             'Subresource Filter', 'hyphen-data')
+    freed = 0
+    for root in (base, base / 'Default'):
+        if not root.is_dir():
+            continue
+        for name in names + comps:
+            p = root / name
+            if not p.exists():
+                continue
+            try:
+                if p.is_dir():
+                    for dirpath, _dirs, files in os.walk(p):
+                        for f in files:
+                            try:
+                                freed += os.path.getsize(os.path.join(dirpath, f))
+                            except OSError:
+                                pass
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    try:
+                        freed += p.stat().st_size
+                    except OSError:
+                        pass
+                    p.unlink(missing_ok=True)
+            except Exception:
+                continue
+    return freed
+
+
+def _component_update_off():
+    """5′：别让 WebView2 自己下载组件（体积评估 #5 的第二段）。
+
+    `component_crx_cache` 21.4 MB / `WidevineCdm` 21.9 MB / `Subresource Filter` 12.3 MB
+    都是 WebView2 的组件更新器悄悄下载的。界面是本地 127.0.0.1 的 HTML，不用 DRM、
+    不要广告过滤规则，所以关掉更新器 + 启动时清一次，这 ≈55 MB 就不会再长回来。
+
+    走 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 环境变量（本项目的 compat 模式一直用它
+    追加 --disable-gpu，说明这条通道可靠）；必须在 webview.start() 之前设置。
+    """
+    try:
+        cur = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS') or ''
+        if '--disable-component-update' not in cur:
+            os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (
+                cur + ' --disable-component-update').strip()
+    except Exception:
+        pass
 
 
 def _cleanup_orphan_webview():
@@ -2934,8 +6118,35 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
     `SecondBrain.exe --silent` 能从快捷方式 / 开机自启直达，省掉双击后再操作。
     """
     if not _single_instance():
-        print('第二大脑已经在运行了，已把窗口叫到前面。')
+        print('Memex已经在运行了，已把窗口叫到前面。')
         return
+
+    # 第 277 项：只有真正的 UI 进程才做「上次是否异常退出」检查与本次运行标记。
+    # 测试 / CLI 导入 brain 时不会走到这里，所以不会制造假报告。
+    try:
+        # 第 277 项：要先注入数据目录再 arm —— 装机版实测「run_state.json 从没落盘」，
+        # 因为 brain 的 bootstrap 要到更后面才 configure，此时 _CTX['dir'] 还是 None，
+        # arm_run_guard / mark_stage 全是空操作，异常退出检查等于没装。
+        if not (getattr(error_report, '_CTX', {}) or {}).get('dir'):
+            error_report.configure(brain.app_dir(), getattr(brain, 'APP_VERSION', ''))
+        rid = error_report.arm_run_guard()
+        error_report.mark_stage('ui')
+        if rid:
+            _log_always('prev run abnormal report: %s' % rid)
+    except Exception as e:
+        _log(f'run guard failed: {e!r}')
+    try:
+        import feature_metrics
+        feature_metrics.configure(brain.app_dir(), autostart=True)
+    except Exception as e:
+        _log(f'metrics configure failed: {e!r}')
+    try:
+        import breadcrumb
+        breadcrumb.configure(brain.app_dir(), keep=True)
+        breadcrumb.add('app', ev='start', silent=bool(silent))
+    except Exception:
+        pass
+
     port = _pick_port()
     if not port:
         print(f'端口 {BASE_PORT}~{BASE_PORT + PORT_TRIES - 1} 都被占用，无法启动。')
@@ -2948,12 +6159,19 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
     srv = _start_server(port)
     if srv is None and _START_ERR[0]:
         tail = _START_ERR[0].strip().splitlines()[-1]
-        _fatal('第二大脑启动失败',
+        _fatal('Memex启动失败',
                ('本地服务没能起来，所以窗口里只会显示「127.0.0.1 未发送任何数据」。'
                 + chr(10) + chr(10) + '错误：' + tail
                 + chr(10) + chr(10) + '常见原因：程序目录写不进去（只读位置 / 安全软件锁定 / 解压不完整）。'
                 + '把整个文件夹挪到桌面或文档下面再试一次。'))
         return
+    # 第 299 项：按 settings.json 的 proxy_mode 同步环境变量（默认跟随系统代理）。
+    # 只影响外网请求；本机 127.0.0.1 的接口由各自的直连 opener 负责，不走这里。
+    try:
+        import netproxy
+        netproxy.refresh()
+    except Exception as e:
+        _log(f'netproxy refresh failed: {e!r}')
     brain.start_pinyin_backfill()   # 老库补拼音（11 万条十几秒），后台跑，不挡窗口
     _start_prune_after_boot()       # 启动后台清理失效路径，跟 Listary/Everything 启动重扫一个思路
 
@@ -3000,6 +6218,15 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
         except Exception:
             _storage = None
         _cleanup_orphan_webview()          # 先清上一实例强杀留下的孤儿 webview
+        _component_update_off()             # 5′：别再让 WebView2 自己下载组件（≈55 MB）
+        # 体积评估 #5/5′：缓存与自下载组件每次启动清一遍（实测 72.7 MB 里 ≈64 MB 可再生）
+        try:
+            _freed = _clean_webview_cache(_profile)
+            if _freed > 0:
+                # 用 _log_always：这是「磁盘为什么小了」的唯一凭据，别随调试开关消失
+                _log_always('webview cache cleared: %.1f MB' % (_freed / 1048576.0))
+        except Exception as e:
+            _log_always('webview cache clean skipped: %r' % (e,))
         webview.start(func=app.after_start, debug=False,
                       private_mode=False, storage_path=_storage)
     except Exception as e:
@@ -3012,7 +6239,7 @@ def main(query=None, show_settings=False, lang=None, silent=False, start_mini=Fa
             webbrowser.open(target)
         except Exception:
             pass
-        _fatal('第二大脑：窗口启动失败，已改用浏览器打开',
+        _fatal('Memex：窗口启动失败，已改用浏览器打开',
                ('窗口组件（WebView2 / .NET）没能加载，界面已经在默认浏览器里打开：'
                 + chr(10) + target
                 + chr(10) + chr(10) + '错误：' + f'{type(e).__name__}: {e}'
@@ -3160,12 +6387,12 @@ def _run_window(query, show_settings, lang, silent=False, start_mini=False):
             try:
                 r = ctypes.windll.user32.MessageBoxW(
                     None,
-                    ('第二大脑需要「WebView2 运行时」，这台电脑上没找到。'
+                    ('Memex需要「WebView2 运行时」，这台电脑上没找到。'
                      + chr(10) * 2
-                     + '点「确定」会打开微软官方下载页，装好后重新打开第二大脑即可。'
+                     + '点「确定」会打开微软官方下载页，装好后重新打开Memex即可。'
                      + chr(10)
                      + '（安装包很小，约 2 MB；装一次，以后都不用再装。）'),
-                    '第二大脑 · 缺少 WebView2 运行时', 0x01)
+                    'Memex · 缺少 WebView2 运行时', 0x01)
                 if r == 1:
                     os.startfile('https://go.microsoft.com/fwlink/p/?LinkId=2124703')
                     return
@@ -3225,7 +6452,7 @@ def _diagnose():
         if out:
             body += chr(10) * 2 + '完整报告：' + str(out)
         try:
-            ctypes.windll.user32.MessageBoxW(None, body, '第二大脑 · 环境自检', 0x40)
+            ctypes.windll.user32.MessageBoxW(None, body, 'Memex · 环境自检', 0x40)
         except Exception:
             pass
         if out:
@@ -3250,7 +6477,7 @@ def _feedback_cli(argv):
         text = ' '.join(rest).strip()
     if not text:
         try:
-            print('第二大脑 · 报告问题')
+            print('Memex · 报告问题')
             print('  界面打不开 / 白屏 / 点了没反应时用这里。')
             print('  描述一句话（可留空直接回车，会附环境信息与最近日志）：')
             text = input('> ').strip()
@@ -3293,21 +6520,85 @@ def _start_auto_update(app):
                     _log_always('auto-update: 发现 %s，开始后台下载' % ver)
                     r = brain.download_update(info)
                     if r.get('ok'):
+                        _metric('update', 'ok', 'download')
                         _log_always('auto-update: %s 已下载，等用户重启' % ver)
                         try:
                             app.tray_balloon('新版本 %s 已下载，设置里点「重启更新」生效' % ver)
                         except Exception:
                             pass
                     else:
+                        # 第 277 项：更新下载失败以前只有一行 debug.log，
+                        # 用户只会说「一直更不了」，看不出是 404 还是被墙。
+                        _metric('update', 'fail', 'download', r.get('k') or r)
                         _log_always('auto-update: 下载失败 %r' % (r.get('k') or r,))
+                elif info.get('ok'):
+                    _metric('update', 'ok', 'check')
+                else:
+                    _metric('update', 'fail', 'check', info.get('err') or 'no-info')
             except Exception as e:
+                _metric('update', 'fail', 'check', e)
                 _log('auto-update failed: %r' % (e,))
             time.sleep(6 * 3600)
     threading.Thread(target=work, name='auto-update', daemon=True).start()
 
 
+def _uninstall_cli(quiet=False):
+    """`Memex.exe --uninstall`：确认后用外部脚本删程序（数据默认保留）。"""
+    import ctypes
+    try:
+        import uninstall
+    except Exception as e:
+        print('[x] 卸载模块缺失：%r' % (e,))
+        return 2
+    if not quiet:
+        r = ctypes.windll.user32.MessageBoxW(
+            None,
+            ('要卸载 Memex 吗？' + chr(10) * 2
+             + '程序文件和快捷方式会被删除；' + chr(10)
+             + '搜索数据（索引库、设置、备份）会保留在原目录，重新安装后可继续用。'
+             + chr(10) * 2 + '点「是」开始卸载，点「否」取消。'),
+            'Memex · 卸载', 0x04 | 0x20 | 0x100)   # YESNO + 问号图标 + 前台
+        if r != 6:      # IDYES
+            return 0
+    ok, script = uninstall.run_uninstall(app=brain.app_dir(), keep_data=True)
+    if not ok:
+        if not quiet:
+            ctypes.windll.user32.MessageBoxW(
+                None, '没能启动卸载程序，请手动删除安装目录：' + chr(10)
+                + brain.app_dir(), 'Memex · 卸载失败', 0x10)
+        return 1
+    return 0
+
+
 def _boot():
     argv = sys.argv[1:]
+    # 第 370 项：免打包调试通道 —— %LOCALAPPDATA%\Memex\App\dev_override\<name>.py
+    # 存在就顶替内置模块（只限卡片/框选/翻译这几个）。必须在所有分支之前装上，
+    # 否则后面 `import snip_card` 拿到的是打进 exe 的旧那份。
+    try:
+        import dev_override
+        _log('dev_override: %r' % (dev_override.boot(),))
+    except Exception as _e:
+        _log('dev_override boot failed: %r' % (_e,))
+    # 第 302 项：安装目录里放一个 Uninstall.exe（和 Memex.exe 同一份二进制，
+    # 只是文件名不同）。用户双击它就等于 Memex.exe --uninstall —— 不必记参数，
+    # 也不依赖「设置 → 应用」能不能找到。判断必须在登记注册表之前，
+    # 否则卸载器一启动又把卸载项写回去了。
+    _as_uninstaller = os.path.basename(sys.executable).lower().startswith('uninstall')
+    # 第 296 项：在「设置 → 应用」里登记卸载项（只对打包后的安装版生效）。
+    # 位置必须在所有分支之前 —— 静默启动 / 托盘 / 命令行子命令都不会经过 _run_window，
+    # 第一轮放在 _run_window 里，结果注册表一条都没写进去。
+    if getattr(sys, 'frozen', False) and not _as_uninstaller:
+        try:
+            import uninstall
+            uninstall.ensure_uninstall_entry(getattr(brain, 'APP_VERSION', '') or '')
+        except Exception as _e:
+            _log('uninstall entry failed: %r' % (_e,))
+    if _as_uninstaller and '--uninstall' not in argv:
+        argv.append('--uninstall')
+    if '--uninstall' in argv:
+        # 第 296 项：控制面板「卸载」按钮走这里（--quiet 时不弹确认框）
+        sys.exit(_uninstall_cli(quiet=('--quiet' in argv)))
     if '--feedback' in argv:
         sys.exit(_feedback_cli(argv))
     if any(a in ('--diagnose', '/diagnose', '-diagnose') for a in argv):
@@ -3345,5 +6636,5 @@ if __name__ == '__main__':
         raise
     except Exception:
         import traceback
-        _fatal('第二大脑启动失败', traceback.format_exc()[-1200:])
+        _fatal('Memex启动失败', traceback.format_exc()[-1200:])
         sys.exit(3)

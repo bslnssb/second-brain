@@ -23,7 +23,6 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { t } from '../lib/i18n'
 import { fill } from './maintenance'
-import { IconSearch, IconClock, IconDoc, IconFolder, IconImage, IconGrid } from './icons'
 
 type FirstRun = {
   ok?: boolean
@@ -96,58 +95,20 @@ const markSeen = async (): Promise<boolean> => {
   }
 }
 
-/** 左边那栏的示意图：一个搜索框 + 三行结果（纯 CSS/SVG，不依赖截图） */
-function MockSearch() {
-  const rows: [JSX.Element, string, string][] = [
-    [<IconDoc key="a" size={12} />, t('ob_mock_f1'), 'D:\\Work\\Reports'],
-    [<IconFolder key="b" size={12} />, t('ob_mock_f2'), 'D:\\Work\\Archive'],
-    [<IconImage key="c" size={12} />, t('ob_mock_f3'), 'C:\\Users\\me\\Pictures'],
-  ]
-  return (
-    <div className="overflow-hidden rounded-xl border border-line bg-card">
-      <div className="flex items-center gap-2 border-b border-line px-2.5 py-2">
-        <IconSearch size={13} />
-        <span className="text-[12px] text-sub">{t('ob_mock_q')}</span>
-      </div>
-      {rows.map(([icon, name, dir], i) => (
-        <div key={i} className={'flex items-center gap-2 px-2.5 py-1.5 text-[11.5px] ' + (i === 0 ? 'bg-accent/10' : '')}>
-          <span className="text-sub">{icon}</span>
-          <span className="truncate text-ink">{name}</span>
-          <span className="ml-auto shrink-0 text-[10px] text-sub">{dir}</span>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-/** 右边那栏的示意图：不输入时列最近改过的文件 + 分类入口 */
-function MockRecent() {
-  const rows: [JSX.Element, string, string][] = [
-    [<IconClock key="a" size={12} />, t('ob_mock_file'), t('ob_mock_now')],
-    [<IconFolder key="b" size={12} />, t('ob_mock_folder'), t('ob_mock_today')],
-    [<IconGrid key="c" size={12} />, t('ob_mock_images'), t('ob_mock_week')],
-  ]
-  return (
-    <div className="overflow-hidden rounded-xl border border-line bg-card">
-      <div className="flex items-center gap-2 border-b border-line px-2.5 py-2 text-[12px] text-sub">
-        {t('ob_mock_recent')}
-      </div>
-      {rows.map(([icon, name, when], i) => (
-        <div key={i} className="flex items-center gap-2 px-2.5 py-1.5 text-[11.5px]">
-          <span className="text-sub">{icon}</span>
-          <span className="truncate text-ink">{name}</span>
-          <span className="ml-auto shrink-0 text-[10px] text-sub">{when}</span>
-        </div>
-      ))}
-    </div>
-  )
-}
+/** 第 204 项：教程改成 Listary 式「分页 + 动态 GIF」。
+ *  原来的两栏静态 CSS 示意图（MockSearch / MockRecent）已删除：
+ *  GIF 放在 web/public/assets/tour-1..4.gif，由 Vite 原样拷进 dist/assets/。
+ *  动图里**不放任何自然语言文字**，标题/说明/按钮全部走 i18n，
+ *  这样中/英/西/葡/印地五种语言看到的文案都是自己的语言。
+ */
 
 export function Onboarding({ onOpenSettings, onIndexed, replay = 0 }: Props) {
   const [phase, setPhase] = useState<'boot' | 'hidden' | 'welcome' | 'run' | 'done' | 'error'>('boot')
   const [st, setSt] = useState<FirstRun>({})
   const [paused, setPaused] = useState(false)
   const [markErr, setMarkErr] = useState(false)
+  /** 教程页码 0..3；replay 重看时从第一页开始 */
+  const [tour, setTour] = useState(0)
   const finished = useRef(false)
 
   useEffect(() => {
@@ -156,6 +117,7 @@ export function Onboarding({ onOpenSettings, onIndexed, replay = 0 }: Props) {
     if (replay) {
       finished.current = false
       setMarkErr(false)
+      setTour(0)
       setPhase('welcome')
       return () => {
         alive = false
@@ -226,22 +188,11 @@ export function Onboarding({ onOpenSettings, onIndexed, replay = 0 }: Props) {
     }
   }, [phase, onIndexed])
 
-  // 建好了就自动收起：别让用户一直停在这张卡上（实测虚拟机里会以为卡死）
-  useEffect(() => {
-    if (phase !== 'done') return
-    const id = setTimeout(() => {
-      finished.current = true
-      void markSeen().then((ok) => {
-        if (ok) {
-          setMarkErr(false)
-          setPhase('hidden')
-        } else {
-          setMarkErr(true)
-        }
-      })
-    }, 2400)
-    return () => clearTimeout(id)
-  }, [phase])
+  // 第 346 项：**不再自动收起**。
+  // 上一版在这里挂了 2.4s 定时器把 phase 从 done 打到 hidden —— 那是「只剩一张小进度卡」
+  // 时代为了防止用户以为卡死的补丁。后来 done 阶段渲染的是整页四步教程，定时器照旧把
+  // 教程在两秒半后自己关掉：用户「还没点就没了」，或者刚点「下一步」就没了。
+  // 现在收起只有一个来源：用户点「开始使用」/「跳过」/「直接开始」（都走 close()）。
 
   /** mark=false：只是把建库小卡收起来，不代表用户看过欢迎页。
    *  以前 run 阶段点 ✕ 也写 welcome_seen，用户从没见过教程就被标成看过。 */
@@ -382,23 +333,28 @@ export function Onboarding({ onOpenSettings, onIndexed, replay = 0 }: Props) {
       style={{ top: 'var(--sb-title, 0px)' }}
     >
       <div className="max-h-[94vh] w-[760px] max-w-[96vw] overflow-auto rounded-2xl border border-line bg-bg p-6 shadow-2xl">
-        <div className="text-[19px] font-semibold">{t('ob_welcome')}</div>
-        <div className="mt-1 text-[12.5px] leading-relaxed text-sub">
-          {phase === 'done' ? t('ob_done_title') : t('ob_sub')}
+        <div className="text-[12px] tracking-wide text-sub">0{tour + 1} / 04</div>
+        <div className="mt-2 text-[26px] font-bold leading-tight">
+          {t(`ob_tour_t${tour + 1}`)}
+        </div>
+        <div className="mt-2 text-[13px] leading-relaxed text-sub">
+          {t(`ob_tour_d${tour + 1}`)}
         </div>
 
-        {/* 两栏：左边搜索、右边不用打字（照 Listary 的样子，但用我们自己的界面画） */}
-        <div className="mt-4 grid grid-cols-2 gap-4">
-          <div className="rounded-xl border border-line p-3">
-            <div className="mb-2 text-[13px] font-medium">{t('ob_col1')}</div>
-            <MockSearch />
-            <div className="mt-2 text-[11.5px] leading-snug text-sub">{t('ob_col1_cap')}</div>
-          </div>
-          <div className="rounded-xl border border-line p-3">
-            <div className="mb-2 text-[13px] font-medium">{t('ob_col2')}</div>
-            <MockRecent />
-            <div className="mt-2 text-[11.5px] leading-snug text-sub">{t('ob_col2_cap')}</div>
-          </div>
+        {/* Listary 式分页动图：每页一张自制 GIF，循环播放 */}
+        <div className="mt-4 overflow-hidden rounded-xl border border-line bg-card">
+          <img src={`./assets/tour-${tour + 1}.gif`} alt="" className="block w-full" />
+        </div>
+        <div className="mt-3 flex items-center justify-center gap-1.5">
+          {[1, 2, 3, 4].map((n) => (
+            <button
+              key={n}
+              aria-label={`step ${n}`}
+              onClick={() => setTour(n - 1)}
+              className={'h-1.5 rounded-full transition-all ' +
+                (n - 1 === tour ? 'w-6 bg-accent' : 'w-1.5 bg-line hover:bg-sub')}
+            />
+          ))}
         </div>
 
         {/* 建库进度（只在第一次建库时出现） */}
@@ -420,21 +376,44 @@ export function Onboarding({ onOpenSettings, onIndexed, replay = 0 }: Props) {
             <div className="mt-2 h-1 overflow-hidden rounded-full bg-line">
               <div className="h-full rounded-full bg-accent transition-all" style={{ width: '100%' }} />
             </div>
+            {/* 第 346 项：索引完了但一个文件都没有（新机器 / 虚拟机里常见）——
+                以前只留一句「建好了，可以搜了」，用户回到界面就看到「索引里还没有文件」，
+                不知道是哪儿的问题。这里直接把下一步给成按钮。 */}
+            {files === 0 && (
+              <div className="mt-2.5 flex items-start gap-2">
+                <span className="flex-1 text-[11.5px] leading-relaxed text-sub">{t('ob_zero_hint')}</span>
+                <button
+                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-[11.5px] font-medium text-white"
+                  onClick={() => void openSettings()}
+                >
+                  {t('ob_pick_folder')}
+                </button>
+              </div>
+            )}
           </div>
         )}
 
         {/* 按钮：建好/看过之后给 Listary 式两个大按钮 */}
         <div className="mt-5 flex items-center justify-between gap-3">
-          <button className="text-[11.5px] text-sub hover:text-ink" onClick={() => void openSettings()}>
-            {t('ob_open_settings')}
+          <button className="text-[11.5px] text-sub hover:text-ink" onClick={() => void close()}>
+            {t('ob_tour_skip')}
           </button>
           <div className="flex gap-2">
-            <button className="rounded-lg border border-line px-4 py-2 text-[12.5px] text-sub hover:text-ink" onClick={() => void close()}>
+            <button className="rounded-lg border border-line px-4 py-2 text-[12.5px] text-sub hover:text-ink"
+              onClick={() => void close()}>
               {t('ob_start_search')}
             </button>
-            <button className="rounded-lg bg-accent px-4 py-2 text-[12.5px] font-medium text-white" onClick={() => void openMini()}>
-              {t('ob_open_quick')}
-            </button>
+            {tour < 3 ? (
+              <button className="rounded-lg bg-accent px-5 py-2 text-[12.5px] font-medium text-white"
+                onClick={() => setTour(tour + 1)}>
+                {t('ob_tour_next')}
+              </button>
+            ) : (
+              <button className="rounded-lg bg-accent px-5 py-2 text-[12.5px] font-medium text-white"
+                onClick={() => void openMini()}>
+                {t('ob_tour_start')}
+              </button>
+            )}
           </div>
         </div>
 

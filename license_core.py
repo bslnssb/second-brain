@@ -164,11 +164,37 @@ PREFIX = 'SB1'
 EDITION_FREE = 'free'
 EDITION_PRO = 'pro'
 
+# ── 功能位（第 293 项定调，改这里之前先读下面两段）────────────────────
+#
+# 【永久免费，永远不许加功能位】—— 决定「搜不搜得到」，加了就是自毁口碑：
+#   · 文件监听 / 增量索引 / 定时扫描
+#   · 全盘与任意文件夹索引
+#   · 入库 OCR（扫描件抽正文，brain.index 内联那条）
+#   · 搜索、预览、单篇「重新识别」
+#   · 批量 OCR 队列（补历史/修失败；它本质是补齐索引，不是增值特权）
+#
+# 【Pro 才收钱】—— 只卖「成批输出 / 组织 / 共享 / 商用」，不动搜索能力：
+#   · export      导出 Excel / CSV（已有 pro/xlsx_writer.py）
+#   · multi_lib   多库 / 多工作区（规划）
+#   · net_index   网络盘 / NAS / 移动库索引（规划）
+#   · commercial  商用许可（由码的类型 pro/team 自动带出，不用签在 f 里）
 FEATURE_EXPORT = 'export'
-FEATURE_OCR_BATCH = 'ocr_batch'
+FEATURE_OCR_BATCH = 'ocr_batch'     # ⚠️ 历史遗留位：当前**不门控**，见 brain docstring
 FEATURE_MULTI_LIB = 'multi_lib'
 FEATURE_TEMPLATES = 'templates'
-ALL_FEATURES = (FEATURE_EXPORT, FEATURE_OCR_BATCH, FEATURE_MULTI_LIB, FEATURE_TEMPLATES)
+FEATURE_NET_INDEX = 'net_index'
+FEATURE_COMMERCIAL = 'commercial'
+ALL_FEATURES = (FEATURE_EXPORT, FEATURE_OCR_BATCH, FEATURE_MULTI_LIB,
+                FEATURE_TEMPLATES, FEATURE_NET_INDEX, FEATURE_COMMERCIAL)
+
+# 码的类型 → 计划名。trial 算 Pro 体验（功能全开），但不带商用许可。
+PLAN_BY_KIND = {'pro': 'pro', 'trial': 'pro', 'team': 'team'}
+COMMERCIAL_KINDS = ('pro', 'team')
+
+
+def plan_of(kind):
+    """码类型 → 计划名（free / pro / team）。空/未知一律 free。"""
+    return PLAN_BY_KIND.get(str(kind or '').strip().lower(), 'free')
 
 
 def _b64e(raw):
@@ -200,9 +226,7 @@ def make_code(seed, kind='pro', name='', ident='', exp='', features='*'):
 
 def _result(valid, reason, payload=None, edition=EDITION_FREE):
     payload = payload or {}
-    feats = payload.get('f') or []
-    if '*' in feats:
-        feats = list(ALL_FEATURES)
+    # 功能位展开只在 _features_of 里做一次，这里别重复算（第 293 项清理）
     return {
         'valid': bool(valid),
         'reason': reason,
@@ -212,8 +236,22 @@ def _result(valid, reason, payload=None, edition=EDITION_FREE):
         'ident': payload.get('u', '') if valid else '',
         'exp': payload.get('e', '') if valid else '',
         'issued': payload.get('i', '') if valid else '',
-        'features': [f for f in feats if f in ALL_FEATURES] if valid else [],
+        'features': _features_of(payload, valid),
+        'plan': plan_of(payload.get('t')) if valid else 'free',
     }
+
+
+def _features_of(payload, valid):
+    """有效码的功能位；pro/team 自动带 commercial（省得签发时漏写）。"""
+    if not valid:
+        return []
+    feats = payload.get('f') or []
+    if '*' in feats:
+        # 第 293 项： '*' = 全部功能位，但**不含** commercial（商用只由 pro/team 给）
+        feats = [f for f in ALL_FEATURES if f != FEATURE_COMMERCIAL]
+    # 商用位**不**在这里补：features 只反映签发内容，
+    # commercial 由 plan（pro/team）推导，见 brain.license_feature。
+    return [f for f in feats if f in ALL_FEATURES]
 
 
 def parse_code(code, pubkey_hex, today=None, hwid=None):

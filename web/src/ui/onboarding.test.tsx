@@ -77,7 +77,9 @@ describe('Onboarding', () => {
     renderOb()
     fireEvent.click(await screen.findByText(t('ob_start_search')))
     await waitFor(() => expect(screen.getByText(t('ob_mark_err'))).toBeTruthy())
-    expect(screen.getByText(t('ob_welcome'))).toBeTruthy()
+    // 第 208 项改名的副产物：以前 ob_tour_t1 英文与 ob_welcome 恰好同串，
+    // 这条断言碰巧能匹配到教程页标题；现在分页标题是 tagline，改断言到真正的可见元素
+    expect(screen.getByText(t('ob_tour_t1'))).toBeTruthy()
     expect(posts).toContainEqual({ welcome_seen: true })
   })
 
@@ -156,5 +158,26 @@ describe('Onboarding', () => {
     // 进度条容器内不该再有无定形动画条（状态点上的 animate-pulse 不算）
     const bar = document.querySelector('.h-1.overflow-hidden .animate-pulse')
     expect(bar).toBeNull()
+  })
+
+  /** 第 346 项回归锁：建库完成 ≠ 教程可以自己关掉。
+   *  上一版在 done 阶段挂 2.4s 定时器 → 用户「还没点教程就没了」「刚点下一步就没了」。 */
+  it('建库完成后教程不会自己消失，且空库时给出「选索引文件夹」入口', async () => {
+    installFetch({
+      firstrun: [
+        { need: true },
+        { need: false, state: 'busy', stage: 'names', files: 0 },
+        { need: false, state: 'done', files: 0, docs: 0 },
+      ],
+      settings: { hotkey: true, theme: 'auto' },
+    })
+    renderOb()
+    // 轮询命中 done 后应停在教程第 1 页
+    expect(await screen.findByText(t('ob_tour_t1'), undefined, { timeout: 4000 })).toBeTruthy()
+    // 老实现会在这之后 2.4s 内自动隐藏：等过一个轮询周期 + 余量，教程必须还在
+    await new Promise((r) => setTimeout(r, 3600))
+    expect(screen.queryByText(t('ob_tour_t1'))).not.toBeNull()
+    expect(screen.getByText(t('ob_zero_hint'))).toBeTruthy()
+    expect(screen.getByText(t('ob_pick_folder'))).toBeTruthy()
   })
 })

@@ -1,0 +1,97 @@
+name: macos-port
+
+# 目的：把 GitHub 的 mac / linux runner 当成**免费的移植测试机**。
+#
+# 现在还没有 mac 版安装包：PyInstaller 不能跨平台编译，而且托盘 / 热键 / 剪贴板 / 4 个覆盖窗
+# 这些还是 Win32 实现（见 CROSSPLATFORM.md 的 P3~P6）。但这条 job 能立刻回答一个关键问题：
+#   **Windows 上全绿的 1132 条测试，在 mac 上到底挂多少条？**
+# 这份「挂掉的清单」就是移植的施工顺序，比拍脑袋排优先级靠谱。
+#
+# 三条硬约定：
+#   1. 全部 report-only（continue-on-error / || true），绝不拦 push —— 这是探测器，不是门禁。
+#   2. 依赖不读 requirements.txt（那里面还是旧的 rapidocr-onnxruntime），按现在真正的依赖装。
+#   3. pythonnet / clr_loader 是 pywebview 的 **Windows 后端**，mac/linux 上装不了也不用装
+#      （pywebview 在 darwin 上会自动拉 pyobjc）。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'plat/**'
+      - 'brain.py'
+      - 'app_window.py'
+      - 'ocr_engine.py'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - '.github/workflows/macos.yml'
+
+jobs:
+  probe:
+    name: probe ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-13, ubuntu-latest]   # macos-14 = arm64，macos-13 = x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 装依赖（按真实依赖装，不读 requirements.txt）
+        continue-on-error: true
+        run: |
+          python -m pip install -U pip wheel
+          python -m pip install \
+            pywebview onnxruntime pypdfium2 zstandard pillow numpy \
+            opencv-python-headless shapely pyclipper rapidocr omegaconf pypdf
+
+      - name: 平台层契约测试（这一条**不许** continue-on-error，它本来就该在任何平台全绿）
+        run: python -m unittest tests.test_plat_382 -v
+
+      - name: 全量单测（report-only）
+        id: suite
+        run: |
+          set +e
+          python -m unittest discover -s tests -v > tests_${{ matrix.os }}.log 2>&1
+          rc=$?
+          echo "exit=$rc"
+          tail -40 tests_${{ matrix.os }}.log
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: import 冒烟（哪些模块在这个平台上根本进不来）
+        run: |
+          python - <<'PY'
+          import importlib
+          mods = [
+              'plat', 'plat.shell', 'plat.paths',
+              'brain', 'app_window', 'ocr_engine', 'pdf_engine', 'scan_docs',
+              'tray', 'hotkey', 'clipboard_mgr', 'snip_overlay', 'snip_card',
+              'floating_ball', 'quick_switch', 'setup_app', 'uninstall',
+          ]
+          ok = fail = 0
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+                  print(f'[OK]   {m}')
+                  ok += 1
+              except BaseException as e:            # noqa: BLE001 —— 连 SystemExit 都要看见
+                  print(f'[FAIL] {m}: {type(e).__name__}: {e}')
+                  fail += 1
+          print(f'\n导入通过 {ok} / 失败 {fail}')
+          PY
+
+      - name: 留日志给上面看
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.os }}
+          path: tests_*.log
+          if-no-files-found: ignore
+          retention-days: 14

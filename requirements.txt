@@ -5,3 +5,6 @@ rapidocr-onnxruntime>=1.2   # 离线中文 OCR（模型内置，装好后零联�
 
 # 桌面窗口版依赖（可选；不装则用浏览器界面）
 pywebview>=4.4
+
+# 正文压缩（体积评估 #3：doc_rec 里 zstd 存正文，老库不用也不影响）
+zstandard>=0.23

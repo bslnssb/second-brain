@@ -10,6 +10,8 @@
   /* 自绘标题栏的高度：弹窗遮罩从这条线往下画，别盖住标题栏（第 189 项）。
      默认 0px（没有自绘标题栏时遮罩照旧铺满整窗），App 按 /api/ping.titlebar 改。 */
   --sb-title: 0px;
+  /* 壁纸开启时文字描边用：浅色主题白光、深色主题黑光 */
+  --sb-glow: 255 255 255;
 }
 
 [data-theme='dark'] {
@@ -56,6 +58,30 @@ body {
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* 全局壁纸开启时，承载文字的区域不能跟着透明（第 192 项）。
+   壁纸层在 z-0、根容器 z-10 且底色被放开；顶栏/侧栏/列表/状态栏若不垫底，
+   文字会直接压在图片上，浅色和深色壁纸都会把字吃掉。
+   垫一层半透明主题底色：文字始终有稳定对比度，壁纸仍能透出。
+   颜色走 --sb-bg，所以自定义配色与深浅主题都自动跟随，不用再写第二套。 */
+.wall-on .sb-readable {
+  /* 第 195 项：遮罩强度由可见度滑杆控制（App 把 --sb-scrim 设到 documentElement）。
+     以前写死 0.72，可见度拉到 100% 也只能透出 28%，用户看到的就是「拉满也几乎看不见」。 */
+  background: rgb(var(--sb-bg) / var(--sb-scrim, 0.72));
+  backdrop-filter: blur(6px);
+  /* 现在只留半透明底 + 轻模糊（第 365 项：去掉 `0 0 6px ... / 0.45` 那圈发光晕，
+     它在深色主题下给每个字描了一圈灰边，看上去就是「字糊了」）。 */
+  text-shadow: none;
+}
+
+/* 第 365 项：设置抽屉自己铺了一层壁纸（见 panels.tsx 的 <Wallpaper absolute />），
+   这里给内容区补上与主窗面板**同一套**遮罩（同样由可见度推 --sb-scrim）+ 轻模糊，
+   否则抽屉里的图会比主窗列表亮一倍，浅色壁纸上深色主题的字就看不清了。
+   模糊只作用于壁纸（backdrop），文字本身不带滤镜、也不带 text-shadow 晕。 */
+.wall-on .sb-veil {
+  background: rgb(var(--sb-bg) / var(--sb-scrim, 0.72));
+  backdrop-filter: blur(6px);
+}
 
 /* 正文命中：同一色系的淡底，不做荧光黄——满屏高亮会把「是哪份文件」盖掉 */
 mark.hl {

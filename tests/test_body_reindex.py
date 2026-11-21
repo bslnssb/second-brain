@@ -140,7 +140,7 @@ class BodyReindexTest(unittest.TestCase):
                                lambda pth: ('第二版 正文内容', None)):
             brain._body_apply(list(brain._BODYQ.values()), [])
         con = brain.init_db()
-        body = con.execute('SELECT body FROM docs').fetchone()[0]
+        body = brain.doc_body_get(con, None, p)
         self.assertIn('第二版', body)
         self.assertEqual(con.execute('SELECT COUNT(*) FROM docs').fetchone()[0], 1)  # 不许重复行
         con.close()

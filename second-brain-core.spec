@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 第二大脑 桌面版打包配置（core，不带 OCR，体积小，onedir）
+# Memex 桌面版打包配置（core，不带 OCR，体积小，onedir）
 #
 # 用法：python -m PyInstaller --noconfirm --clean --distpath dist-core \
 #           --workpath build-core second-brain-core.spec

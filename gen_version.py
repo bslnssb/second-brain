@@ -40,12 +40,12 @@ VSVersionInfo(
     StringFileInfo([
       StringTable('080404B0', [
         StringStruct('CompanyName', 'bslnssb'),
-        StringStruct('FileDescription', '第二大脑 · 本地文件搜索（文件名 + 文档正文）'),
+        StringStruct('FileDescription', 'Memex · 本地文件搜索（文件名 + 文档正文）'),
         StringStruct('FileVersion', %r),
-        StringStruct('InternalName', 'SecondBrain'),
+        StringStruct('InternalName', 'Memex'),
         StringStruct('LegalCopyright', 'PolyForm Noncommercial 1.0.0'),
-        StringStruct('OriginalFilename', 'SecondBrain.exe'),
-        StringStruct('ProductName', '第二大脑 (Second Brain)'),
+        StringStruct('OriginalFilename', 'Memex.exe'),
+        StringStruct('ProductName', 'Memex'),
         StringStruct('ProductVersion', %r),
         StringStruct('Comments', 'build %s')
       ])

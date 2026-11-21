@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -19,6 +20,13 @@ class ErrorReportTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
         E.configure(self.d, 'v0.9.55-test')
+        # 屏蔽后台发送线程。_on_error 会起一个 name='errlog-sender' 的线程，
+        # 它抢 _CTX['lock']；本组用例正撞上时 send_pending 会返回
+        # skipped/sent=0，断言就变成竞态（2026-11-16 全量跑时撞出来过一次）。
+        # 用例里本来就把 _post 打了 mock，后台线程毫无意义，直接屏蔽更稳。
+        self._bg = mock.patch.object(E, '_bg_send', lambda *a, **k: None)
+        self._bg.start()
+        self.addCleanup(self._bg.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -122,12 +130,14 @@ class ErrorReportTest(unittest.TestCase):
         self.assertIn('boom', rep['message'])
         self.assertEqual(rep['version'], 'v0.9.55-test')
         md = E.markdown(rep)
-        self.assertIn('第二大脑 · 错误报告', md)
+        self.assertIn('Memex · 错误报告', md)
         self.assertIn('RuntimeError', md)
 
     def test_07_save_list_get_clear_and_cap(self):
+        # 第 277 项：同签名会合并计数，不再是「一份报告一个文件」。
+        # 所以这里每份都给不同 kind —— 测的仍是「总数上限」，不是去重。
         for i in range(E.MAX_KEEP + 6):
-            E.save_report({'v': 1, 'at': str(i), 'kind': 'X', 'where': 'u'})
+            E.save_report({'v': 1, 'at': str(i), 'kind': 'X%d' % i, 'where': 'u'})
         items = E.list_reports()
         self.assertEqual(len(items), E.MAX_KEEP)
         first = items[0]['id']
@@ -141,7 +151,7 @@ class ErrorReportTest(unittest.TestCase):
                        'trace': 't', 'env': {}, 'note': 'n'})
         p = E.export_report()
         self.assertIsNotNone(p)
-        self.assertTrue(p.read_text(encoding='utf-8').startswith('# 第二大脑'))
+        self.assertTrue(p.read_text(encoding='utf-8').startswith('# Memex'))
 
     def test_09_save_conf_and_status_hides_endpoint(self):
         self.ingest('https://example.com/r?k=SECRET')
@@ -184,12 +194,24 @@ class ErrorReportTest(unittest.TestCase):
         self.assertFalse(m.called)
 
     def test_13_send_pending_caps_batch(self):
-        for _ in range(E.MAX_BATCH + 4):
-            E.save_report({'v': 1, 'at': 'x', 'kind': 'X'})
         self.ingest()
-        with mock.patch.object(E, '_post', return_value=True) as m:
-            r = E.send_pending()
+        # 前面某个用例的 _on_error 已经起过后台发送线程（name='errlog-sender'）：
+        # 它会抢走 _CTX['lock']、把队列发空，真实网络失败还会留下退避（conf.next_try），
+        # 三件事都会让本线程拿到 sent=0（偶发红，2026-11-16 第 243 项起就撞过）。
+        # 第 326 项：先等后台线程收工，再把退避清零、队列重铺，最后才测「单次最多几份」。
+        E._CTX['lock'] = threading.Lock()      # 别继承别的用例留下的锁状态
+        for t in threading.enumerate():
+            if t.name == 'errlog-sender':
+                t.join(timeout=10)
+        with mock.patch.object(E, '_bg_send', lambda *a, **k: None):
+            E.clear_reports()
+            for i in range(E.MAX_BATCH + 4):
+                E.save_report({'v': 1, 'at': str(i), 'kind': 'X%d' % i, 'where': 'u'})
+            E.save_conf(dict(E.load_conf(), next_try=0.0, fail_streak=0))
+            with mock.patch.object(E, '_post', return_value=True) as m:
+                r = E.send_pending()
         self.assertEqual(r['sent'], E.MAX_BATCH)
+        self.assertEqual(m.call_count, E.MAX_BATCH)
         self.assertEqual(m.call_count, E.MAX_BATCH)
 
     def test_14_on_error_without_endpoint_never_hooks_network(self):

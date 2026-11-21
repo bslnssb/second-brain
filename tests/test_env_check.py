@@ -240,5 +240,104 @@ class TestEnvMsgs(unittest.TestCase):
         self.assertIn('缺少', ec.judge(info)[0]['title'])
 
 
+class TestProbeDepth(unittest.TestCase):
+    """第 281 项：把 12 项功能体检里「只有壳」的几项钉死。
+
+    踩过的坑：资源探测不声明 restype，64 位下句柄被压成 32 位 → GDI/User 恒为 0，
+    这条判断等于关着；更新通道只看用户从没配过的 update_sources.json → urls 恒为 0，
+    等于没有；免费版没 license 却天天报一条 WARN。这些都是「绿着但没用」。
+    """
+
+    def test_license_free_is_info_not_warn(self):
+        l = lv(ec.judge(mk(license={'state': 'none', 'edition': 'free'})))
+        self.assertEqual('INFO', l.get('license'))
+
+    def test_license_real_failure_still_warns(self):
+        l = lv(ec.judge(mk(license={'state': 'machine_mismatch'})))
+        self.assertEqual('WARN', l.get('license'))
+
+    def test_update_builtin_channel_decides(self):
+        ok = lv(ec.judge(mk(update={'urls': 0, 'builtin': True, 'cur': 'v0.9.55', 'latest': 'v0.9.56'})))
+        self.assertEqual('OK', ok.get('update'))
+        bad = lv(ec.judge(mk(update={'urls': 0, 'builtin': False, 'errors': ['timeout']})))
+        self.assertEqual('WARN', bad.get('update'))
+
+    def test_resources_line_always_shown_with_memory(self):
+        it = [i for i in ec.judge(mk(resources={'threads': 9, 'handles': 120,
+                                                'gdi': 15, 'user': 3,
+                                                'mem_mb': 118, 'peak_mb': 310}))
+              if i['key'] == 'res']
+        self.assertTrue(it, '资源这一行不能在没有 GDI 时整条消失')
+        self.assertIn('118', it[0]['title'])
+        self.assertIn('310', it[0]['title'])
+
+    def test_index_body_mismatch_warns(self):
+        l = lv(ec.judge(mk(index_health={'docs': 1000, 'files': 9000, 'fts': 300, 'ok': True,
+                                        'wal_mb': 0.1, 'free_pct': 2})))
+        self.assertEqual('WARN', l.get('idx_fts'))
+
+    def test_libsets_problem_warns(self):
+        l = lv(ec.judge(mk(libsets={'n': 1, 'active': 'default', 'writable': False,
+                                    'sets': [{'id': 'default', 'db': True}]})))
+        self.assertEqual('WARN', l.get('libsets'))
+
+    def test_dir_writable_really_writes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(ec._dir_writable(d))
+            self.assertFalse(ec._dir_writable(Path(d) / 'nope'))
+
+    def test_probe_libsets_reports_writable_and_sync(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            got = ec._probe_libsets(d)
+            self.assertIn('writable', got)
+            self.assertIn('sync', got)
+            self.assertTrue(got['writable'])
+
+    def test_every_m_key_exists_in_english(self):
+        """M('key') 用到的键必须真的在 _EN 里 —— 缺一个就静默回落中文，
+        英语/西语界面里那一行突然出现中文（用户截图里就是这样被抓到的）。"""
+        import re
+        from pathlib import Path
+        src = Path(ec.__file__).read_text(encoding='utf-8')
+        used = set(re.findall(r"M\('([a-z0-9_]+)'", src))
+        self.assertTrue(used)
+        self.assertEqual(sorted(used - set(ec._EN)), [])
+
+    def _make_db(self, d, n=50):
+        import sqlite3
+        p = Path(d) / 'brain.db'
+        con = sqlite3.connect(str(p))
+        con.execute('CREATE TABLE docs (rowid_ INTEGER PRIMARY KEY, body TEXT)')
+        for i in range(n):
+            con.execute('INSERT INTO docs (body) VALUES (?)', ('x' * 20,))
+        con.commit()
+        con.close()
+        return p
+
+    def test_header_check_is_cheap_and_correct(self):
+        """深度体检只做 header 检查（quick_check 2.4GB 要 28–39s，塞不进按钮）。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = self._make_db(d)
+            st, size = ec._db_header_check(str(p))
+            self.assertEqual('ok', st)
+            self.assertEqual(p.stat().st_size, size)
+            self.assertEqual('missing', ec._db_header_check(str(Path(d) / 'nope.db'))[0])
+
+    def test_full_verify_writes_state(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = self._make_db(d)
+            res = ec.full_verify(str(p), data_dir=d)
+            self.assertEqual('ok', res['state'])
+            self.assertTrue(res['ok'])
+            got = ec.read_verify_state(d)
+            self.assertEqual('ok', got.get('state'))
+            self.assertFalse(got.get('stale'))
+            self.assertTrue(ec.verify_state_path(d).is_file())
+
+
 if __name__ == '__main__':
     unittest.main()

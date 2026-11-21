@@ -19,10 +19,27 @@ import queue
 import threading
 import time
 
+# 第 277 项：热键埋点。低级键盘钩子被杀软拦掉时只会静默 return None。
+try:
+    import feature_metrics as _metrics
+except Exception:                                     # pragma: no cover
+    _metrics = None
+
+
+def _hk(status, mode=None, err=''):
+    if _metrics is None:
+        return
+    try:
+        _metrics.add('hotkey', status, sub=str(mode or '')[:12], err=str(err)[:120])
+    except Exception:
+        pass
+
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
 VK_CONTROL, VK_LCONTROL, VK_RCONTROL = 0x11, 0xA2, 0xA3
+VK_SPACE = 0x20
+VK_MENU = 0x12
 HC_ACTION = 0
 
 
@@ -55,15 +72,18 @@ else:                                    # 非 Windows：导入即可，start() 
     user32 = kernel32 = None
 
 
-class DoubleCtrl:
-    """启动后常驻：双击 Ctrl → callback()。
+class GlobalHotkey:
+    """启动后常驻：全局热键 → callback()。
 
-    gap      两次抬起之间的最大间隔（秒），默认 0.5；再大就把「想按两次」和「手慢」混了
-    cooldown 触发后多久内不再触发，避免三连击里最后一次又被算成新的一对
+    支持三种唤出模式：
+    - 'double_ctrl': 双击 Ctrl（默认）
+    - 'alt_space': Alt + Space（拦截系统菜单）
+    - 'ctrl_space': Ctrl + Space
     """
 
-    def __init__(self, callback, gap=0.5, cooldown=0.35):
+    def __init__(self, callback, mode='double_ctrl', gap=0.5, cooldown=0.35):
         self.callback = callback
+        self.mode = mode or 'double_ctrl'
         self.gap = gap
         self.cooldown = cooldown
         self._q = queue.SimpleQueue()
@@ -73,6 +93,10 @@ class DoubleCtrl:
         self.ok = False
         self.error = ''
 
+    def set_mode(self, mode):
+        self.mode = mode or 'double_ctrl'
+        self._state = {'ctrl': False, 'dirty': False, 'last': 0.0, 'fired': 0.0}
+
     # ---- 钩子回调（必须在 1ms 级返回） ----
     def _on_key(self, nCode, wParam, lParam):
         try:
@@ -80,26 +104,50 @@ class DoubleCtrl:
                 kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 vk = kb.vkCode
                 st = self._state
-                if vk in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL):
-                    if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                        if not st['ctrl']:
-                            st['dirty'] = False
-                        st['ctrl'] = True
-                    elif wParam in (WM_KEYUP, WM_SYSKEYUP) and st['ctrl']:
-                        st['ctrl'] = False
-                        if st['dirty']:
-                            st['last'] = 0.0          # 中间打过字，这一对不算
-                        else:
-                            now = time.monotonic()
-                            if 0 < now - st['last'] <= self.gap:
-                                st['last'] = 0.0
-                                if now - st['fired'] > self.cooldown:
-                                    st['fired'] = now
-                                    self._q.put(1)
+                now = time.monotonic()
+                mode = self.mode
+
+                if mode == 'alt_space':
+                    # Alt+Space 检测
+                    if vk == VK_SPACE and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        alt_down = bool(kb.flags & 0x20) or bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+                        if alt_down:
+                            if now - st['fired'] > self.cooldown:
+                                st['fired'] = now
+                                self._q.put(1)
+                            return 1  # 拦截 Alt+Space，防止触发系统窗口菜单
+
+                elif mode == 'ctrl_space':
+                    # Ctrl+Space 检测
+                    if vk == VK_SPACE and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+                        if ctrl_down:
+                            if now - st['fired'] > self.cooldown:
+                                st['fired'] = now
+                                self._q.put(1)
+                            return 1  # 拦截 Ctrl+Space
+
+                else:
+                    # 默认 'double_ctrl'
+                    if vk in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL):
+                        if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                            if not st['ctrl']:
+                                st['dirty'] = False
+                            st['ctrl'] = True
+                        elif wParam in (WM_KEYUP, WM_SYSKEYUP) and st['ctrl']:
+                            st['ctrl'] = False
+                            if st['dirty']:
+                                st['last'] = 0.0          # 中间打过字，这一对不算
                             else:
-                                st['last'] = now
-                elif wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) and st['ctrl']:
-                    st['dirty'] = True
+                                if 0 < now - st['last'] <= self.gap:
+                                    st['last'] = 0.0
+                                    if now - st['fired'] > self.cooldown:
+                                        st['fired'] = now
+                                        self._q.put(1)
+                                else:
+                                    st['last'] = now
+                    elif wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) and st['ctrl']:
+                        st['dirty'] = True
         except Exception:
             pass                          # 钩子里绝不能抛异常，否则整条输入链都会受影响
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -144,13 +192,18 @@ class DoubleCtrl:
     def start(self):
         if user32 is None:
             self.error = 'not-windows'
+            _hk('fail', self.mode, 'not-windows')
             return None
         self._ready = threading.Event()
         threading.Thread(target=self._run, daemon=True, name='hk-hook').start()
         self._ready.wait(3.0)
         if not self.ok:
+            # 第 277 项：装不上低级键盘钩子（被杀软拦、别的程序抢先）是静默失败，
+            # 用户只会觉得「双击 Ctrl 没反应」。
+            _hk('fail', self.mode, self.error or 'hook-failed')
             return None
         threading.Thread(target=self._consume, daemon=True, name='hk-fire').start()
+        _hk('ok', self.mode)
         return self
 
     def stop(self):
@@ -163,6 +216,14 @@ class DoubleCtrl:
         self.ok = False
 
 
+DoubleCtrl = GlobalHotkey
+
+
+def start_hotkey(callback, mode='double_ctrl', gap=0.5):
+    """便捷入口：装好全局热键并返回句柄；装不上返回 None（调用方忽略即可，不影响其他功能）。"""
+    return GlobalHotkey(callback, mode=mode, gap=gap).start()
+
+
 def start_double_ctrl(callback, gap=0.5):
-    """便捷入口：装好并返回句柄；装不上返回 None（调用方忽略即可，不影响其他功能）"""
-    return DoubleCtrl(callback, gap=gap).start()
+    """向下兼容旧接口。"""
+    return start_hotkey(callback, mode='double_ctrl', gap=gap)
