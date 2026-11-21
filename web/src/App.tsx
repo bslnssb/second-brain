@@ -79,6 +79,32 @@ function RowIcon({ row }: { row: Row }) {
   return <IconFile size={15} />
 }
 
+/** 网格格子里的图：缩略图取不到（204/错误）就退回该类型的图标。
+ *  第 393 项：第 392 项让网格不再给 Office 文档排转换，204 一来 <img> 只是被隐藏，
+ *  格子里就剩一块白 —— 用户截图「那么多图标都无法显示」就是这个。 */
+function GridThumb({ row }: { row: Row }) {
+  const [bad, setBad] = useState(false)
+  if (bad) {
+    return (
+      <span className="scale-[1.8]">
+        <RowIcon row={row} />
+      </span>
+    )
+  }
+  return (
+    <img
+      src={`/api/thumb?p=${encodeURIComponent(row.p)}&s=1`}
+      alt=""
+      /* 第 316 项：首页放到 200 条，缩略图必须跟着滚才取，
+         否则一进页面就是 200 个 /api/thumb 并发（313 那次「未响应」的教训）。 */
+      loading="lazy"
+      decoding="async"
+      className="max-h-full max-w-full object-contain"
+      onError={() => setBad(true)}
+    />
+  )
+}
+
 /** 一行结果的「类型」：文件夹 / 文档·PDF / 图片·PNG / 应用·EXE……
  *  这张表必须和 brain.py 的 `_KIND_EXTS` 一模一样 —— 少一个扩展名，用户选了那一类
  *  就搜不到（iPhone 的 .heic 曾经整个漏在「图片」外面）。preflight 逐项比对两边。 */
@@ -2031,18 +2057,7 @@ export default function App() {
                 >
                   <div className="mb-1 grid h-[86px] place-items-center overflow-hidden rounded bg-card/60 text-sub">
                     {THUMB_EXT.includes(ext) ? (
-                      <img
-                        src={`/api/thumb?p=${encodeURIComponent(r.p)}&s=1`}
-                        alt=""
-                        /* 第 316 项：首页放到 200 条，缩略图必须跟着滚才取，
-                           否则一进页面就是 200 个 /api/thumb 并发（313 那次「未响应」的教训）。 */
-                        loading="lazy"
-                        decoding="async"
-                        className="max-h-full max-w-full object-contain"
-                        onError={(e) => {
-                          (e.currentTarget as HTMLImageElement).style.display = 'none'
-                        }}
-                      />
+                      <GridThumb row={r} />
                     ) : (
                       <span className="scale-[1.8]"><RowIcon row={r} /></span>
                     )}
