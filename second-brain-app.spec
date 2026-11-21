@@ -68,7 +68,7 @@ if Path('licenses').is_dir():
 # win32file 是 v0.9.47 实时索引用的（brain._watch_worker 里函数内 import），
 # 不列出来 PyInstaller 不会收 —— 源码跑得好好的，exe 一启动监听就静默失败。
 hiddenimports += ['PIL.Image', 'cv2', 'numpy', 'scan_docs', 'selftest', 'env_check', 'env_msgs',   # 体检文案的西/葡/印地语表（环境体检要五语言）
-                  'plat', 'plat.shell', 'plat.paths', 'plat.win',   # 第 382 项：平台抽象层（brain 静态 import，仍显式声明备用）
+                  'plat', 'plat.shell', 'plat.paths', 'plat.win', 'doc_render',   # 第 382 项：平台抽象层（brain 静态 import，仍显式声明备用）
                   'ocr_engine',    # 第 380 项：OCR 统一入口（brain/snip_ocr/selftest 都走它）
                   'hotkey', 'tray', 'pypinyin', 'license_core', 'libsets',
                   'typewatch', 'quick_switch',   # 第 194/197 项：函数内 import 的 Win32 模块
@@ -172,4 +172,5 @@ coll = COLLECT(
     upx_exclude=[],
     name='Memex',
 )
+
 

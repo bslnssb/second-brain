@@ -71,6 +71,8 @@ import scan_docs
 # 统一走平台层（Windows 行为不变，mac/linux 由 plat/shell.py 分派）。
 import plat.shell as plat_shell
 import plat.paths as plat_paths
+# 第 385 项：Word/Excel/PPT 借本机 Office/WPS 转 PDF 出页图（详见 doc_render.py 顶部）
+import doc_render
 
 # 第 243 项：音频时长探测（纯标准库，不依赖 mutagen/ffmpeg）。
 import audio_probe
@@ -1481,7 +1483,7 @@ def sys_locale_info():
 def app_dir():
     """放数据的地方（数据库/settings/scope）——Windows 上默认还是程序所在目录。
 
-    写不进去时退到 `%LOCALAPPDATA%\SecondBrain\data`（老注释里的原因：exe 放在只读位置、
+    写不进去时退到 `%LOCALAPPDATA%\\SecondBrain\\data`（老注释里的原因：exe 放在只读位置、
     从压缩包直接双击、目录被安全软件锁住时，第一次查库就报
     "attempt to write a readonly database"，窗口里只剩「127.0.0.1 未发送任何数据」）。
 
@@ -13442,8 +13444,16 @@ def _shell_thumb_png(path, size=256):
 
 
 def pdf_pages(path):
-    """PDF 总页数（拿不到就 0）。第 325 项：详情栏要显示「12 / 36」。"""
+    """PDF 总页数（拿不到就 0）。第 325 项：详情栏要显示「12 / 36」。
+
+    第 385 项：Word/Excel/PPT 报的是「转出来的那份 PDF」的页数，
+    这样详情栏的翻页器和 PDF 完全共用一套。"""
     try:
+        _ext = os.path.splitext(str(path or ''))[1].lower()
+        if _ext != '.pdf' and doc_render.is_office(path):
+            path = doc_render.pdf_for(path, app_dir()) or ''
+            if not path:
+                return 0
 
         import pdf_engine as pymupdf
 
@@ -13528,6 +13538,24 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
         return hit
 
     ext = os.path.splitext(path)[1].lower()
+
+    # 第 385 项：Word/Excel/PPT 借 Office/WPS 先转 PDF，再走下面同一个 PDF 分支出页图。
+    # 转不出来（没装 Office/WPS、或者转换超时）就记一次失败冷却，前端会回落到纯文本。
+    if doc_render.is_office(path):
+
+        _pdf = doc_render.pdf_for(path, app_dir())
+
+        if not _pdf:
+
+            with THUMB_LOCK:
+
+                THUMB_FAIL[k] = time.time()
+
+            return None
+
+        path = _pdf
+
+        ext = '.pdf'
 
     png = None
 

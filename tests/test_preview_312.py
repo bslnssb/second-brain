@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""第 312 项（详情面板预览）+ 第 313 项（Office 缩略图回滚）的边界。
+"""第 312 项（详情面板预览）+ 第 313 项（Office 缩略图回滚）+ 第 385 项（Office 页图）的边界。
 
 312 第一版给 Word/Excel/PPT 加了 Shell 缩略图分支，装机后**主窗直接「未响应」**：
 前端缩略图视图对每一格（含 docx/xlsx/pptx）都发 `/api/thumb`，Shell 缩略图处理器
@@ -9,7 +9,10 @@
 
 1. `make_thumb` 对 Office 扩展名必须**秒回 None**，不许再走 Shell；
 2. 图片仍走 PIL、PDF 仍走 pymupdf（不能被回滚误伤）；
-3. `/api/thumb` 注释写清「别再加 Office」，前端详情靠正文首段（`AUTO_PEEK_EXT`）。
+3. `/api/thumb` 注释写清「别再加 Office」。
+
+第 385 项把第 1 条收窄了：Office 不再一律 None，而是**只走 doc_render（本机 Office/WPS 转 PDF，
+带锁 + 超时 + 磁盘缓存）**；转换拿不到就立刻回 None，绝不许回头去碰 Shell 缩略图处理器。
 """
 import io
 import os
@@ -49,18 +52,24 @@ class PreviewThumb312(unittest.TestCase):
         seg = _read('brain.py').split('def make_thumb')[1].split('\ndef ')[0]
         self.assertNotIn('OFFICE_THUMB_EXTS', seg)
 
-    def test_office_returns_none_fast(self):
-        """docx/xlsx/pptx 必须立刻 None，不能等 Shell 处理器（线程就靠这个不被占死）。"""
+    def test_office_without_engine_returns_none_fast(self):
+        """第 385 项改口径：Office 现在**允许出图**，但只在「转换能成」时出。
+
+        这里把 doc_render.pdf_for 打成 None（= 机器上没 Office/WPS），必须立刻回 None，
+        绝不能退回去调 Shell 缩略图处理器 —— 那才是 312 卡死的真源头。
+        """
+        from unittest import mock
         d = tempfile.mkdtemp(prefix='memex313_')
         for ext in ('docx', 'xlsx', 'pptx'):
             p = os.path.join(d, 'a.' + ext)
             with io.open(p, 'wb') as f:
                 f.write(b'not a real office file')
-            t0 = time.time()
-            out = brain.make_thumb(p, 320, 400)
-            dt = time.time() - t0
+            with mock.patch.object(brain.doc_render, 'pdf_for', return_value=None):
+                t0 = time.time()
+                out = brain.make_thumb(p, 320, 400)
+                dt = time.time() - t0
             self.assertIsNone(out, ext)
-            self.assertLess(dt, 0.5, '%s 用了 %.2fs，说明又去调 Shell 了' % (ext, dt))
+            self.assertLess(dt, 0.3, '%s 用了 %.2fs，说明绕过了 doc_render 去调别的' % (ext, dt))
 
     def test_image_still_takes_pil_branch(self):
         d = tempfile.mkdtemp(prefix='memex312_')
@@ -89,8 +98,18 @@ class PreviewThumb312(unittest.TestCase):
         body = m.group(1)
         for e in ('png', 'pdf'):
             self.assertIn("'%s'" % e, body)
-        # Word/Excel 必须走正文首段，而不是硬画一张图
-        self.assertNotIn("'docx'", body)
+        # 第 385 项：Word/PPT 出页图（后端先转 PDF）。
+        # Excel 不在页图名单里 —— 宽表印成 PDF 只有左上角一小块（实测 10 页 9 页空），
+        # 所以 xls/xlsx/et 改走前端单元格表格（INLINE_PRIMARY）。
+        for e in ('doc', 'docx', 'ppt', 'pptx'):
+            self.assertIn("'%s'" % e, body)
+        for e in ('xls', 'xlsx', 'et'):
+            self.assertNotIn("'%s'" % e, body)
+        self.assertRegex(src, r"const INLINE_PRIMARY = \[(.*?)\]")
+        m3 = re.search(r'const INLINE_PRIMARY = \[(.*?)\]', src, re.S)
+        self.assertTrue(m3, 'Excel 走表格的名单不见了')
+        for e in ('xls', 'xlsx', 'et'):
+            self.assertIn("'%s'" % e, m3.group(1))
         m2 = re.search(r'const AUTO_PEEK_EXT = \[(.*?)\]', src, re.S)
         self.assertTrue(m2, '自动读正文的扩展名表不见了')
         for e in ('docx', 'xlsx', 'pptx'):

@@ -61,7 +61,16 @@ import { t, LANGS, setLang, getLang } from '../lib/i18n'
 // 第 270 项：删掉的内置搜索引警要能一键补回（普通用户不会手填三栏加回来）
 import { missingDefaultEngines, restoreDefaultEngines } from '../lib/websearch'
 // 第 379 项：docx/xlsx 的真版面预览（原始文件字节 + 前端渲染）
-import { canLayout } from './docview'
+import {
+  canInline,
+  canLayout,
+  INLINE_MAX_BYTES,
+  readPptxSlides,
+  readSheets,
+  renderDocxInline,
+  type SheetTable,
+  type SlideText,
+} from './docview'
 import { DocViewModal } from './docmodal'
 
 /* ---------------------------------- 设置 ---------------------------------- */
@@ -4003,6 +4012,11 @@ export function Preview({
   const THUMB_IN_DTL = [
     'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tif', 'tiff', 'pdf',
     'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'm4v', 'ts', 'webm', 'mpg', 'mpeg',
+    /* 第 385 项：Word/PPT 也出页图 —— 后端先用本机 Office/WPS 转 PDF，
+       再和 PDF 走同一个渲染分支（文本框、图表、SmartArt 都能画出来）。
+       Excel 不在这里：宽表印成 PDF 只是左上角一小块（实测 10 页里 9 页空白），
+       所以 xlsx 走下面「单元格表格」那套，字才是可读的。 */
+    'doc', 'docx', 'wps', 'rtf', 'ppt', 'pptx', 'dps',
   ]
   const canThumb = row.t !== 'dir' && THUMB_IN_DTL.includes(thumbExt)
   const [thumbBad, setThumbBad] = useState(false)
@@ -4030,7 +4044,10 @@ export function Preview({
      键盘监听 effect 的依赖数组也得在声明之后才能引用它。 */
   const [peek, setPeek] = useState<{ ok: boolean; text?: string; why?: string; matched?: boolean; page?: number; pages?: number } | null>(null)
   const [peeking, setPeeking] = useState(false)
-  const isPdf = String(row.e || row.p.split('.').pop() || '').replace(/^\./, '').toLowerCase() === 'pdf'
+  /* 第 385 项：PDF 与 Office 文档共用一套「页图 + 翻页」。名字仍叫 isPdf，
+     是因为后面所有翻页/展开/箭头逻辑都挂在它身上，改名只会制造噪音。 */
+  const PAGE_EXT = ['pdf', 'doc', 'docx', 'wps', 'rtf', 'ppt', 'pptx', 'dps']
+  const isPdf = PAGE_EXT.includes(String(row.e || row.p.split('.').pop() || '').replace(/^\./, '').toLowerCase())
   const thumbSrc = (xl: boolean) =>
     `/api/thumb?p=${encodeURIComponent(row.p)}&big=1${xl ? '&xl=1' : ''}` +
     (isPdf ? `&pg=${page}&q=${encodeURIComponent(q)}` : '')
@@ -4071,7 +4088,7 @@ export function Preview({
   useEffect(() => {
     setPage(1)
     setPages(0)
-    if (String(row.e || row.p.split('.').pop() || '').replace(/^\./, '').toLowerCase() !== 'pdf') return
+    if (!isPdf) return
     let alive = true
     fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}`, { headers: { 'Sec-Fetch-Site': 'same-origin' } })
       .then((r) => r.json())
@@ -4145,6 +4162,60 @@ export function Preview({
   const DOC_EXT = ['doc', 'docx', 'pdf', 'txt', 'md', 'rtf', 'xls', 'xlsx', 'csv', 'ppt', 'pptx', 'wps', 'et', 'dps', 'epub']
   const e0 = String(row.e || '').replace(/^\./, '').toLowerCase()
   const canPeek = row.t !== 'dir' && (DOC_EXT.includes(e0) || (!e0 && row.t === 'doc'))
+  /* 第 385 项：Word/Excel/PPT 选中就**自动**内嵌预览，不再要求先点「预览版面」。
+     体积超标（>12MB 的扫描件）不自动铺版面 —— 硬铺会把 WebView 卡住，那种还是留给大窗。 */
+  const inlineExt = String(row.e || row.p.split('.').pop() || '').replace(/^\./, '').toLowerCase()
+  /* 第 385 项：Excel 系（xls/xlsx/et）用「单元格表格」当主预览 —— 可读、可滚，
+     不像 Page 图那样被打印分页切成一小块。其余（docx/pptx）先出页图，
+     页图取不到时才回落到纯前端渲染。 */
+  const SHEET_EXT = ['xls', 'xlsx', 'et']
+  const INLINE_PRIMARY = SHEET_EXT
+  const inlinePrimary = INLINE_PRIMARY.includes(inlineExt)
+  const inlineOversize = !!(row.s && row.s > INLINE_MAX_BYTES)
+  const canInlineView = row.t !== 'dir' && canInline(inlineExt) && !inlineOversize
+  type InlinePreview = {
+    st: 'idle' | 'loading' | 'ok' | 'fail'
+    pages?: number
+    sheets?: SheetTable[]
+    slides?: SlideText[]
+    why?: string
+  }
+  const [inline, setInline] = useState<InlinePreview>({ st: 'idle' })
+  const inlineBox = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    setInline({ st: 'idle' })
+    if (!canInlineView) return
+    if (!inlinePrimary && !thumbBad) return   // 有页图就别再铺一份
+    const el = inlineBox.current
+    let alive = true
+    setInline({ st: 'loading' })
+    const pump = async () => {
+      try {
+        if (inlineExt === 'docx') {
+          // 只有 docx 需要容器（docx-preview 直接把页面挂进去）
+          if (!el) {
+            if (alive) setInline({ st: 'idle' })
+            return
+          }
+          const pages = await renderDocxInline(row.p, el, INLINE_MAX_BYTES)
+          if (alive) setInline({ st: 'ok', pages })
+        } else if (SHEET_EXT.includes(inlineExt)) {
+          const sheets = await readSheets(row.p, 60, 14)
+          if (alive) setInline({ st: 'ok', sheets })
+        } else if (inlineExt === 'pptx') {
+          const slides = await readPptxSlides(row.p, 8, INLINE_MAX_BYTES)
+          if (alive) setInline(slides.length ? { st: 'ok', slides } : { st: 'fail', why: '幻灯片里没有可读文字' })
+        } else {
+          if (alive) setInline({ st: 'idle' })
+        }
+      } catch (e) {
+        if (alive) setInline({ st: 'fail', why: (e as Error).message || String(e) })
+      }
+    }
+    void pump()
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row.p, canInlineView, inlineExt, thumbBad, inlinePrimary])
   // 第 312 项：Word/Excel/PPT 不显示图，改成进面板就把正文首段拉出来。
   // 只在这三类上自动拉；txt/pdf 这类本来就长，还是让用户自己点「读取正文」，
   // 免得选一下就扫全表（/api/peek 是按 path 查 docs）。
@@ -4152,6 +4223,8 @@ export function Preview({
   useEffect(() => {
     if (row.t === 'dir' || snip) return
     if (!AUTO_PEEK_EXT.includes(e0)) return
+    if (canThumb && !thumbBad) return   // 第 385 项：已经有页图了，别再拉纯文本
+    if (canInlineView) return           // Excel 表格预览 / 页图失败时的回落，都不重复拉文本
     void loadPeek()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [row.p])
@@ -4288,6 +4361,70 @@ export function Preview({
           <dd className="font-mono text-[11px]">{fmtTime(row.m)}</dd>
         </div>
       </dl>
+      {row.t !== 'dir' && ((canInlineView && (inlinePrimary || thumbBad)) || inlineOversize) && inlineExt && (
+        <div className="mt-3">
+          <div className="mb-1 flex items-center justify-between text-[10px] text-sub">
+            <span>
+              {inlineExt === 'docx' ? '版面预览' : SHEET_EXT.includes(inlineExt) ? '表格预览' : '幻灯片预览'}
+              {inline.st === 'ok' && inline.pages ? ` · ${inline.pages} 页` : ''}
+            </span>
+            {inline.st === 'loading' && <span>{t('dtl_reading')}</span>}
+            {inlineOversize && <span>大于 48MB，不自动渲染</span>}
+          </div>
+          {canInlineView && !inlinePrimary && (
+            <div
+              ref={inlineBox}
+              className="max-h-[46vh] overflow-auto rounded-md border border-line bg-card p-1"
+            />
+          )}
+          {inline.st === 'ok' && inline.sheets && inline.sheets.length > 0 && (
+            <div className="max-h-[46vh] overflow-auto rounded-md border border-line bg-card p-1">
+              {inline.sheets.slice(0, 1).map((sh) => (
+                <div key={sh.name}>
+                  <div className="mb-1 truncate px-1 text-[10px] text-sub">{sh.name}</div>
+                  <table className="w-full border-collapse text-[10px] leading-4">
+                    <tbody>
+                      {sh.rows.slice(0, 25).map((r, ri) => (
+                        <tr key={ri} className={ri === 0 ? 'bg-card font-medium' : ''}>
+                          {r.map((c, ci) => (
+                            <td key={ci} className="max-w-[120px] truncate border border-line px-1 py-0.5 align-top">
+                              {c}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+            </div>
+          )}
+          {inline.st === 'ok' && inline.slides && inline.slides.length > 0 && (
+            <div className="max-h-[46vh] space-y-1 overflow-auto">
+              {inline.slides.map((sl) => (
+                <div key={sl.n} className="rounded-md border border-line bg-card px-2 py-1.5">
+                  <div className="mb-0.5 text-[10px] text-sub">第 {sl.n} 页</div>
+                  <div className="text-[11px] font-medium leading-4">{sl.title}</div>
+                  {sl.lines.length > 0 && (
+                    <ul className="mt-0.5 list-disc pl-4 text-[10px] leading-4 text-ink/80">
+                      {sl.lines.slice(0, 6).map((ln, i) => (
+                        <li key={i} className="truncate">
+                          {ln}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {inline.st === 'fail' && (
+            <div className="rounded-md bg-card px-2 py-1.5 text-[10px] leading-4 text-sub">
+              {inline.why || '预览失败'}
+            </div>
+          )}
+        </div>
+      )}
       {snip ? (
         <div className="mt-3 rounded-md bg-card px-2 py-1.5 text-[11px] leading-5 text-ink/85">
           <div className="mb-1 text-[10px] text-sub">{t('dtl_hit_body')}</div>

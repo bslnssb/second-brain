@@ -54,17 +54,34 @@ describe('Preview 详情面板的预览（第 312 项）', () => {
     expect(container.querySelector('img')).toBeTruthy()
   })
 
-  it('Word / Excel / PPT 不画图，改成自动读正文首段', async () => {
-    const fn = vi.fn(async (_input: RequestInfo | URL) => ({
-      ok: true,
-      status: 200,
-      json: async () => ({ ok: true, text: '第一段正文……', matched: false }),
-    }))
-    vi.stubGlobal('fetch', fn)
-    const { container } = draw('D:\\doc\\方案.docx', 'docx')
+  it('第 385 项：Word / PPT 选中就出页图，不用再点「预览版面」', () => {
+    // 后端先用本机 Office/WPS 转 PDF，再和 PDF 共用「页图 + 翻页」这一套
+    for (const [p, e] of [
+      ['D:\\doc\\方案.docx', 'docx'],
+      ['D:\\doc\\汇报.pptx', 'pptx'],
+    ] as const) {
+      cleanup()
+      const { container } = draw(p, e)
+      const img = container.querySelector('img') as HTMLImageElement
+      expect(img, p).toBeTruthy()
+      expect(img.getAttribute('src'), p).toContain('/api/thumb?p=')
+      expect(img.getAttribute('src'), p).toContain('pg=1')
+    }
+  })
+
+  it('第 385 项：Excel 走单元格表格，不印页图（宽表印出来只有一小块）', async () => {
+    const { container } = draw('D:\\doc\\台账.xlsx', 'xlsx')
     expect(container.querySelector('img')).toBeNull()
-    await waitFor(() => expect(container.textContent).toContain('第一段正文'))
-    expect(fn.mock.calls[0][0]).toContain('/api/peek')
+    expect(container.textContent).toContain('表格预览')
+    // 表格标题里能认出来源文件，且不出现「读一段正文看看」这种兜底按钮
+    expect(container.textContent).toContain('台账.xlsx')
+  })
+
+  it('第 385 项：页图取不到时（没装 Office/WPS）回落成纯前端版面预览', () => {
+    const { container } = draw('D:\\doc\\方案.docx', 'docx')
+    const img = container.querySelector('img') as HTMLImageElement
+    fireEvent.error(img)
+    return waitFor(() => expect(container.textContent).toContain('版面预览'))
   })
 
   it('exe / 音频 / 文件夹：既不画图也不自动读正文', () => {
@@ -188,3 +205,4 @@ describe('Preview 详情面板的预览（第 312 项）', () => {
     await waitFor(() => expect(onStep).toHaveBeenCalledWith(-1))
   })
 })
+
