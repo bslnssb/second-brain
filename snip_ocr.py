@@ -7,6 +7,8 @@
 4. 提供富文本提取、按行结构化解析、一键拷入剪贴板与另存为。
 """
 
+import plat.win  # noqa: F401  ← 第 382 项：非 Windows 上给 ctypes 补 Win32 占位，
+# 让模块「能 import」；功能本身仍要靠 P3~P5 的真实现，现在调用等于空转。
 import ctypes
 import io
 import os

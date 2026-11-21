@@ -68,3 +68,7 @@ pro/
 pro_api.py
 ocr_batch.py
 xlsx_writer.py
+
+# Pro 版测试：测的是私有模块，公开仓库里不许出现
+tests/test_ocr_batch.py
+tests/test_xlsx.py

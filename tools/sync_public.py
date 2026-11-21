@@ -43,14 +43,14 @@ def sha(p: Path) -> str:
 
 def parse_manifest():
     """返回 {'sync','local','build','private'}，值为清单里的原始模式。"""
-    out = {'sync': [], 'local': [], 'build': [], 'private': []}
+    out = {'sync': [], 'local': [], 'build': [], 'private': [], 'skip': []}
     for i, line in enumerate(MANIFEST.read_text(encoding='utf-8').splitlines(), 1):
         s = line.strip()
         if not s or s.startswith('#'):
             continue
         parts = s.split(None, 1)
         if len(parts) != 2 or parts[0] not in out:
-            raise SystemExit('[!] 清单第 %d 行格式不对：%r（应为 "sync|local|build 路径"）' % (i, line))
+            raise SystemExit('[!] 清单第 %d 行格式不对：%r（应为 "sync|local|build|private|skip 路径"）' % (i, line))
         out[parts[0]].append(parts[1].strip())
     return out
 
@@ -100,10 +100,11 @@ def main():
         raise SystemExit('[!] 找不到开发根：%s（这个脚本只能在项目里跑）' % DEV)
 
     mf = parse_manifest()
+    skip = set(mf['skip'])        # 目录规则里要单独排除的文件（如 Pro 版测试，见 check_public 的 PRIVATE_PATHS）
     added, updated, same, missing, stale = [], [], [], [], []
 
     for pattern in mf['sync']:
-        files = expand(DEV, pattern)
+        files = [f for f in expand(DEV, pattern) if f not in skip]
         if not files:
             missing.append(pattern)
             continue
@@ -189,7 +190,8 @@ def main():
     all_pat = mf['sync'] + mf['local'] + mf['build']
     tr = tracked()
     leaked = sorted(p for p in tr if p.startswith('pro/') or p in
-                    ('pro_api.py', 'ocr_batch.py', 'xlsx_writer.py'))
+                    ('pro_api.py', 'ocr_batch.py', 'xlsx_writer.py',
+                     'tests/test_ocr_batch.py', 'tests/test_xlsx.py'))
     if leaked:
         print('\n[!] 私有模块被 git 跟踪（先 git rm --cached 再同步）：')
         for q in leaked:
@@ -199,9 +201,9 @@ def main():
     absent = [p for p in mf['local'] if not p.endswith('/') and not (REPO / p).is_file()]
     absent += [p for p in mf['local'] if p.endswith('/') and not (REPO / p).is_dir()]
 
-    print('清单：%d 条 sync / %d 条 local / %d 条 build / %d 条 private' %
+    print('清单：%d 条 sync / %d 条 local / %d 条 build / %d 条 private / %d 条 skip' %
           (len(mf['sync']), len(mf['local']), len(mf['build']),
-           len(mf['private'])))
+           len(mf['private']), len(mf['skip'])))
     print('开发根：%s\n公开仓库：%s\n' % (DEV, REPO))
     for label, items in (('新增', added), ('更新', updated), ('清掉的旧构建文件', stale),
                          ('缺失', missing),

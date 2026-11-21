@@ -87,6 +87,49 @@ jobs:
           done
           exit 0
 
+      - name: collect 报告（哪些测试文件在这个平台上根本没进来）
+        run: |
+          python - <<'PY'
+          # 全量单测里「import 失败」只算 1 条 _FailedTest，看不出被吞掉多少条，
+          # 所以单独 collect 一遍：逐文件 loadTestsFromModule，拿到真实条数 + 失败清单。
+          import importlib, os, unittest, re
+
+          rows, bad, total = [], [], 0
+          tdir = os.path.join(os.getcwd(), 'tests')
+          files = sorted(f for f in os.listdir(tdir) if f.startswith('test_') and f.endswith('.py'))
+          for f in files:
+              name = 'tests.' + f[:-3]
+              try:
+                  mod = importlib.import_module(name)
+                  n = unittest.defaultTestLoader.loadTestsFromModule(mod).countTestCases()
+                  total += n
+                  rows.append((f[:-3], n, 'OK', ''))
+              except BaseException as e:       # noqa: BLE001
+                  msg = ' '.join(('%s: %s' % (type(e).__name__, e)).split())[:160]
+                  bad.append((f[:-3], msg))
+                  rows.append((f[:-3], 0, 'FAIL', msg))
+
+          print('collect: %d 条，%d/%d 文件失败' % (total, len(bad), len(files)))
+          for n, m in bad:
+              print('[FAIL] %s  %s' % (n, m))
+
+          # 一条 annotation 装下全部失败文件名，免登录可读
+          if bad:
+              print('::error title=collect 失败 ${{ matrix.os }}::%d 条 / %d 文件；失败文件：%s'
+                    % (total, len(bad), '、'.join(n for n, _ in bad)))
+          else:
+              print('::notice title=collect ${{ matrix.os }}::%d 条，全部文件都能 collect' % total)
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as fh:
+                  fh.write('\n### collect 明细\n\n共 %d 条；失败 %d 文件\n\n| 文件 | 条数 | 结果 | 说明 |\n|---|---|---|---|\n'
+                           % (total, len(bad)))
+                  for n, c, st, msg in rows:
+                      fh.write('| `%s` | %d | %s | %s |\n' % (n, c, st, msg.replace('|', '/')))
+          PY
+        continue-on-error: true
+
       - name: import 冒烟（哪些模块在这个平台上根本进不来）
         run: |
           python - <<'PY'

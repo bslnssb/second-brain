@@ -24,6 +24,7 @@ sync  translator.py
 sync  tts.py
 sync  tests/test_346_tts.py
 sync  tests/test_plat_382.py
+sync  tests/test_plat_win_383.py
 # 卸载（第 296 项）：生成 .cmd + 登记「设置→应用」卸载项；漏了它 exe 里 import 直接失败
 sync  uninstall.py
 # 系统程序清单（第 297 项）：设置/cmd/记事本… 不在索引里，查询时补
@@ -207,3 +208,8 @@ sync  tests/test_netproxy_299.py
 
 
 
+sync  tests/
+
+# Pro 版的两个测试不能公开：它们测的是 ocr_batch.py / xlsx_writer.py（PRIVATE_PATHS）。
+skip  tests/test_ocr_batch.py
+skip  tests/test_xlsx.py

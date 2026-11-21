@@ -13,6 +13,8 @@
 否则 Ctrl+C、Ctrl+V 之后紧跟一次单击 Ctrl 就会被误判成双击。
 打字打断时把上一次的计时清零，这样「Ctrl、Ctrl+C、Ctrl」不会连成一次双击。
 """
+import plat.win  # noqa: F401  ← 第 382 项：非 Windows 上给 ctypes 补 Win32 占位，
+# 让模块「能 import」；功能本身仍要靠 P3~P5 的真实现，现在调用等于空转。
 import ctypes
 import ctypes.wintypes as wt
 import queue

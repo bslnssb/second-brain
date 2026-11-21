@@ -124,7 +124,7 @@ def load_words():
 
 
 def parse_manifest():
-    out = {'sync': [], 'local': [], 'build': [], 'private': []}
+    out = {'sync': [], 'local': [], 'build': [], 'private': [], 'skip': []}
     for i, line in enumerate(MANIFEST.read_text(encoding='utf-8').splitlines(), 1):
         s = line.strip()
         if not s or s.startswith('#'):

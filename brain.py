@@ -70,6 +70,7 @@ import scan_docs
 # 第 382 项：打开/定位这类「本机特有动作」不再直接写 os.startfile / explorer，
 # 统一走平台层（Windows 行为不变，mac/linux 由 plat/shell.py 分派）。
 import plat.shell as plat_shell
+import plat.paths as plat_paths
 
 # 第 243 项：音频时长探测（纯标准库，不依赖 mutagen/ffmpeg）。
 import audio_probe
@@ -1478,84 +1479,32 @@ def sys_locale_info():
 
 
 def app_dir():
+    """放数据的地方（数据库/settings/scope）——Windows 上默认还是程序所在目录。
 
-    """放数据的地方（数据库/settings/scope）——默认是程序所在目录。
+    写不进去时退到 `%LOCALAPPDATA%\SecondBrain\data`（老注释里的原因：exe 放在只读位置、
+    从压缩包直接双击、目录被安全软件锁住时，第一次查库就报
+    "attempt to write a readonly database"，窗口里只剩「127.0.0.1 未发送任何数据」）。
 
+    第 384 项：判定逻辑搬到 `plat.paths.pick_data_dir()`（纯函数、可单测），
+    这里只负责**缓存结果 + 保留原来那句提示和 DATA_FALLBACK 语义**。
+    Windows 上的两条路径（程序目录 → LOCALAPPDATA 兜底）逐字未改。
 
-
-    写不进去时自动退到 `%LOCALAPPDATA%\\SecondBrain\\data`：
-
-    用户把 exe 放在只读位置、直接从压缩包里双击、或者目录被安全软件锁住时，
-
-    原来会在第一次查库时报 "attempt to write a readonly database"，
-
-    窗口里只显示「127.0.0.1 未发送任何数据」，看上去就是「打不开」。
-
-    （可用环境变量 SB_DATA_DIR 强制指定。）
-
+    可用环境变量 SB_DATA_DIR 强制指定（给了就照它办，不偷偷换地方）。
     """
-
     if _DATA_DIR:
-
         return _DATA_DIR[0]
 
     global DATA_FALLBACK
 
     base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    picked, used_fallback = plat_paths.pick_data_dir(install=str(base), env=os.environ)
 
-    env_dir = (os.environ.get('SB_DATA_DIR') or '').strip()
+    if used_fallback and picked != str(base):
+        print('[i] 程序目录写不进去，数据改放到：%s' % picked, flush=True)
+        DATA_FALLBACK = True
 
-    if env_dir:
-
-        # 环境变量给了就**照它办**，别偷偷换地方：曾经因为 SB_DATA_DIR 指向的目录
-
-        # 还没建出来，探针失败就默默退到 %LOCALAPPDATA%，结果测试读的是 A、程序写的是 B。
-
-        try:
-
-            Path(env_dir).mkdir(parents=True, exist_ok=True)
-
-        except Exception:
-
-            pass
-
-    pick = Path(env_dir) if env_dir else base
-
-    try:
-
-        probe = pick / '.sb_write_test'
-
-        probe.write_text('ok', encoding='utf-8')
-
-        probe.unlink()
-
-    except Exception:
-
-        try:
-
-            fb = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData/Local'))                 / 'SecondBrain' / 'data'
-
-            fb.mkdir(parents=True, exist_ok=True)
-
-            probe = fb / '.sb_write_test'
-
-            probe.write_text('ok', encoding='utf-8')
-
-            probe.unlink()
-
-            print('[i] 程序目录写不进去，数据改放到：%s' % fb, flush=True)
-
-            DATA_FALLBACK = True
-
-            pick = fb
-
-        except Exception:
-
-            pass
-
-    _DATA_DIR.append(pick)
-
-    return pick
+    _DATA_DIR.append(Path(picked))
+    return Path(picked)
 
 
 

@@ -25,6 +25,8 @@ App 把焦点抢过去之后调 release() 拿回缓冲区，再用 replay() 把�
 """
 from __future__ import annotations
 
+import plat.win  # noqa: F401  ← 第 382 项：非 Windows 上给 ctypes 补 Win32 占位，
+# 让模块「能 import」；功能本身仍要靠 P3~P5 的真实现，现在调用等于空转。
 import ctypes
 import ctypes.wintypes as wt
 import queue

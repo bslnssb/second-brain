@@ -14,6 +14,8 @@
 * 鼠标钩子回调只做「记下坐标 + 排队」，COM 枚举与 Win32 写对话框全放到
   工作线程 —— 钩子里慢一点，整台机器的鼠标都会顿。
 """
+import plat.win  # noqa: F401  ← 第 382 项：非 Windows 上给 ctypes 补 Win32 占位，
+# 让模块「能 import」；功能本身仍要靠 P3~P5 的真实现，现在调用等于空转。
 import ctypes
 import os
 import queue

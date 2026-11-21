@@ -11,6 +11,8 @@
 
 带参数时走命令行（update / selftest / search …），方便打包成 exe 后复用同一入口。
 """
+import plat.win  # noqa: F401  ← 第 382 项：非 Windows 上给 ctypes 补 Win32 占位，
+# 让模块「能 import」；功能本身仍要靠 P3~P5 的真实现，现在调用等于空转。
 import ctypes
 import app_entries
 import ctypes.wintypes  # 第 216 项：ctypes.wintypes 是懒加载属性，模块级导入一次，
