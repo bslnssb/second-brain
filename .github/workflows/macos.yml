@@ -2,16 +2,19 @@ name: macos-port
 
 # 目的：把 GitHub 的 mac / linux runner 当成**免费的移植测试机**。
 #
-# 现在还没有 mac 版安装包：PyInstaller 不能跨平台编译，而且托盘 / 热键 / 剪贴板 / 4 个覆盖窗
-# 这些还是 Win32 实现（见 CROSSPLATFORM.md 的 P3~P6）。但这条 job 能立刻回答一个关键问题：
-#   **Windows 上全绿的 1132 条测试，在 mac 上到底挂多少条？**
-# 这份「挂掉的清单」就是移植的施工顺序，比拍脑袋排优先级靠谱。
+# 现在还没有 mac 版安装包（PyInstaller 不能跨平台编译，见 CROSSPLATFORM.md 的 P3~P6），
+# 但这三件事能立刻回答「Windows 上全绿的 1132 条测试，在 mac 上到底挂多少条」——
+# 那份清单就是移植的施工顺序。
 #
 # 三条硬约定：
-#   1. 全部 report-only（continue-on-error / || true），绝不拦 push —— 这是探测器，不是门禁。
-#   2. 依赖不读 requirements.txt（那里面还是旧的 rapidocr-onnxruntime），按现在真正的依赖装。
-#   3. pythonnet / clr_loader 是 pywebview 的 **Windows 后端**，mac/linux 上装不了也不用装
-#      （pywebview 在 darwin 上会自动拉 pyobjc）。
+#   1. report-only，绝不拦 push（探测发现的问题不该拦住日常提交）。
+#   2. 依赖不读 requirements.txt（那里还是旧的 rapidocr-onnxruntime），按真实依赖装。
+#   3. 结论要**免登录可读**：把失败清单打成 annotation（`::error title=…::`），
+#      日志本身要登录才能看，annotation 走 check-runs API 是公开的。
+#
+# 关于 runner 选型（第 382 项实测）：
+#   macos-13 是 Intel 机型，已经退役/严重缺机器 —— 实测排队 20 分钟起不来，会一直挂着；
+#   所以只留 macos-14（Apple 芯片，覆盖绝大多数 mac 用户）+ ubuntu。
 
 on:
   workflow_dispatch:
@@ -25,6 +28,10 @@ on:
       - 'requirements*.txt'
       - '.github/workflows/macos.yml'
 
+concurrency:
+  group: macos-port-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   probe:
     name: probe ${{ matrix.os }}
@@ -33,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-13, ubuntu-latest]   # macos-14 = arm64，macos-13 = x86_64
+        os: [macos-14, ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -51,47 +58,78 @@ jobs:
             pywebview onnxruntime pypdfium2 zstandard pillow numpy \
             opencv-python-headless shapely pyclipper rapidocr omegaconf pypdf
 
-      - name: 平台层契约测试（这一条**不许** continue-on-error，它本来就该在任何平台全绿）
+      - name: 平台层契约测试（这一条是硬门禁：17 条本来就该在任何平台全绿）
         run: python -m unittest tests.test_plat_382 -v
 
-      - name: 全量单测（report-only）
-        id: suite
+      - name: 全量单测（report-only，结论写进 summary + annotation）
         run: |
           set +e
-          python -m unittest discover -s tests -v > tests_${{ matrix.os }}.log 2>&1
+          python -m unittest discover -s tests -v > suite.log 2>&1
           rc=$?
-          echo "exit=$rc"
-          tail -40 tests_${{ matrix.os }}.log
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          total=$(grep -E "^Ran [0-9]+ tests" suite.log | tail -1)
+          verdict=$(grep -E "^(OK|FAILED)" suite.log | tail -1)
+          {
+            echo "### 全量单测（${{ matrix.os }}）"
+            echo ""
+            echo "- ${total:-没有跑到 Ran 那一行}"
+            echo "- \`${verdict:-没有 OK/FAILED 结论}\`（exit=$rc）"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "== ${total} / ${verdict} / exit=$rc =="
+          # 前 10 条失败打 annotation（GitHub 每个 step 的 annotation 有条数上限）
+          grep -E "^(FAIL|ERROR): " suite.log | head -10 | while IFS= read -r line; do
+            name=$(printf '%s' "$line" | sed -E 's/^(FAIL|ERROR): ([^ ]+).*/\2/')
+            kind=$(printf '%s' "$line" | cut -d: -f1)
+            msg=$(printf '%s' "$line" | cut -c1-150)
+            echo "::error title=${kind} ${name}::${msg}"
+          done
           exit 0
 
       - name: import 冒烟（哪些模块在这个平台上根本进不来）
         run: |
           python - <<'PY'
           import importlib
+          import os
+
           mods = [
               'plat', 'plat.shell', 'plat.paths',
               'brain', 'app_window', 'ocr_engine', 'pdf_engine', 'scan_docs',
               'tray', 'hotkey', 'clipboard_mgr', 'snip_overlay', 'snip_card',
               'floating_ball', 'quick_switch', 'setup_app', 'uninstall',
           ]
-          ok = fail = 0
+          rows, fails = [], []
           for m in mods:
               try:
                   importlib.import_module(m)
-                  print(f'[OK]   {m}')
-                  ok += 1
-              except BaseException as e:            # noqa: BLE001 —— 连 SystemExit 都要看见
-                  print(f'[FAIL] {m}: {type(e).__name__}: {e}')
-                  fail += 1
-          print(f'\n导入通过 {ok} / 失败 {fail}')
+                  rows.append((m, 'OK', ''))
+              except BaseException as e:          # noqa: BLE001 —— 连 SystemExit 都要看见
+                  msg = '%s: %s' % (type(e).__name__, e)
+                  msg = ' '.join(str(msg).split())[:150]
+                  rows.append((m, 'FAIL', msg))
+                  fails.append((m, msg))
+
+          for m, st, msg in rows:
+              print('[%s] %s %s' % (st, m, msg))
+
+          # 免登录可读的结论：前 10 条打成 annotation
+          for m, msg in fails[:10]:
+              print('::error title=import 失败 %s::%s' % (m, msg))
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as f:
+                  f.write('\n### import 冒烟\n\n| 模块 | 结果 | 说明 |\n|---|---|---|\n')
+                  for m, st, msg in rows:
+                      f.write('| `%s` | %s | %s |\n' % (m, st, msg.replace('|', '/')))
+
+          print('\n导入通过 %d / 失败 %d' % (len(rows) - len(fails), len(fails)))
           PY
+        continue-on-error: true
 
       - name: 留日志给上面看
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tests-${{ matrix.os }}
-          path: tests_*.log
+          path: suite.log
           if-no-files-found: ignore
           retention-days: 14
