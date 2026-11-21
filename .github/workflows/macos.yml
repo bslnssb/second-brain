@@ -75,6 +75,9 @@ jobs:
             echo "- \`${verdict:-没有 OK/FAILED 结论}\`（exit=$rc）"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "== ${total} / ${verdict} / exit=$rc =="
+          # 汇总也要打 annotation：日志要登录才能看，annotation 是公开可读的。
+          fails=$(grep -cE "^(FAIL|ERROR): " suite.log)
+          echo "::error title=单测总计 ${{ matrix.os }}::${total} / ${verdict} / 失败与错误共 ${fails} 条"
           # 前 10 条失败打 annotation（GitHub 每个 step 的 annotation 有条数上限）
           grep -E "^(FAIL|ERROR): " suite.log | head -10 | while IFS= read -r line; do
             name=$(printf '%s' "$line" | sed -E 's/^(FAIL|ERROR): ([^ ]+).*/\2/')
