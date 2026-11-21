@@ -21,6 +21,7 @@
 
 import hashlib
 import os
+import shutil
 import threading
 import time
 
@@ -41,6 +42,12 @@ PROGIDS = {
 PPT_SAVE_PDF = 32       # ppSaveAsPDF
 WD_FORMAT_PDF = 17      # wdFormatPDF
 XL_TYPE_PDF = 0         # xlTypePDF
+WD_EXPORT_FROM_TO = 3   # wdExportFromTo：只导一段页
+
+# 第 388 项：详情栏只看得到第 1 页，没必要等整份导完。
+# 实测 180 页的 docx：整份导出 6.8s，只导前 8 页 1.06s（打开 + 数页数才 0.7s）。
+# 所以先导「头一份」（HEAD_PAGES 页）让首屏先出来，整份在后台接着转。
+HEAD_PAGES = 8
 
 APP_IDLE = 120.0        # 引擎实例闲置这么久就 Quit（不让一个后台 WPS 常驻吃内存）
 MAX_QUEUE = 3           # 队列只留最新 3 个任务
@@ -88,6 +95,44 @@ def cache_path(path, base):
     return os.path.join(d, h + '.pdf')
 
 
+def _side_paths(path, base):
+    """(整份 PDF, 头一份 PDF, 元数据 json)，三者同一 sha1 前缀。"""
+    full = cache_path(path, base)
+    if not full:
+        return None, None, None
+    stem = full[:-4]
+    return full, stem + '.head.pdf', stem + '.meta.json'
+
+
+def _read_meta(path, base):
+    """读 {pages, head} —— pages 是整份页数，head 是头一份里已导出的页数（0=整份）。"""
+    try:
+        _full, _head, meta = _side_paths(path, base)
+        if not meta or not os.path.exists(meta):
+            return None
+        import json
+        with open(meta, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return {'pages': int(d.get('pages') or 0), 'head': int(d.get('head') or 0)}
+    except Exception:                    # noqa: BLE001
+        return None
+
+
+def _write_meta(path, base, pages, head):
+    try:
+        _full, _head, meta = _side_paths(path, base)
+        if not meta:
+            return
+        import json
+        tmp = meta + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'pages': int(pages or 0), 'head': int(head or 0)}, f)
+        os.replace(tmp, meta)
+    except Exception:                    # noqa: BLE001
+        pass
+
+
+
 def _sweep(base, keep=200, max_age_days=7):
     """缓存自清：太久没人看、或者文件数太多时，删最老的那批（转换产物，删了能再转）。"""
     d = cache_dir(base)
@@ -124,7 +169,7 @@ def _co():
         return False
 
 
-def _convert_word(app, src, out):
+def _convert_word(app, src, out, box):
     app.Visible = False
     try:
         app.DisplayAlerts = 0
@@ -132,12 +177,25 @@ def _convert_word(app, src, out):
         pass
     doc = app.Documents.Open(src, ReadOnly=True, AddToRecentFiles=False)
     try:
-        doc.SaveAs(out, FileFormat=WD_FORMAT_PDF)
+        total = 0
+        try:
+            total = int(doc.ComputeStatistics(2))     # wdStatisticPages（不导出也能数）
+        except Exception:                # noqa: BLE001
+            total = 0
+        box['pages'] = total
+        if box.get('mode') == 'head' and total > HEAD_PAGES:
+            # 只导前几页：180 页那份从 6.8s 降到 1.06s，详情栏只看得见第 1 页
+            doc.ExportAsFixedFormat(out, WD_FORMAT_PDF, False, 0,
+                                    WD_EXPORT_FROM_TO, 1, HEAD_PAGES)
+            box['head_pages'] = HEAD_PAGES
+        else:
+            doc.ExportAsFixedFormat(out, WD_FORMAT_PDF)
+            box['head_pages'] = total if box.get('mode') == 'head' else 0
     finally:
         doc.Close(False)
 
 
-def _convert_excel(app, src, out):
+def _convert_excel(app, src, out, box):
     try:
         app.Visible = False
     except Exception:                    # noqa: BLE001
@@ -153,14 +211,16 @@ def _convert_excel(app, src, out):
         wb.Close(False)
 
 
-def _convert_ppt(app, src, out):
+def _convert_ppt(app, src, out, box):
     try:
         app.Visible = False           # PowerPoint 一般不允许隐藏，包一层
     except Exception:                 # noqa: BLE001
         pass
     pres = app.Presentations.Open(src, ReadOnly=True, WithWindow=False)
     try:
+        box['pages'] = int(getattr(pres.Slides, 'Count', 0) or 0)
         pres.SaveAs(out, PPT_SAVE_PDF)
+        box['head_pages'] = 0
     finally:
         pres.Close()
 
@@ -227,7 +287,7 @@ def _convert_one(kind, src, out, box):
             box['err'] = '没有可用的 Office/WPS 引擎'
             return False
         try:
-            _CONVERTERS[kind](app, src, out)
+            _CONVERTERS[kind](app, src, out, box)
             if os.path.exists(out) and os.path.getsize(out) > 0:
                 box['engine'] = _APPS.get(kind, {}).get('prog')
                 return True
@@ -248,8 +308,8 @@ def _loop():
             _reap_apps()
             time.sleep(0.25)
             continue
-        key, path, out, kind, base = task
-        box = {}
+        key, path, out, kind, base, mode = task
+        box = {'mode': mode}
         try:
             ok = _convert_one(kind, path, out, box)
         except Exception as e:             # noqa: BLE001
@@ -258,14 +318,34 @@ def _loop():
         with _LOCK:
             _INFLIGHT.discard(key)
         if ok:
+            pages = int(box.get('pages') or 0)
+            head_pages = int(box.get('head_pages') or 0)
+            if mode == 'head':
+                _finish_head(path, base, out, kind, pages, head_pages)
+            else:
+                _write_meta(path, base, pages, 0)
             _sweep(base)
         else:
-            _FAILED[key] = (time.time(), box.get('err') or 'unknown')
+            _FAILED[_norm(path)] = (time.time(), box.get('err') or 'unknown')
             try:
                 print('[i] 文档转 PDF 失败：%s → %s' % (os.path.basename(path), box.get('err')),
                       flush=True)
             except Exception:              # noqa: BLE001
                 pass
+
+
+def _finish_head(path, base, out, kind, pages, head_pages):
+    """头一份转完：短文档就是整份（直接复制成整份，不再导第二遍）；长文档补一份整份。"""
+    full, _head, _meta = _side_paths(path, base)
+    if pages and head_pages >= pages:
+        try:
+            shutil.copyfile(out, full)
+        except Exception:                # noqa: BLE001
+            pass
+        _write_meta(path, base, pages, 0)
+        return
+    _write_meta(path, base, pages, head_pages or HEAD_PAGES)
+    _enqueue(_norm(path) + '|full', path, full, kind, base, 'full')
 
 
 def _ensure_worker():
@@ -278,17 +358,25 @@ def _ensure_worker():
     _WORKER.start()
 
 
-def _enqueue(key, path, out, kind, base):
-    """排一个转换任务。同一文件只排一次；队列只留最新的 MAX_QUEUE 个。"""
+def _enqueue(key, path, out, kind, base, mode):
+    """排一个转换任务。同一个 key 只排一次；队列只留最新的 MAX_QUEUE 个。"""
     with _LOCK:
         if key in _INFLIGHT:
             return
         _INFLIGHT.add(key)
-        _TASKS.append((key, path, out, kind, base))
+        _TASKS.append((key, path, out, kind, base, mode))
         while len(_TASKS) > MAX_QUEUE:
             old = _TASKS.pop(0)
             _INFLIGHT.discard(old[0])
     _ensure_worker()
+
+
+def _ready(path, base):
+    """(整份在手? , 头一份在手?)"""
+    full, head, _meta = _side_paths(path, base)
+    ok_full = bool(full and os.path.exists(full) and os.path.getsize(full) > 0)
+    ok_head = bool(head and os.path.exists(head) and os.path.getsize(head) > 0)
+    return ok_full, ok_head
 
 
 def status_for(path, base):
@@ -303,12 +391,12 @@ def status_for(path, base):
         return 'ok'
     if ext not in OFFICE_PDF or not OFFICE_PDF[ext]:
         return 'none'
-    out = cache_path(path, base)
-    if out and os.path.exists(out) and os.path.getsize(out) > 0:
+    ok_full, ok_head = _ready(path, base)
+    if ok_full or ok_head:
         return 'ok'
     key = _norm(path)
     with _LOCK:
-        if key in _INFLIGHT:
+        if key + '|head' in _INFLIGHT or key + '|full' in _INFLIGHT:
             return 'pending'
     fail = _FAILED.get(key)
     if fail and time.time() - fail[0] < FAIL_COOLDOWN:
@@ -316,10 +404,13 @@ def status_for(path, base):
     return 'none'
 
 
-def pdf_for(path, base):
+def pdf_for(path, base, pg=0):
     """Office 文档 → PDF 路径（带缓存）。
 
-    命中缓存直接给路径；没命中就**排进后台队列并立刻返回 None**（绝不阻塞请求线程）。
+    - 整份转好了：直接给整份（任何页码都能渲）
+    - 只有头一份、且要的页（pg，0 基）在头一份范围内：给头一份，整份在后台补
+    - 都没有：排「头一份」任务并立刻返回 None（绝不阻塞请求线程）
+
     前端看到 None 会隔一两秒再要一次，转好了就命中。
     """
     if not path or not os.path.exists(path):
@@ -330,22 +421,54 @@ def pdf_for(path, base):
     if ext not in OFFICE_PDF or not OFFICE_PDF[ext]:
         return None
 
-    out = cache_path(path, base)
-    if not out:
+    full, head, _meta = _side_paths(path, base)
+    if not full:
         return None
-    if os.path.exists(out) and os.path.getsize(out) > 0:
-        return out
+    ok_full, ok_head = _ready(path, base)
+    if ok_full:
+        return full
 
     key = _norm(path)
     fail = _FAILED.get(key)
     if fail and time.time() - fail[0] < FAIL_COOLDOWN:
         return None
 
-    _enqueue(key, path, out, OFFICE_PDF[ext], base)
-    # 排完队再看一眼：可能刚好被别处转完了（极小概率），顺手给路径
-    if os.path.exists(out) and os.path.getsize(out) > 0:
-        return out
+    kind = OFFICE_PDF[ext]
+    meta = _read_meta(path, base) or {'pages': 0, 'head': 0}
+    head_pages = meta.get('head') or HEAD_PAGES
+    if ok_head:
+        if kind == 'word' and pg < head_pages:
+            _enqueue(key + '|full', path, full, kind, base, 'full')
+            return head
+        # 要的页超出头一份（或不是 word，头一份就等于整份，不会走到这儿）
+        _enqueue(key + '|full', path, full, kind, base, 'full')
+        return None
+
+    # 还没有任何产物：word 先导头一份（首屏 1 秒级），其它格式本来就不支持分段
+    if kind == 'word':
+        _enqueue(key + '|head', path, head, kind, base, 'head')
+    else:
+        _enqueue(key + '|full', path, full, kind, base, 'full')
     return None
+
+
+def total_pages(path, base):
+    """Office 文档的整份页数（拿不到就 0，并顺手把头一份排上）。
+
+    第 388 项：页数在转换时用 ComputeStatistics 记进 meta.json，翻页器不用等整份导完。
+    """
+    if not path or not os.path.exists(path):
+        return 0
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in OFFICE_PDF or not OFFICE_PDF[ext]:
+        return 0
+    meta = _read_meta(path, base)
+    if meta and meta.get('pages'):
+        return meta['pages']
+    pdf_for(path, base)          # 没转就排上，前端会重试
+    meta = _read_meta(path, base)
+    return int(meta.get('pages') or 0) if meta else 0
+
 
 
 def wait_for(path, base, timeout=30.0):

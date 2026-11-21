@@ -109,6 +109,18 @@ describe('Preview 详情面板的预览（第 312 项）', () => {
     }
   })
 
+  it('第 388 项：页数要轮询 —— 头一份先出图，页数稍后才记下', async () => {
+    // 第一次 pdfmeta 回 0（还在转），第二次才有 180 —— 翻页器必须自己等到它
+    let n = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n++
+      return { ok: true, status: 200, json: async () => ({ pages: n === 1 ? 0 : 180 }) }
+    }))
+    const { container } = draw('D:\\doc\\方案.docx', 'docx')
+    await waitFor(() => expect(container.querySelector('img')).toBeTruthy())
+    await waitFor(() => expect(container.textContent).toContain('/ 180'), { timeout: 6000 })
+  })
+
   it('exe / 音频 / 文件夹：既不画图也不自动读正文', () => {
     for (const [p, e, t] of [
       ['D:\\a.exe', 'exe', 'file'],

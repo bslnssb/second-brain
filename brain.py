@@ -13455,6 +13455,10 @@ def pdf_pages(path):
     try:
         _ext = os.path.splitext(str(path or ''))[1].lower()
         if _ext != '.pdf' and doc_render.is_office(path):
+            # 第 388 项：页数在转换时就数好记进 meta.json（0.4s），不用等整份导完再开 PDF 数
+            n = doc_render.total_pages(path, app_dir())
+            if n:
+                return n
             path = doc_render.pdf_for(path, app_dir()) or ''
             if not path:
                 return 0
@@ -13547,7 +13551,8 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
     # 转不出来（没装 Office/WPS、或者转换超时）就记一次失败冷却，前端会回落到纯文本。
     if doc_render.is_office(path):
 
-        _pdf = doc_render.pdf_for(path, app_dir())
+        # 第 388 项：只要的页在「头一份」范围内（前 8 页），首屏不用等整份导完
+        _pdf = doc_render.pdf_for(path, app_dir(), pg=page)
 
         if not _pdf:
 

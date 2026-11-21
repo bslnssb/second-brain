@@ -120,9 +120,12 @@ type Facets = {
 /** 第 324 项：把命中的关键词在文件名里标出来。
  *  只标普通词；`ext:pdf`、`size:>10m`、`-排除`、`xxx/` 这些语法片段不参与高亮 ——
  *  高亮它们等于告诉用户「这几个字在文件名里」，纯属误导。 */
-function Hi({ text, q }: { text: string; q: string }) {
-  const raw = String(text || '')
-  if (!raw || !q) return <>{raw}</>
+/* 第 388 项：同一个查询词，列表 200 行每行都要编一次正则 —— 一次重渲染就是 200 次。
+   词没变就复用上一次编好的（split 不改 lastIndex，复用安全）。 */
+const HI_RE: { q: string | null; re: RegExp | null } = { q: null, re: null }
+
+function hiRegex(q: string): RegExp | null {
+  if (HI_RE.q === q) return HI_RE.re
   const toks = q
     .split(/\s+/)
     .map((s) => s.trim())
@@ -133,9 +136,19 @@ function Hi({ text, q }: { text: string; q: string }) {
       if (/^(ext|type|size|dm|content|内容|c):/.test(lo)) return false
       return !/[/\\]$/.test(s)
     })
-  if (!toks.length) return <>{raw}</>
-  const esc = toks.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-  const parts = raw.split(new RegExp(`(${esc.join('|')})`, 'gi'))
+  HI_RE.q = q
+  HI_RE.re = toks.length
+    ? new RegExp(`(${toks.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
+    : null
+  return HI_RE.re
+}
+
+function Hi({ text, q }: { text: string; q: string }) {
+  const raw = String(text || '')
+  if (!raw || !q) return <>{raw}</>
+  const re = hiRegex(q)
+  if (!re) return <>{raw}</>
+  const parts = raw.split(re)
   return (
     <>
       {parts.map((seg, i) =>
@@ -681,10 +694,16 @@ export default function App() {
 
   /** 整本 OCR 队列状态（第 148 项起免费）。面板开着 1 秒一刷，关着 5 秒一刷 ——
    *  后者只为让工具栏那个小圆点还准，关掉面板任务本身一直在后台跑。 */
+  const lastOcrSig = useRef('')
   const refreshOcr = useCallback(() => {
     getOcrBatch()
       .then((d) => {
         // d.pro 只可能是「公开源码版没有 pro/ 私有包」，不是收费墙
+        /* 第 388 项：5 秒一刷原来每次都 setOcr(d) —— 新对象 = 整棵界面重渲染一次，
+           200 行结果跟着重建。没变化就别 set，省掉这一次白渲染。 */
+        const sig = d.pro ? 'pro' : JSON.stringify(d || null)
+        if (sig === lastOcrSig.current) return
+        lastOcrSig.current = sig
         if (d.pro) { setOcrPro(true); setOcr(null) }
         else { setOcrPro(false); setOcr(d) }
       })
@@ -694,6 +713,7 @@ export default function App() {
   // 不让它把「用户还在活动」的假象续上（否则空闲迁移永远不会触发）。
   useEffect(() => {
     let alive = true
+    let last = ''
     const tick = async () => {
       try {
         const s = await getCompact()
@@ -704,6 +724,9 @@ export default function App() {
               ? Math.min(99, Math.round(((s.done || 0) / s.total) * 100))
               : 0
             : 100
+        // 第 388 项：同上 —— 没变化就别 set，否则每 10 秒整界面白重渲染一次
+        if (`${s.state}|${pct}` === last) return
+        last = `${s.state}|${pct}`
         setCompact({ state: s.state, pct })
       } catch {
         /* 后端忙的时候偶发失败，下次再读 */
@@ -1061,6 +1084,19 @@ export default function App() {
       return true
     })
   }, [rows, kind, days, subType, folder])
+
+  /* 第 388 项：列表里每行都要知道「从这行往后还剩几条正文命中」，原来在 map 里对每行
+     先切一段数组再过滤（200 行 ≈ 两万次切片 + 过滤），每次重渲染都跑一遍。
+     现在倒着数一次，O(n)。 */
+  const hitLeft = useMemo(() => {
+    const out = new Array<number>(shown.length).fill(0)
+    let acc = 0
+    for (let i = shown.length - 1; i >= 0; i--) {
+      if (shown[i].ty === 'hit') acc++
+      out[i] = acc
+    }
+    return out
+  }, [shown])
 
   // 侧栏筛选把行数砍短后，picked 要跟着收回来：
   // 否则高亮停在一条已经不存在的行上，回车就是打开错的文件（或什么都不打开）。
@@ -2028,7 +2064,8 @@ export default function App() {
             const prev = shown[i - 1]
             const startsHits = r.ty === 'hit' && (!prev || prev.ty !== 'hit')
             // 第 335 项：数「这一屏里剩下的」正文命中，别用全量 —— 截到 200 条时数字会对不上
-            const hitCount = shown.slice(i).filter((x) => x.ty === 'hit').length
+            // 第 388 项：预先数好（hitLeft），不再每行 slice + filter
+            const hitCount = hitLeft[i] ?? 0
             const isApp = APP_EXTS.includes(String(r.e || '').toLowerCase())
             return (
               <div key={r.p + i}>

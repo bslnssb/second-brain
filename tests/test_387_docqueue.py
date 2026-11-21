@@ -132,7 +132,7 @@ class TestTransientEngineFailure(unittest.TestCase):
             calls.append(kind)
             return FakeApp(len(calls))
 
-        def fake_conv(app, src, out):
+        def fake_conv(app, src, out, box):
             if app.n == 1:                     # 第一次：模拟 RPC 挂掉
                 raise RuntimeError("(-2147023174, 'RPC 服务器不可用。', None, None)")
             with open(out, 'wb') as fh:

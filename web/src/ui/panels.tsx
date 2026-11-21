@@ -4142,18 +4142,32 @@ export function Preview({
     return () => { alive = false }
   }, [row.p])
   /* 第 387 项：Office 是「先排队、几秒后才出图」，刚选中时 pdfmeta 还是 0（PDF 还没转出来）。
-     等页图真出来（thmbOk）再补问一次，翻页器才会显示「1 / 24」而不是只有一张图。 */
+     等页图真出来（thmbOk）再补问一次，翻页器才会显示「1 / 24」而不是只有一张图。
+     第 388 项：页图现在来自「头一份」（1~3 秒就有），但页数是转换时才记下的，
+     第一次问照样是 0 —— 所以要**轮询**到拿到页数为止，否则翻页器一直不出现（真机截图踩到）。 */
   useEffect(() => {
-    if (!isPdf || !thmbOk || pages > 0) return
+    if (!isPdf || pages > 0) return
     let alive = true
-    fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}`, { headers: { 'Sec-Fetch-Site': 'same-origin' } })
-      .then((r) => r.json())
-      .then((j: { pages?: number }) => {
-        if (alive && j && j.pages) setPages(Number(j.pages))
-      })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [row.p, thmbOk, pages, isPdf])
+    let tries = 0
+    let timer: number | null = null
+    const ask = () => {
+      fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}`, { headers: { 'Sec-Fetch-Site': 'same-origin' } })
+        .then((r) => r.json())
+        .then((j: { pages?: number }) => {
+          if (!alive) return
+          if (j && j.pages) { setPages(Number(j.pages)); return }
+          if (++tries < 20) timer = window.setTimeout(ask, 1500)
+        })
+        .catch(() => {
+          if (alive && ++tries < 20) timer = window.setTimeout(ask, 1500)
+        })
+    }
+    ask()
+    return () => {
+      alive = false
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [row.p, pages, isPdf])
   useEffect(() => {
     if (!zoom) return
     const el = zoomRef.current
