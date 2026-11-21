@@ -185,6 +185,17 @@ describe('Preview 详情面板的预览（第 312 项）', () => {
     await waitFor(() => expect(container.textContent).toContain('8 / 180'))
   })
 
+  it('第 391 项：后台说这份转不出来（state=failed）就停掉重试、直接给原因', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ pages: 0, hit: 0, done: false, state: 'failed' }),
+    })))
+    const { container } = draw('D:\\doc\\手册.docx', 'docx')
+    await waitFor(() => expect(container.textContent).toContain('没能生成页图预览'), { timeout: 4000 })
+    // 不再转圈：图块收起，给出「打开看原件」的说明
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.textContent).toContain('打开')
+  })
+
   it('exe / 音频 / 文件夹：既不画图也不自动读正文', () => {
     for (const [p, e, t] of [
       ['D:\\a.exe', 'exe', 'file'],

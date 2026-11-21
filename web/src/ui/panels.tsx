@@ -4149,8 +4149,14 @@ export function Preview({
       fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}&q=${encodeURIComponent(q)}`,
         { headers: { 'Sec-Fetch-Site': 'same-origin' } })
         .then((r) => r.json())
-        .then((j: { pages?: number; hit?: number; done?: boolean }) => {
+        .then((j: { pages?: number; hit?: number; done?: boolean; state?: string }) => {
           if (!alive || !j) return
+          /* 第 391 项：后台明确说「这份转不出来」（卡死/失败冷却中），就别再转圈了 ——
+             直接停掉重试、显示失败提示（还能用「打开」看原件）。 */
+          if (j.state === 'failed') {
+            setThumbBad(true)
+            return
+          }
           const p = Number(j.pages || 0)
           if (p) setPages(p)
           const hit = Number(j.hit || 0)
@@ -4358,7 +4364,7 @@ export function Preview({
       {canThumb && isOfficePage && !thmbOk && (
         <div className="-mt-0.5 mb-2 text-center text-[10px] text-sub">
           {thumbBad
-            ? '预览转换失败（本机 Office/WPS 没响应），点「预览版面」可以再试一次'
+            ? '这份文档没能生成页图预览（文件太大或排版引擎卡住了），点「打开」直接看原件即可'
             : '首次预览正在排版转换，大文件要十几秒（转好会缓存，下次秒开）'}
         </div>
       )}
@@ -4470,7 +4476,8 @@ export function Preview({
           <dd className="font-mono text-[11px]">{fmtTime(row.m)}</dd>
         </div>
       </dl>
-      {row.t !== 'dir' && ((canInlineView && (inlinePrimary || thumbBad)) || inlineOversize) && inlineExt && (
+      {row.t !== 'dir' && !(thumbBad && inline.st === 'fail')
+        && ((canInlineView && (inlinePrimary || thumbBad)) || inlineOversize) && inlineExt && (
         <div className="mt-3">
           <div className="mb-1 flex items-center justify-between text-[10px] text-sub">
             <span>
@@ -4527,9 +4534,9 @@ export function Preview({
               ))}
             </div>
           )}
-          {inline.st === 'fail' && (
+          {inline.st === 'fail' && !thumbBad && (
             <div className="rounded-md bg-card px-2 py-1.5 text-[10px] leading-4 text-sub">
-              {inline.why || '预览失败'}
+              这份文档的版面试不出来（可能是受保护或加密的文件），点「打开」看原件即可
             </div>
           )}
         </div>

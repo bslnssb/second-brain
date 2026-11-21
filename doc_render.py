@@ -23,6 +23,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 
@@ -54,10 +55,27 @@ APP_IDLE = 120.0        # 引擎实例闲置这么久就 Quit（不让一个后�
 MAX_QUEUE = 3           # 队列只留最新 3 个任务
 FAIL_COOLDOWN = 60.0    # 真转换失败（两次都报错）后的冷却；「还在排队」不算失败
 
+# 第 391 项：一份文档能把 WPS 的导出**永久卡住**（实测 19MB 手册让 wps.exe 100% CPU 跑
+# 500 秒不返回）。以前转换是单线程 inline 干活，一卡就把整个队列堵死 —— 之后点任何文档
+# 都只显示「正在排版转换」，永远不出来（用户截图就是这个）。
+# 现在单次转换超过这个时间就认定卡死：杀掉的引擎进程、记失败（冷却长一点免得反复烧）、
+# 队列继续往下走。
+CONV_TIMEOUT = 25.0
+TIMEOUT_COOLDOWN = 300.0   # 卡死过的文件 5 分钟内不再试（不然每点一次就烧 25 秒 CPU）
+
+# 第 391 项之二：受保护的文档（WPS「工具箱授权浏览」目录里那种）导出来的 PDF 里
+# 文字是乱码，`ComputeStatistics` 还会回一个离谱的页数（实测 19MB 那份回 101560），
+# 前端翻页器就成了「1 / 101560」。页数超过这个上限一律当「这份预览不了」处理：
+# 不重试、长冷却，前端直接提示「点打开看原件」。
+MAX_SANE_PAGES = 5000
+
+# 我们自己的引擎可能是 WPS 假装的 Word（错误信息里写着 Kingsoft WPS），所以进程名都认
+ENGINE_EXES = ('wps.exe', 'winword.exe', 'et.exe', 'excel.exe', 'wpp.exe', 'powerpnt.exe')
+
 WORKER_AUTOSTART = True # 单测把它关掉，避免在测试机上真起 WPS
 
-_FAILED = {}            # key -> (时间, 原因)
-_APPS = {}              # kind -> {'app':..., 'last':..., 'prog':...}
+_FAILED = {}            # key -> (时间, 原因, 冷却秒数)
+_APPS = {}              # kind -> {'app':..., 'last':..., 'prog':..., 'pids':()}
 _TASKS = []             # [(key, path, out, kind, base)]，从尾部取（最新优先）
 _INFLIGHT = set()       # 已排队 / 正在转的 key
 _LOCK = threading.Lock()
@@ -71,6 +89,99 @@ def _norm(path):
 
 def is_office(path):
     return os.path.splitext(str(path or ''))[1].lower() in OFFICE_PDF
+
+
+class _Unsupported(Exception):
+    """这份文档注定预览不了（受保护/加密、页数离谱）：不换引擎重试，直接判失败。"""
+
+
+def _fail_cool(key):
+    """这份文件现在是不是还在失败冷却里（卡死的用更长的冷却）。"""
+    f = _FAILED.get(key)
+    if not f:
+        return False
+    cool = f[2] if len(f) > 2 else FAIL_COOLDOWN
+    return time.time() - f[0] < cool
+
+
+def _engine_pids(since=None):
+    """当前 WPS / Office 引擎进程的 pid（可选只算 `since` 之后新起的）。
+
+    不依赖 psutil（打包环境里不一定有它）：EnumProcesses + OpenProcess +
+    QueryFullProcessImageNameW + GetProcessTimes，全是 kernel32/psapi 自带。
+    拿不准就返回空集合 —— 宁可杀不掉，也不能误杀用户自己的 WPS。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        psapi = ctypes.WinDLL('psapi.dll')
+        arr = (wintypes.DWORD * 4096)()
+        need = wintypes.DWORD(0)
+        if not psapi.EnumProcesses(ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(need)):
+            return set()
+        out = set()
+        count = min(need.value // ctypes.sizeof(wintypes.DWORD), 4096)
+        for i in range(count):
+            pid = arr[i]
+            if not pid:
+                continue
+            handle = k32.OpenProcess(0x1000, False, pid)     # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                continue
+            try:
+                buf = ctypes.create_unicode_buffer(600)
+                size = wintypes.DWORD(600)
+                if not k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                    continue
+                if buf.value.rsplit('\\', 1)[-1].lower() not in ENGINE_EXES:
+                    continue
+                if since is None:
+                    out.add(int(pid))
+                    continue
+                ct, et, kt, ut = (wintypes.FILETIME(), wintypes.FILETIME(),
+                                  wintypes.FILETIME(), wintypes.FILETIME())
+                if not k32.GetProcessTimes(handle, ctypes.byref(ct), ctypes.byref(et),
+                                           ctypes.byref(kt), ctypes.byref(ut)):
+                    continue
+                born = (ct.dwHighDateTime << 32 | ct.dwLowDateTime) / 1e7 - 11644473600.0
+                if born >= since - 1.0:
+                    out.add(int(pid))
+            finally:
+                k32.CloseHandle(handle)
+        return out
+    except Exception:                    # noqa: BLE001
+        return set()
+
+
+def _kill_engine(kind):
+    """卡死时把这批引擎进程强杀（连带子进程）。
+
+    绝不 `app.Quit()`：引擎正卡在导出里，Quit 也是排队，根本回不来。
+    只杀「这个实例起的时候之后新出现的」进程，用户自己开着的 WPS 不动。
+    """
+    with _LOCK:
+        ent = _APPS.pop(kind, None)
+    if not ent:
+        return []
+    pids = set(ent.get('pids') or ())
+    if ent.get('spawn_ts'):
+        # WPS 是多进程的：真正干活的那个子进程是「打开文档时」才生的，不在建实例时
+        # 记的 pids 里。所以杀的时候再把「这个实例起来之后新出现的引擎进程」一起算上。
+        # 窗口只有几十秒，且这个实例本来就是我们 DispatchEx 起的，正常情况下不会误伤
+        # 用户自己的 WPS。
+        pids |= _engine_pids(ent['spawn_ts'])
+    killed = []
+    for pid in sorted(pids):
+        try:
+            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=0x08000000, timeout=15)
+            killed.append(pid)
+        except Exception:                # noqa: BLE001
+            pass
+    return killed
 
 
 def cache_dir(base):
@@ -247,6 +358,10 @@ def _convert_word(app, src, out, box):
             total = int(doc.ComputeStatistics(2))     # wdStatisticPages（不导出也能数）
         except Exception:                # noqa: BLE001
             total = 0
+        if total > MAX_SANE_PAGES:
+            # 受保护的文档这里会回天量页数（101560 页），而且导出来是乱码：
+            # 与其排 25 秒白烧 CPU 再给用户一张废纸，不如直接判「预览不了」
+            raise _Unsupported('页数异常(%d)，疑似受保护/加密文档' % total)
         box['pages'] = total
         if box.get('mode') == 'head' and total > HEAD_PAGES:
             # 第 390 项：用户要看的是**命中那一页**，不是第 1 页。
@@ -268,7 +383,12 @@ def _convert_word(app, src, out, box):
             box['from'] = 1
             box['hit'] = 0
     finally:
-        doc.Close(False)
+        try:
+            doc.Close(False)
+        except Exception:                # noqa: BLE001
+            # 受保护的文档连 Close 都会报错（真机上是 `Open.Close`）；吞掉它，
+            # 别把上面那句「这份预览不了」的原因盖掉
+            pass
 
 
 def _convert_excel(app, src, out, box):
@@ -305,15 +425,24 @@ _CONVERTERS = {'word': _convert_word, 'excel': _convert_excel, 'ppt': _convert_p
 
 
 def _drop_app(kind):
-    """把某个引擎实例扔掉（转换报错后换一个干净的，避免坏状态一直传下去）。"""
+    """把某个引擎实例扔掉（转换报错后换一个干净的，避免坏状态一直传下去）。
+
+    第 391 项之二：`Quit()` 本身是 COM 调用，引擎半死的时候它也会一起卡住
+    （真机上就在这儿把转换线程吊住，看着像「队列又不干活了」）。所以只做一件事：
+    把它交给一条一次性线程去退，转换线程立刻走人。
+    """
     with _LOCK:
         ent = _APPS.pop(kind, None)
     if not ent:
         return
-    try:
-        ent['app'].Quit()
-    except Exception:                    # noqa: BLE001
-        pass
+
+    def bye():
+        try:
+            ent['app'].Quit()
+        except Exception:                # noqa: BLE001
+            pass
+
+    threading.Thread(target=bye, name='doc-quit', daemon=True).start()
 
 
 def _reap_apps():
@@ -333,6 +462,7 @@ def _app_for(kind):
     import win32com.client as client
     for prog in PROGIDS[kind]:
         try:
+            spawn_ts = time.time()
             app = client.DispatchEx(prog)
             try:
                 app.Visible = False
@@ -343,7 +473,10 @@ def _app_for(kind):
             except Exception:             # noqa: BLE001
                 pass
             with _LOCK:
-                _APPS[kind] = {'app': app, 'last': time.time(), 'prog': prog}
+                _APPS[kind] = {'app': app, 'last': time.time(), 'prog': prog,
+                               # 记下「这次新起了哪些引擎进程」：卡死时只杀这些
+                               'pids': tuple(sorted(_engine_pids(spawn_ts))),
+                               'spawn_ts': spawn_ts}
             return app
         except Exception:                 # noqa: BLE001
             continue
@@ -358,6 +491,8 @@ def _convert_one(kind, src, out, box):
     再试一次，两次都失败才算真失败 —— 否则用户那份文档就被 5 分钟冷却按死了。
     """
     for _attempt in (0, 1):
+        if box.get('_abort'):            # 看门狗已经放弃了这一份，别再起新引擎
+            return False
         app = _app_for(kind)
         if app is None:
             box['err'] = '没有可用的 Office/WPS 引擎'
@@ -368,11 +503,56 @@ def _convert_one(kind, src, out, box):
                 box['engine'] = _APPS.get(kind, {}).get('prog')
                 return True
             box['err'] = '转换产物为空'
+        except _Unsupported as e:        # 注定预览不了：别再换引擎白试一遍
+            box['err'] = str(e)[:160]
+            box['unsupported'] = True
+            return False
         except Exception as e:            # noqa: BLE001
             box['err'] = str(e)[:160]
+        if box.get('_abort'):
+            return False
         # 这一份没转成：把实例扔掉，下一轮换个干净的（坏状态不留给下一份文件）
         _drop_app(kind)
     return False
+
+
+def _run_convert(kind, path, out, box):
+    """带看门狗地转一份：超过 CONV_TIMEOUT 就认定引擎卡死，杀掉它、放弃这一份。
+
+    COM 调用本身没法「取消」，所以用一条工作线程 + join 超时来兜：
+    join 超时后给 box 打 `_abort`（那条被丢下的线程下一次就退出，不会再起新引擎），
+    然后强杀我们自己的引擎进程（卡住的 RPC 会立刻失败，线程也就散了）。
+    """
+    res = {}
+
+    def work():
+        try:
+            res['ok'] = _convert_one(kind, path, out, box)
+        except Exception as e:            # noqa: BLE001
+            box['err'] = str(e)[:160]
+            res['ok'] = False
+
+    th = threading.Thread(target=work, name='doc-conv', daemon=True)
+    th.start()
+    th.join(CONV_TIMEOUT)
+    if th.is_alive():
+        box['_abort'] = True
+        box['timeout'] = True
+        box['err'] = '转换超时（>%d 秒，引擎卡住，已回收）' % int(CONV_TIMEOUT)
+        _kill_engine(kind)
+        try:
+            os.remove(out)               # 别留半截 PDF 被 _ready 当成「已转好」
+        except OSError:
+            pass
+        return False
+    return bool(res.get('ok'))
+
+
+def _fail_cooldown(box):
+    """这一份失败后冷却多久：卡死 / 受保护的 5 分钟，普通报错 1 分钟。"""
+    if box.get('timeout') or box.get('unsupported'):
+        return TIMEOUT_COOLDOWN
+    return FAIL_COOLDOWN
 
 
 def _loop():
@@ -388,7 +568,7 @@ def _loop():
         qn = ' '.join(_q_tokens(q))
         box = {'mode': mode, 'q': qn}
         try:
-            ok = _convert_one(kind, path, out, box)
+            ok = _run_convert(kind, path, out, box)
         except Exception as e:             # noqa: BLE001
             ok = False
             box['err'] = str(e)[:160]
@@ -405,7 +585,9 @@ def _loop():
                 _write_meta(path, base, pages, 0, 1, hit, qn)
             _sweep(base)
         else:
-            _FAILED[_norm(path)] = (time.time(), box.get('err') or 'unknown')
+            # 卡死过 / 受保护文档冷却久一点（5 分钟）：不然用户每点一次就白烧 25 秒 CPU
+            cool = _fail_cooldown(box)
+            _FAILED[_norm(path)] = (time.time(), box.get('err') or 'unknown', cool)
             try:
                 print('[i] 文档转 PDF 失败：%s → %s' % (os.path.basename(path), box.get('err')),
                       flush=True)
@@ -443,6 +625,9 @@ def _ensure_worker():
 
 def _enqueue(key, path, out, kind, base, mode, q=''):
     """排一个转换任务。同一个 key 只排一次；队列只留最新的 MAX_QUEUE 个。"""
+    # 先把 worker 拉起来：以前只在排新任务之后才 ensure，worker 万一半路死掉、
+    # 而 _INFLIGHT 里还有旧条目，就会一直走「已在排队」这条早退路，永远没人干活
+    _ensure_worker()
     with _LOCK:
         if key in _INFLIGHT:
             # 已经在排队、还没开工的，就把查询词换成最新的（前端先按旧 q 排上、
@@ -487,8 +672,7 @@ def status_for(path, base):
     with _LOCK:
         if key + '|head' in _INFLIGHT or key + '|full' in _INFLIGHT:
             return 'pending'
-    fail = _FAILED.get(key)
-    if fail and time.time() - fail[0] < FAIL_COOLDOWN:
+    if _fail_cool(key):
         return 'failed'
     return 'none'
 
@@ -524,8 +708,7 @@ def pdf_page_source(path, base, pg=0, q=''):
             _enqueue(key + '|head', path, head, kind, base, 'head', q)
         return full, int(pg)
 
-    fail = _FAILED.get(key)
-    if fail and time.time() - fail[0] < FAIL_COOLDOWN:
+    if _fail_cool(key):
         return None, None
 
     meta = _read_meta(path, base) or {'pages': 0, 'head': 0, 'from': 1}
@@ -572,10 +755,14 @@ def total_pages(path, base, q=''):
         return 0
     meta = _read_meta(path, base)
     if meta and meta.get('pages'):
-        return meta['pages']
+        n = int(meta['pages'] or 0)
+        return n if n <= MAX_SANE_PAGES else 0     # 老缓存里的鬼页数一律不认
     pdf_page_source(path, base, 0, q)          # 没转就排上，前端会重试
     meta = _read_meta(path, base)
-    return int(meta.get('pages') or 0) if meta else 0
+    if not meta:
+        return 0
+    n = int(meta.get('pages') or 0)
+    return n if n <= MAX_SANE_PAGES else 0
 
 
 def hit_info(path, base, q=''):

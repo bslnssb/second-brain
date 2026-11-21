@@ -13456,12 +13456,12 @@ def pdf_pages(path, q=''):
         _ext = os.path.splitext(str(path or ''))[1].lower()
         if _ext != '.pdf' and doc_render.is_office(path):
             # 第 388 项：页数在转换时就数好记进 meta.json（0.4s），不用等整份导完再开 PDF 数
+            # 第 391 项之二：受保护文档会回 101560 这种鬼页数 —— 不可信就报 0（前端不显示翻页器），
+            # 也**不要**拿手上那段 PDF 的页数顶（那段是命中页 ±1，报出去就是「1 / 8」假页数）
             n = doc_render.total_pages(path, app_dir(), q)
-            if n:
+            if n and n <= doc_render.MAX_SANE_PAGES:
                 return n
-            path = doc_render.pdf_page_source(path, app_dir(), 0, q)[0] or ''
-            if not path:
-                return 0
+            return 0
 
         import pdf_engine as pymupdf
 
@@ -24608,6 +24608,7 @@ def make_server(port=8765):
                 pgs = 0
                 hpg = 0
                 hdn = True
+                stt = 'none'
 
                 kw = (qs.get('q', [''])[0] or '').strip()
 
@@ -24637,8 +24638,12 @@ def make_server(port=8765):
                             # 手里的那段是旧关键词定位的（或者还是旧版本缓存）：
                             # 这里踢一脚，让它按当前词重导那一段；前端会继续轮询到 done
                             doc_render.pdf_page_source(p, app_dir(), 0, kw)
+                        # 第 391 项：转换卡死/失败时告诉前端「别等了」，它会把重试停掉、
+                        # 直接显示「这份预览不出来」——以前只能一直转圈到 70 秒上限
+                        stt = doc_render.status_for(p, app_dir())
 
-                body = json.dumps({'ok': bool(pgs), 'pages': pgs, 'hit': hpg, 'done': hdn},
+                body = json.dumps({'ok': bool(pgs), 'pages': pgs, 'hit': hpg, 'done': hdn,
+                                   'state': stt},
                                   ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'
