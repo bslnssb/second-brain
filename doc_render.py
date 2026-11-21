@@ -104,6 +104,49 @@ def _fail_cool(key):
     return time.time() - f[0] < cool
 
 
+def _lower_priority(pids):
+    """把引擎进程降到「低于正常」优先级：后台重排版不许跟用户抢核（第 392 项）。
+
+    BELOW_NORMAL 而不是 IDLE：IDLE 在机器一忙时会几乎分不到时间片，转换会拖得很久；
+    BELOW_NORMAL 只在有别的活要 CPU 时让路，空闲时照样全速。子进程（WPS 开文档时起的
+    那个窗口进程）默认继承父进程的优先级，所以只要在「打开文档之前」降一次就够。
+    """
+    if not pids:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        PROC_SET_INFORMATION = 0x0200
+        BELOW_NORMAL = 0x00004000
+        done = 0
+        for pid in list(pids):
+            try:
+                h = k32.OpenProcess(PROC_SET_INFORMATION, False, int(pid))
+            except Exception:            # noqa: BLE001
+                continue
+            if not h:
+                continue
+            try:
+                if k32.SetPriorityClass(h, BELOW_NORMAL):
+                    done += 1
+            finally:
+                k32.CloseHandle(h)
+        return done
+    except Exception:                    # noqa: BLE001
+        return 0
+
+
+def _engine_procs(kind):
+    """这个 kind 现在名下的引擎进程：实例记下的 + 它起来之后新出现的（开文档时才生）。"""
+    ent = _APPS.get(kind) or {}
+    since = ent.get('spawn_ts')
+    pids = set(ent.get('pids') or ())
+    pids |= _engine_pids(since) if since else set()
+    return pids
+
+
 def _engine_pids(since=None):
     """当前 WPS / Office 引擎进程的 pid（可选只算 `since` 之后新起的）。
 
@@ -477,6 +520,8 @@ def _app_for(kind):
                                # 记下「这次新起了哪些引擎进程」：卡死时只杀这些
                                'pids': tuple(sorted(_engine_pids(spawn_ts))),
                                'spawn_ts': spawn_ts}
+            # 第 392 项：引擎一出生就降优先级（子进程会继承），后台排版别抢用户的核
+            _lower_priority(_engine_procs(kind))
             return app
         except Exception:                 # noqa: BLE001
             continue
@@ -498,6 +543,7 @@ def _convert_one(kind, src, out, box):
             box['err'] = '没有可用的 Office/WPS 引擎'
             return False
         try:
+            _lower_priority(_engine_procs(kind))   # 每次开工前再降一次，别让它回到正常优先级
             _CONVERTERS[kind](app, src, out, box)
             if os.path.exists(out) and os.path.getsize(out) > 0:
                 box['engine'] = _APPS.get(kind, {}).get('prog')
@@ -516,6 +562,19 @@ def _convert_one(kind, src, out, box):
     return False
 
 
+def _priority_watch(kind, stop):
+    """转换期间盯着引擎进程，新冒出来的也一起降到 BELOW_NORMAL（第 392 项）。
+
+    真机实测：WPS 打开文档时才起的那个子进程**不继承**我们的优先级，回来又是 NORMAL，
+    转换的后半段照旧抢占 CPU。所以边转边盯，1 秒看一次，转换结束就收手。
+    """
+    while not stop.wait(0.9):
+        try:
+            _lower_priority(_engine_procs(kind))
+        except Exception:                # noqa: BLE001
+            return
+
+
 def _run_convert(kind, path, out, box):
     """带看门狗地转一份：超过 CONV_TIMEOUT 就认定引擎卡死，杀掉它、放弃这一份。
 
@@ -524,6 +583,9 @@ def _run_convert(kind, path, out, box):
     然后强杀我们自己的引擎进程（卡住的 RPC 会立刻失败，线程也就散了）。
     """
     res = {}
+    stop_prio = threading.Event()
+    threading.Thread(target=_priority_watch, args=(kind, stop_prio),
+                     name='doc-prio', daemon=True).start()
 
     def work():
         try:
@@ -532,20 +594,23 @@ def _run_convert(kind, path, out, box):
             box['err'] = str(e)[:160]
             res['ok'] = False
 
-    th = threading.Thread(target=work, name='doc-conv', daemon=True)
-    th.start()
-    th.join(CONV_TIMEOUT)
-    if th.is_alive():
-        box['_abort'] = True
-        box['timeout'] = True
-        box['err'] = '转换超时（>%d 秒，引擎卡住，已回收）' % int(CONV_TIMEOUT)
-        _kill_engine(kind)
-        try:
-            os.remove(out)               # 别留半截 PDF 被 _ready 当成「已转好」
-        except OSError:
-            pass
-        return False
-    return bool(res.get('ok'))
+    try:
+        th = threading.Thread(target=work, name='doc-conv', daemon=True)
+        th.start()
+        th.join(CONV_TIMEOUT)
+        if th.is_alive():
+            box['_abort'] = True
+            box['timeout'] = True
+            box['err'] = '转换超时（>%d 秒，引擎卡住，已回收）' % int(CONV_TIMEOUT)
+            _kill_engine(kind)
+            try:
+                os.remove(out)               # 别留半截 PDF 被 _ready 当成「已转好」
+            except OSError:
+                pass
+            return False
+        return bool(res.get('ok'))
+    finally:
+        stop_prio.set()
 
 
 def _fail_cooldown(box):
@@ -675,6 +740,37 @@ def status_for(path, base):
     if _fail_cool(key):
         return 'failed'
     return 'none'
+
+
+def pdf_page_cached(path, base, pg=0, q=''):
+    """只吃现成缓存：返回 (含第 pg 页的 PDF, 段内下标)，没有就 (None, None)。
+
+    第 392 项：网格视图给 docx/pptx 出缩略图，会为滚动过的每一份文档排一次转换 ——
+    实测这是最隐形的一笔 CPU（一屏 20 个格子 = 20 次重排版）。网格只值一个 32px 的图，
+    所以网格这一路**只允许读缓存**，回来再补；详情栏（big=1）才允许排队。
+    """
+    if not path or not os.path.exists(path):
+        return None, None
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.pdf':
+        return path, int(pg)
+    if ext not in OFFICE_PDF or not OFFICE_PDF[ext]:
+        return None, None
+    full, head, _meta = _side_paths(path, base)
+    if not full:
+        return None, None
+    try:
+        if os.path.exists(full) and os.path.getsize(full) > 0:
+            return full, int(pg)
+        if os.path.exists(head) and os.path.getsize(head) > 0:
+            meta = _read_meta(path, base) or {}
+            frm = int(meta.get('from') or 1)
+            cnt = int(meta.get('head') or 0)
+            if cnt and frm - 1 <= int(pg) <= frm - 1 + cnt - 1:
+                return head, int(pg) - (frm - 1)
+    except OSError:
+        pass
+    return None, None
 
 
 def pdf_page_source(path, base, pg=0, q=''):

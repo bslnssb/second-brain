@@ -13553,7 +13553,16 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
 
         # 第 390 项：缓存里可能只有「命中页 ±1」那一段，必须同时拿到页下标，
         # 否则从另一个页码的 PDF 里取第 1 页，渲出来是别的页（用户就会觉得跳错页）。
-        _pdf, _idx = doc_render.pdf_page_source(path, app_dir(), page, q)
+        # 第 392 项：网格格子（max_w<600）只准读缓存 —— 一屏 20 个 docx 就是 20 次重排版，
+        # 而网格只值一张 32px 小图；详情栏（big=1 → 900/1600）才允许排队转换。
+        try:
+            _mw = int(max_w)
+        except Exception:
+            _mw = 320
+        if _mw < 600:
+            _pdf, _idx = doc_render.pdf_page_cached(path, app_dir(), page, q)
+        else:
+            _pdf, _idx = doc_render.pdf_page_source(path, app_dir(), page, q)
 
         if not _pdf:
 
