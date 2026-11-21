@@ -101,8 +101,14 @@ REQUIRED = [                        # 少了任何一个都算发不出去
 
 
 def run_git(*args):
+    # 第 382 项：`errors='replace'` 是必需的。`git log -p` 打出来的 diff 里会夹着
+    # 非 UTF-8 的**文本**文件（licenses 里 freetype.txt 这种 Latin-1 许可原文），
+    # 原来一碰到 0xa9 就 `UnicodeDecodeError` 整条 CI 崩掉 —— 而崩掉的表现是
+    # 「out=None → AttributeError」，看上去跟隐私毫无关系，红了两版都没人查出来。
+    # 换成跳过坏字节：扫词表要的只是能看见的 ASCII/中文，掉几个字节不影响判定。
     r = subprocess.run(['git', '-c', 'core.quotepath=false', *args],
-                       cwd=str(REPO), capture_output=True, text=True, encoding='utf-8')
+                       cwd=str(REPO), capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
     return r.stdout if r.returncode == 0 else ''
 
 
