@@ -4500,7 +4500,7 @@ export function Preview({
           />
         </button>
       )}
-      {canThumb && isOfficePage && !thmbOk && (
+      {canThumb && isOfficePage && !thmbOk && !inlinePrimary && (
         <div className="-mt-0.5 mb-2 text-center text-[10px] text-sub">
           {thumbBad
             ? '这份文档没能生成页图预览（文件太大或排版引擎卡住了），点「打开」直接看原件即可'
