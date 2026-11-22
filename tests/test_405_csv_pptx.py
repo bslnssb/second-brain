@@ -26,6 +26,12 @@ class TestCsvRaw(unittest.TestCase):
         # pptx 不再等页图失败才铺文字
         self.assertIn("const INLINE_PRIMARY = [...SHEET_EXT, 'pptx']", panel)
 
+    def test_index_html_not_cached(self):
+        """升级后界面必须是新的：旧 index.html 会指着旧版 app.xxxx.js。"""
+        src = io.open(os.path.join(ROOT, 'brain.py'), encoding='utf-8').read()
+        self.assertIn("if ctype.startswith('text/html'):", src)
+        self.assertIn("self.send_header('Cache-Control', 'no-store')", src)
+
 
 if __name__ == '__main__':
     unittest.main()

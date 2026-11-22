@@ -25943,6 +25943,13 @@ def make_server(port=8765):
 
             self.send_header('Content-Type', ctype)
 
+            # 第 405 项：html 不让 WebView2 记住 —— 旧 index.html 指着上一版带 hash 的
+            # app.xxxx.js，那文件还在 _internal/web 里躺着，于是升级后界面永远是上一版
+            # （用户截图里「命中页正文」这种旧文案、以及改好的预览迟迟不出现，都是这个原因）。
+            # 带 hash 的 js/css 文件名本身就会变，照旧允许缓存。
+            if ctype.startswith('text/html'):
+                self.send_header('Cache-Control', 'no-store')
+
             self.end_headers()
 
             self.wfile.write(body)
