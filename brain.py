@@ -13663,8 +13663,10 @@ def _ocr_run(path, k, src=None):
                     if _OCR_ACTIVE.get('key') not in ('', k):
                         break                    # 用户已经去看别的文件了
                     toks, ctx = _OCR_TARGET.get(k, ([], ''))
-                if pymupdf and _ocr_map_search(m, toks, ctx):
-                    break                        # 已经找到，没必要继续烧 CPU
+                # 第 407 项：找到命中页后**不要停**。用户会说「第二页也有啊，怎么没标」——
+                # 户口本、毕业证这种一份材料里同一名字反复出现，只识别到第一处就收工，
+                # 后面的页永远没有框。继续按页识别（BELOW_NORMAL、单线程、75s 预算），
+                # 每页落盘，前端靠 ocr_n 变化换 URL 重渲。
                 if time.time() - t0 > OCR_JOB_BUDGET:
                     break
                 p = i + 1
@@ -13720,8 +13722,10 @@ def ocr_hit_page(path, tokens, ctx='', src=None):
     hit = _ocr_map_search(m, tokens, ctx)
     done = len(m.get('pages') or {})
     total = int(m.get('total') or 0)
-    if hit or m.get('done'):
-        return hit, done, total, False, bool(m.get('done'))
+    if m.get('done'):
+        return hit, done, total, False, True
+    if hit and done >= total and total:
+        return hit, done, total, False, True
     with _OCR_LOCK:
         _OCR_ACTIVE['key'] = k
         _OCR_ACTIVE['ts'] = time.time()
@@ -13732,7 +13736,7 @@ def ocr_hit_page(path, tokens, ctx='', src=None):
                                   name='ocr-%s' % k[:6])
             _OCR_JOBS[k] = th
             th.start()
-    return 0, done, total, True, False
+    return hit, done, total, True, False
 
 
 def _ocr_line_rects(path, page, tokens):
@@ -25001,6 +25005,7 @@ def make_server(port=8765):
                         # 就是这个 PDF 路径，天然对得上）。
                         ocr_prog = None
                         ocr_done = False
+                        ocr_n = 0
                         if not hpg and kw:
                             _ocr_src = ''
                             try:
@@ -25018,7 +25023,10 @@ def make_server(port=8765):
                                         doc_render._context_window(snip), src=_ocr_src)
                                     hpg = oh
                                     ocr_done = odone
-                                    if not oh and obusy:
+                                    ocr_n = int(od or 0)
+                                    # 第 407 项：找到命中页也继续识别其余页（用户要在第 2、3 页
+                                    # 也看到框），所以 obusy 就要保持轮询、把 od 交给前端换 URL。
+                                    if obusy:
                                         ocr_prog = [od, ot]   # ot 先可能是 0（刚起跑）
                                         hdn = False           # 还没算完，前端别停
                                 except Exception:
@@ -25035,7 +25043,9 @@ def make_server(port=8765):
                                    'state': stt,
                                    # 第 399 项：扫描件的 OCR 进度 [已识别页, 总页数]
                                    # 第 406 项：ocr_done = 整份识别完（前端据此停止无限等待）
-                                   'ocr': ocr_prog, 'ocr_done': bool(ocr_done)},
+                                   'ocr': ocr_prog, 'ocr_done': bool(ocr_done),
+                                   # 第 407 项：已识别页数（前端并进页图 hv，页数一变就重渲）
+                                   'ocr_n': int(ocr_n or 0)},
                                   ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'

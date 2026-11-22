@@ -4132,6 +4132,8 @@ export function Preview({
   const [ocrProg, setOcrProg] = useState<[number, number] | null>(null)
   /* 第 406 项：整份 OCR 已经识别完（还没命中就是真的没有，别再让用户干等） */
   const [ocrDone, setOcrDone] = useState(false)
+  /* 第 407 项：已识别页数 —— 并进页图 hv，每多识别一页就换个地址重渲 */
+  const [ocrN, setOcrN] = useState(0)
   /* 第 397 项：查询词变了要重新问「命中第几页」—— 但别每敲一个字就扫一遍 PDF 文本层，
      停手 400ms 再问。 */
   const [qNow, setQNow] = useState(q)
@@ -4160,9 +4162,11 @@ export function Preview({
     /* 第 403 项：扫描件的高亮是后台 OCR 画出来的，第一张图往往在 OCR 跑完之前就发出去了
        （没框），之后浏览器还会按 max-age 缓存一整天 —— 用户就会觉得「扫描件一直不标」。
        把「已识别页数」当成版本号带上：OCR 一有进展地址就变，服务端缓存键也跟着换，
-       才会重渲出带黄框的那一页。 */
-    (isPdf && (ocrProg || hitPg)
-      ? `&hv=${ocrProg ? 'o' + ocrProg[0] : 'h' + hitPg}`
+       才会重渲出带黄框的那一页。
+       第 407 项：命中页之后 OCR 还在继续识别其余页（同一名字在第 2、3 页也有），
+       所以版本号里必须带上 ocrN，不能只用命中页码。 */
+    (isPdf && (ocrN > 0 || hitPg)
+      ? `&hv=${(hitPg ? 'h' + hitPg : 'o')}-${ocrN}`
       : '') +
     /* 重试用：只用来打破浏览器对 204 的缓存，让同一个地址能真的重发 */
     (pgTry ? `&t=${pgTry}` : '')
@@ -4232,6 +4236,7 @@ export function Preview({
     setHitPg(0)
     setOcrProg(null)
     setOcrDone(false)
+    setOcrN(0)
     jumpedHit.current = false
     if (!isPdf) return
     let alive = true
@@ -4244,7 +4249,7 @@ export function Preview({
         `&s=${encodeURIComponent((row.b || row.snip || '').replace(/<\/?mark>/gi, ''))}`,
         { headers: { 'Sec-Fetch-Site': 'same-origin' } })
         .then((r) => r.json())
-        .then((j: { pages?: number; hit?: number; done?: boolean; state?: string; ocr?: [number, number] | null; ocr_done?: boolean }) => {
+        .then((j: { pages?: number; hit?: number; done?: boolean; state?: string; ocr?: [number, number] | null; ocr_done?: boolean; ocr_n?: number }) => {
           if (!alive || !j) return
           /* 第 391 项：后台明确说「这份转不出来」（卡死/失败冷却中），就别再转圈了 ——
              直接停掉重试、显示失败提示（还能用「打开」看原件）。 */
@@ -4255,6 +4260,7 @@ export function Preview({
           const op = j.ocr ? [Number(j.ocr[0]), Number(j.ocr[1])] as [number, number] : null
           setOcrProg(op)
           setOcrDone(!!j.ocr_done)
+          setOcrN(Number(j.ocr_n || 0))
           const p = Number(j.pages || 0)
           if (p) setPages(p)
           const hit = Number(j.hit || 0)

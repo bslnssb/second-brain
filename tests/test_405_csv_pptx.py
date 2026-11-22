@@ -41,6 +41,8 @@ class TestCsvRaw(unittest.TestCase):
         panel = io.open(os.path.join(ROOT, 'web/src/ui/panels.tsx'), encoding='utf-8').read()
         self.assertIn('图片型页面：正在识别第', panel)
         self.assertIn('ocrDone', panel)
+        # 第 407 项：hv 必须带已识别页数，命中页之后的页也能重渲出框
+        self.assertIn("`&hv=${(hitPg ? 'h' + hitPg : 'o')}-${ocrN}`", panel)
 
     def test_ocr_data_changes_thumb_key(self):
         """OCR 每识别完一页，页图缓存就该换 key —— 否则「没框」的图会一直顶着。"""

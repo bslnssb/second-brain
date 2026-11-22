@@ -131,11 +131,18 @@ class TestOcrHelpers(unittest.TestCase):
             brain._OCR_JOBS.clear()
 
     def test_ocr_hit_page_returns_hit(self):
+        """第 407 项：命中页出来之后仍然 busy —— 同一名字在别的页也要标，识别继续跑。"""
         m = {'total': 3, 'done': False,
              'pages': {'2': {'lines': [[0.1, 0.2, 0.9, 0.25, '这里提到 深信服']]}}}
         with mock.patch.object(brain, '_ocr_side', lambda p: ('k4', None)), \
                 mock.patch.object(brain, '_ocr_load', lambda p: m):
-            self.assertEqual(brain.ocr_hit_page('x.pdf', ['深信服']), (2, 1, 3, False, False))
+            self.assertEqual(brain.ocr_hit_page('x.pdf', ['深信服']), (2, 1, 3, True, False))
+
+    def test_ocr_hit_page_done_without_hit(self):
+        m = {'total': 3, 'done': True, 'pages': {'1': {'lines': []}}}
+        with mock.patch.object(brain, '_ocr_side', lambda p: ('k5', None)), \
+                mock.patch.object(brain, '_ocr_load', lambda p: m):
+            self.assertEqual(brain.ocr_hit_page('x.pdf', ['深信服']), (0, 1, 3, False, True))
 
 
 class TestThumbVersion(unittest.TestCase):
