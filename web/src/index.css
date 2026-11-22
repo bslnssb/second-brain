@@ -91,7 +91,13 @@ mark.hl {
   border-radius: 3px;
   padding: 0 2px;
 }
-[data-theme='dark'] mark.hl {
-  background: rgb(var(--sb-accent) / 0.28);
-  color: #eef1f7;
+/* 表格/幻灯片里的命中：字号只有 10~11px，14% 的淡底基本看不出来，加描边提一档 */
+mark.hl-strong {
+  background: rgb(var(--sb-accent) / 0.26);
+  box-shadow: inset 0 0 0 1px rgb(var(--sb-accent) / 0.55);
 }
+[data-theme='dark'] mark.hl-strong {
+  background: rgb(var(--sb-accent) / 0.42);
+  box-shadow: inset 0 0 0 1px rgb(var(--sb-accent) / 0.7);
+}
+

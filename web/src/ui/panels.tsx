@@ -3959,6 +3959,40 @@ export function Timeline({
 }
 
 /** 把后端用 … 标的命中片段渲染成高亮 */
+/** 第 395 项：表格/幻灯片预览里的关键词高亮。
+ *  以前只有下面那段「命中的正文」会标红，表格单元格是原样文字 —— 用户要的「深信服」
+ *  全在表格里，却得自己一行行找。规则和列表标题高亮一致：按空格拆词、去掉
+ *  ext:/size:/dm:/content: 这类语法项和 - 排除项，大小写不敏感。 */
+export function HiText({ text, q, strong = false }: { text: string; q: string; strong?: boolean }) {
+  const raw = String(text ?? '')
+  if (!raw || !q) return <>{raw}</>
+  const toks = q
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter((s) => {
+      if (!s) return false
+      if (/^[-－]/.test(s)) return false
+      if (/^(ext|type|size|dm|content|内容|c):/i.test(s)) return false
+      return true
+    })
+  if (!toks.length) return <>{raw}</>
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const parts = raw.split(new RegExp(`(${toks.map(esc).join('|')})`, 'gi'))
+  return (
+    <>
+      {parts.map((seg, i) =>
+        i % 2 === 1 ? (
+          <mark key={i} className={strong ? 'hl hl-strong' : 'hl'}>
+            {seg}
+          </mark>
+        ) : (
+          <span key={i}>{seg}</span>
+        ),
+      )}
+    </>
+  )
+}
+
 function Marked({ text }: { text: string }) {
   const parts = String(text || '').split(/[]/)
   return (
@@ -4504,7 +4538,7 @@ export function Preview({
                         <tr key={ri} className={ri === 0 ? 'bg-card font-medium' : ''}>
                           {r.map((c, ci) => (
                             <td key={ci} className="max-w-[120px] truncate border border-line px-1 py-0.5 align-top">
-                              {c}
+                              <HiText text={c} q={q} strong />
                             </td>
                           ))}
                         </tr>
@@ -4520,12 +4554,14 @@ export function Preview({
               {inline.slides.map((sl) => (
                 <div key={sl.n} className="rounded-md border border-line bg-card px-2 py-1.5">
                   <div className="mb-0.5 text-[10px] text-sub">第 {sl.n} 页</div>
-                  <div className="text-[11px] font-medium leading-4">{sl.title}</div>
+                  <div className="text-[11px] font-medium leading-4">
+                    <HiText text={String(sl.title || '')} q={q} strong />
+                  </div>
                   {sl.lines.length > 0 && (
                     <ul className="mt-0.5 list-disc pl-4 text-[10px] leading-4 text-ink/80">
                       {sl.lines.slice(0, 6).map((ln, i) => (
                         <li key={i} className="truncate">
-                          {ln}
+                          <HiText text={ln} q={q} />
                         </li>
                       ))}
                     </ul>
