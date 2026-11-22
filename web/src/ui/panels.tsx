@@ -4090,6 +4090,8 @@ export function Preview({
   const [pages, setPages] = useState(0)
   /* 第 390 项：关键词命中第几页（0 = 不知道/没命中，Word 文本框里的字 Find 搜不到就会是 0） */
   const [hitPg, setHitPg] = useState(0)
+  /* 第 399 项：扫描件没有文本层，命中页由后台逐页 OCR 定位；这里显示 [已识别页, 总页数] */
+  const [ocrProg, setOcrProg] = useState<[number, number] | null>(null)
   /* 第 397 项：查询词变了要重新问「命中第几页」—— 但别每敲一个字就扫一遍 PDF 文本层，
      停手 400ms 再问。 */
   const [qNow, setQNow] = useState(q)
@@ -4181,6 +4183,7 @@ export function Preview({
     setPage(1)
     setPages(0)
     setHitPg(0)
+    setOcrProg(null)
     jumpedHit.current = false
     if (!isPdf) return
     let alive = true
@@ -4193,7 +4196,7 @@ export function Preview({
         `&s=${encodeURIComponent((row.b || row.snip || '').replace(/<\/?mark>/gi, ''))}`,
         { headers: { 'Sec-Fetch-Site': 'same-origin' } })
         .then((r) => r.json())
-        .then((j: { pages?: number; hit?: number; done?: boolean; state?: string }) => {
+        .then((j: { pages?: number; hit?: number; done?: boolean; state?: string; ocr?: [number, number] | null }) => {
           if (!alive || !j) return
           /* 第 391 项：后台明确说「这份转不出来」（卡死/失败冷却中），就别再转圈了 ——
              直接停掉重试、显示失败提示（还能用「打开」看原件）。 */
@@ -4201,6 +4204,8 @@ export function Preview({
             setThumbBad(true)
             return
           }
+          const op = j.ocr ? [Number(j.ocr[0]), Number(j.ocr[1])] as [number, number] : null
+          setOcrProg(op)
           const p = Number(j.pages || 0)
           if (p) setPages(p)
           const hit = Number(j.hit || 0)
@@ -4212,7 +4217,9 @@ export function Preview({
           /* 页数到手、而且已按当前查询词算过（done）就不用再问了；
              Office 换了关键词时会重导那一段，done 变 true 之前继续等 → 才能跳到新的命中页 */
           if (p > 0 && j.done !== false) return
-          if (++tries < 20) timer = window.setTimeout(ask, 1500)
+          /* 第 399 项：扫描件在 OCR，最多等 60 轮（约 90 秒），找到了就跳过去 */
+          const limit = op ? 60 : 20
+          if (++tries < limit) timer = window.setTimeout(ask, op ? 1500 : 1500)
         })
         .catch(() => {
           if (alive && ++tries < 20) timer = window.setTimeout(ask, 1500)
@@ -4446,11 +4453,15 @@ export function Preview({
           </button>
         </div>
       )}
-      {/* 第 397 项：扫描件（无文本层）页面上真的没法标字 —— 说句实话，
-          别让用户以为是漏标。OCR 出来的文字仍在下面「命中的正文」里标红。 */}
+      {/* 第 397/399 项：扫描件（无文本层）—— 后台按页 OCR 找命中页；
+          找的期间给进度，没找到才说「页面上标不出字」。 */}
       {isPdf && !isOfficePage && q && hitPg === 0 && pages > 0 && (
         <div className="mb-1 text-center text-[10px] text-sub">
-          这份 PDF 没有文字层（扫描件），页面上标不出字；OCR 的文字在下面「命中的正文」里已标出
+          {ocrProg
+            ? (ocrProg[1] > 0
+              ? `扫描件：正在识别第 ${ocrProg[0]} / ${ocrProg[1]} 页，找到命中词就跳过去…`
+              : `扫描件：正在识别第 ${ocrProg[0]} 页，找到命中词就跳过去…`)
+            : '这份 PDF 没有文字层（扫描件），页面上标不出字；OCR 的文字在下面「命中的正文」里已标出'}
         </div>
       )}
       {zoom && !thumbBad && (

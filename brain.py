@@ -13032,6 +13032,10 @@ THUMB_DIR = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~
 
                          'SecondBrain', 'thumbs')
 
+# 第 400 项：画框方式变了（search_for 按行分组、扫描件走 OCR 框）。旧缓存图是按老算法
+# 画的，key 里加个版本号，让它自然失效，不用用户手动清缓存。
+THUMB_SCHEME = 'v2'
+
 
 
 
@@ -13054,8 +13058,9 @@ def _thumb_disk_path(path, max_w, max_h, page=0, hl=()):
 
         stamp = 'na'
 
-    raw = ('%s|%s|%dx%d|p%d|%s' % (os.path.normcase(path), stamp, max_w, max_h,
-                                   int(page or 0), ','.join(hl or ()))).encode('utf-8', 'replace')
+    raw = ('%s|%s|%dx%d|p%d|%s|%s' % (os.path.normcase(path), stamp, max_w, max_h,
+                                      int(page or 0), ','.join(hl or ()),
+                                      THUMB_SCHEME)).encode('utf-8', 'replace')
 
     import hashlib
 
@@ -13522,6 +13527,209 @@ def pdf_pages(path, q=''):
 
 
 
+# ------------------ 第 399 项：扫描件（无文本层）的页级 OCR ------------------
+# PDF 全靠图片、没有文本层时，既定位不到命中页、也画不出高亮。索引阶段本来就 OCR 过，
+# 但那是「整篇正文」，没留页号；这里给**详情栏**单独做一份按页缓存的 OCR：
+# 只对用户真正点开的那一份跑、后台单线程、优先级 BELOW_NORMAL、每页落盘，
+# 找命中页和画黄框都读这份缓存。
+OCR_DPI = 150.0          # 定位/画框够用；180 会更准但每页多花 200~300ms
+OCR_JOB_BUDGET = 75.0    # 单份最多烧 75 秒 OCR，超了就先把已识别的交出去
+_OCR_MAP = {}            # key -> {'pages': {页号: {'lines': [...]}}, 'total': n, 'done': bool}
+_OCR_JOBS = {}           # key -> Thread
+_OCR_TARGET = {}         # key -> (tokens, ctx)
+_OCR_ACTIVE = {'key': '', 'ts': 0.0}
+_OCR_LOCK = threading.Lock()
+
+
+def _ocr_side(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, None
+    k = hashlib.sha1(('%s|%d|%d' % (os.path.normcase(str(path)), int(st.st_mtime),
+                                     st.st_size)).encode()).hexdigest()
+    return k, os.path.join(app_dir(), 'preview_cache', k + '.ocr.json')
+
+
+def _ocr_load(path):
+    k, fp = _ocr_side(path)
+    if not k:
+        return None
+    with _OCR_LOCK:
+        m = _OCR_MAP.get(k)
+    if m is not None:
+        return m
+    m = {'pages': {}, 'total': 0, 'done': False}
+    try:
+        with open(fp, 'r', encoding='utf-8') as f:
+            m.update(json.load(f) or {})
+    except Exception:
+        pass
+    with _OCR_LOCK:
+        _OCR_MAP[k] = m
+    return m
+
+
+def _ocr_save(k, m):
+    try:
+        fp = os.path.join(app_dir(), 'preview_cache', k + '.ocr.json')
+        tmp = fp + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(m, f, ensure_ascii=False)
+        os.replace(tmp, fp)
+    except Exception:
+        pass
+
+
+def _ocr_norm(lines):
+    return re.sub(r'\s+', '', ' '.join(str(l[4]) for l in lines)).lower()
+
+
+def _ocr_map_search(m, tokens, ctx=''):
+    """已识别页里找命中页（1 基）。有片段就先按片段找（哪怕后面的页也有词），
+    片段找不到才退回按词。"""
+    toks = [str(t).lower() for t in tokens or []]
+    if not m or not m.get('pages'):
+        return 0
+    pages = sorted(m['pages'], key=lambda s: int(s))
+    if ctx:
+        for p in pages:
+            norm = _ocr_norm((m['pages'][p] or {}).get('lines') or [])
+            if norm and ctx.lower() in norm:
+                return int(p)
+    if toks:
+        for p in pages:
+            norm = _ocr_norm((m['pages'][p] or {}).get('lines') or [])
+            if norm and any(t in norm for t in toks):
+                return int(p)
+    return 0
+
+
+def _lower_current_thread():
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.SetThreadPriority(k32.GetCurrentThread(), -1)   # BELOW_NORMAL
+    except Exception:
+        pass
+
+
+def _ocr_run(path, k):
+    """后台逐页 OCR（只跑用户当前点开的那一份）。"""
+    _lower_current_thread()
+    m = _ocr_load(path) or {'pages': {}, 'total': 0, 'done': False}
+    t0 = time.time()
+    try:
+        import pdf_engine as pymupdf
+        with pymupdf.open(str(path)) as doc:
+            n = len(doc)
+            m['total'] = n
+            ocr = _get_ocr()
+            for i in range(n):
+                with _OCR_LOCK:
+                    if _OCR_ACTIVE.get('key') not in ('', k):
+                        break                    # 用户已经去看别的文件了
+                    toks, ctx = _OCR_TARGET.get(k, ([], ''))
+                if pymupdf and _ocr_map_search(m, toks, ctx):
+                    break                        # 已经找到，没必要继续烧 CPU
+                if time.time() - t0 > OCR_JOB_BUDGET:
+                    break
+                p = i + 1
+                if p in m['pages']:
+                    continue
+                try:
+                    page = doc[i]
+                    r = page.rect
+                    z = min(OCR_DPI / 72.0, 2200.0 / max(r.width, r.height, 1))
+                    if z < 0.05:
+                        continue
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
+                    res, _e = ocr(pix.tobytes('png'))
+                    w = float(pix.width) or 1.0
+                    h = float(pix.height) or 1.0
+                    pix = None
+                    lines = []
+                    for box, txt, _score in (res or []):
+                        txt = str(txt or '').strip()
+                        if not box or not txt:
+                            continue
+                        xs = [pt[0] for pt in box]
+                        ys = [pt[1] for pt in box]
+                        lines.append([min(xs) / w, min(ys) / h,
+                                      max(xs) / w, max(ys) / h, txt])
+                    m['pages'][str(p)] = {'lines': lines[:200]}
+                    _ocr_save(k, m)
+                except Exception:
+                    continue
+            m['done'] = len(m['pages']) >= (m.get('total') or 0)
+            _ocr_save(k, m)
+    except Exception:
+        try:
+            m['done'] = True
+            _ocr_save(k, m)
+        except Exception:
+            pass
+    finally:
+        with _OCR_LOCK:
+            _OCR_JOBS.pop(k, None)
+
+
+def ocr_hit_page(path, tokens, ctx=''):
+    """扫描件的命中页：(页号, 已识别页数, 总页数, 是否还在跑)。没找到就先在后台排上。"""
+    k, _fp = _ocr_side(path)
+    if not k:
+        return 0, 0, 0, False
+    m = _ocr_load(path) or {'pages': {}, 'total': 0, 'done': False}
+    hit = _ocr_map_search(m, tokens, ctx)
+    done = len(m.get('pages') or {})
+    total = int(m.get('total') or 0)
+    if hit or m.get('done'):
+        return hit, done, total, False
+    with _OCR_LOCK:
+        _OCR_ACTIVE['key'] = k
+        _OCR_ACTIVE['ts'] = time.time()
+        _OCR_TARGET[k] = ([str(t).lower() for t in tokens or []], str(ctx or ''))
+        th = _OCR_JOBS.get(k)
+        if th is None:
+            th = threading.Thread(target=_ocr_run, args=(path, k), daemon=True,
+                                  name='ocr-%s' % k[:6])
+            _OCR_JOBS[k] = th
+            th.start()
+    return 0, done, total, True
+
+
+def _ocr_line_rects(path, page, tokens):
+    """某一页里命中词的位置（归一化 0~1），给页图画黄框用。
+
+    按「行文本框 + 字序比例」切：OCR 给的是整行框，直接整行涂黄会把一行都糊掉。
+    """
+    k, _fp = _ocr_side(path)
+    if not k or not tokens:
+        return []
+    with _OCR_LOCK:
+        m = _OCR_MAP.get(k)
+    if m is None:
+        m = _ocr_load(path)
+    pg = ((m or {}).get('pages') or {}).get(str(page))
+    if not pg:
+        return []
+    out = []
+    for x0, y0, x1, y1, txt in (pg.get('lines') or []):
+        s = str(txt)
+        low = s.lower()
+        n = len(s) or 1
+        for tok in tokens:
+            tok = str(tok).lower()
+            if not tok:
+                continue
+            i = low.find(tok)
+            while i >= 0 and len(out) < 200:
+                a = x0 + (x1 - x0) * (i / n)
+                b = x0 + (x1 - x0) * ((i + len(tok)) / n)
+                out.append((a, y0, b, y1))
+                i = low.find(tok, i + len(tok))
+    return out
+
+
 def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
 
     """图片/PDF → 缩略图 PNG 字节。失败返回 None，前端回落到系统图标。
@@ -13752,6 +13960,19 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
                                                      fill=(255, 214, 0, 120))
 
                                         marked = True
+
+                                # 第 399 项：扫描件没有文本层，search_for 一个框都拿不到 ——
+                                # 读后台刚 OCR 出来的行框（归一化坐标），按字序切出命中的那一截。
+                                if not marked and _hl:
+                                    try:
+                                        W, Hh = im.size
+                                        for _a, _b, _c, _d in _ocr_line_rects(
+                                                str(path), int(pg) + 1, _hl)[:200]:
+                                            dr.rectangle([_a * W, _b * Hh, _c * W, _d * Hh],
+                                                         fill=(255, 214, 0, 120))
+                                            marked = True
+                                    except Exception:
+                                        pass
 
                                 if marked:
 
@@ -24668,6 +24889,7 @@ def make_server(port=8765):
                 hpg = 0
                 hdn = True
                 stt = 'none'
+                ocr_prog = None
 
                 kw = (qs.get('q', [''])[0] or '').strip()
                 # 第 398 项：「命中的正文」那一小段（带 \x01/\x02 标记）—— 命中页要和它对齐：
@@ -24707,6 +24929,20 @@ def make_server(port=8765):
                             cp = pdf_hit_page(p, kw, snip=snip)
                             if cp:
                                 hpg = cp
+                        # 第 399 项：扫描件没有文本层 → 后台逐页 OCR 定命中页（单线程、
+                        # BELOW_NORMAL、每页落盘）。没找完就让前端继续轮询、显示进度。
+                        ocr_prog = None
+                        if not hpg and p.lower().endswith('.pdf') and kw:
+                            try:
+                                oh, od, ot, obusy = ocr_hit_page(
+                                    p, doc_render._q_tokens(kw),
+                                    doc_render._context_window(snip))
+                                hpg = oh
+                                if not oh and obusy:
+                                    ocr_prog = [od, ot]   # ot 先可能是 0（刚起跑）
+                                    hdn = False           # 还没算完，前端别停
+                            except Exception:
+                                ocr_prog = None
                         if not hdn and kw:
                             # 手里的那段是旧关键词定位的（或者还是旧版本缓存）：
                             # 这里踢一脚，让它按当前词重导那一段；前端会继续轮询到 done
@@ -24716,7 +24952,9 @@ def make_server(port=8765):
                         stt = doc_render.status_for(p, app_dir())
 
                 body = json.dumps({'ok': bool(pgs), 'pages': pgs, 'hit': hpg, 'done': hdn,
-                                   'state': stt},
+                                   'state': stt,
+                                   # 第 399 项：扫描件的 OCR 进度 [已识别页, 总页数]
+                                   'ocr': ocr_prog},
                                   ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'

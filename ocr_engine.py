@@ -81,7 +81,12 @@ def get_engine():
             if _engine is None:
                 from rapidocr import RapidOCR
                 # log_level=error：静默掉「某页没检出文字」这类 WARNING，别写进 debug.log
-                _engine = RapidOCR(params={'Global.log_level': 'error'})
+                # 第 399 项：扫描件定位命中页会在后台连续 OCR，默认 -1 会让 onnxruntime
+                # 吃满所有核（实测 3 核多），用户前台搜索明显被打扰 → 限 2 线程 + 1 个
+                # inter-op，单页约 0.5~1s，整份 30 页 6~10s，够快也不卡。
+                _engine = RapidOCR(params={'Global.log_level': 'error',
+                                           'EngineConfig.onnxruntime.intra_op_num_threads': 2,
+                                           'EngineConfig.onnxruntime.inter_op_num_threads': 1})
     return _engine
 
 

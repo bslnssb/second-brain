@@ -105,7 +105,13 @@ class Page:
             return ''
 
     def search_for(self, text, quads=False):
-        """返回命中区域的 Rect 列表（左上原点坐标）。"""
+        """返回命中区域的 Rect 列表（左上原点坐标）。
+
+        第 400 项：以前把匹配到的所有字符框并成**一个**矩形 —— PDFium 给的
+        (起始字符, 个数) 偶尔跨行（Word 导出的 PDF 里一行就是一个 run），
+        一合并就变成覆盖两三行的黄块，看起来像「错误命中」。现在按行分组：
+        纵向重叠不足就另起一个矩形，每个矩形只框一行的字。
+        """
         needle = str(text or '').strip()
         if not needle:
             return []
@@ -120,21 +126,28 @@ class Page:
                     if not hit:
                         break
                     idx, cnt = hit
-                    x0 = y0 = x1 = y1 = None
+                    cur = None
                     for k in range(idx, idx + max(1, int(cnt))):
                         try:
                             l, b, r, t = tp.get_charbox(k)
                         except Exception:
                             continue
-                        # PDFium 左下原点 → 左上原点
+                        if r - l <= 0 and t - b <= 0:
+                            continue
                         ty0, ty1 = h - t, h - b
-                        if x0 is None:
-                            x0, y0, x1, y1 = l, ty0, r, ty1
+                        if cur is None:
+                            cur = [l, ty0, r, ty1]
+                            continue
+                        ch = max(1.0, ty1 - ty0)
+                        overlap = min(ty1, cur[3]) - max(ty0, cur[1])
+                        if overlap / min(ch, max(1.0, cur[3] - cur[1])) < 0.5:
+                            out.append(Rect(*cur))          # 换行了，先收这一行
+                            cur = [l, ty0, r, ty1]
                         else:
-                            x0, y0 = min(x0, l), min(y0, ty0)
-                            x1, y1 = max(x1, r), max(y1, ty1)
-                    if x0 is not None:
-                        out.append(Rect(x0, y0, x1, y1))
+                            cur = [min(cur[0], l), min(cur[1], ty0),
+                                   max(cur[2], r), max(cur[3], ty1)]
+                    if cur is not None:
+                        out.append(Rect(*cur))
             finally:
                 try:
                     searcher.close()
