@@ -4400,15 +4400,22 @@ export function Preview({
      只滚表格这个盒子（不 scrollIntoView，免得把整个详情栏/页面一起滚跑）。 */
   useEffect(() => {
     if (inline.st !== 'ok' || !inline.sheets) return
-    const timer = window.setTimeout(() => {
+    /* 铺表、字体、横向滚动都会改布局，一次可能算不准 —— 连做三次（60/250/600ms）。 */
+    const jump = () => {
       const box = sheetGrid.current
-      if (!box) return
-      const rowEl = hitRowRef.current
       const cellEl = hitCellRef.current
-      if (rowEl) box.scrollTop = Math.max(0, rowEl.offsetTop - box.clientHeight / 3)
-      if (cellEl) box.scrollLeft = Math.max(0, cellEl.offsetLeft - box.clientWidth / 2)
-    }, 60)
-    return () => window.clearTimeout(timer)
+      if (!box || !cellEl) return
+      const left = cellEl.offsetLeft - box.clientWidth / 3
+      box.scrollLeft = Math.max(0, Math.min(left, box.scrollWidth - box.clientWidth))
+    }
+    const t1 = window.setTimeout(jump, 60)
+    const t2 = window.setTimeout(jump, 250)
+    const t3 = window.setTimeout(jump, 600)
+    return () => {
+      window.clearTimeout(t1)
+      window.clearTimeout(t2)
+      window.clearTimeout(t3)
+    }
   }, [inline, sheetPick])
   // 第 312 项：Word/Excel/PPT 不显示图，改成进面板就把正文首段拉出来。
   // 只在这三类上自动拉；txt/pdf 这类本来就长，还是让用户自己点「读取正文」，
@@ -4622,9 +4629,15 @@ export function Preview({
             const si = sheetPick != null && sheetPick >= 0 && sheetPick < sheets.length ? sheetPick : hit.si
             const sh = sheets[si]
             const focus = si === hit.si ? hit.ri : -1
-            const start = focus >= 0 ? Math.max(0, focus - 12) : 0
-            const end = focus >= 0 ? Math.min(sh.rows.length, focus + 40) : Math.min(sh.rows.length, 60)
-            const rows = sh.rows.slice(start, end)
+            /* 命中行放在窗口第 4 行 —— 不再依赖 scrollTop（表格刚铺出来时高度还算不准，
+               之前 scrollTop 会被后面的布局变化吃掉）。 */
+            const start = focus >= 0 ? Math.max(0, focus - 3) : 0
+            const end = focus >= 0 ? Math.min(sh.rows.length, focus + 30) : Math.min(sh.rows.length, 60)
+            /* 第 401 项：窗口从命中行附近开始时，把第 1 行（表头）钉在顶部 ——
+               不然滚过去只剩数据，看不出哪一列是什么。 */
+            const shown: Array<{ ri: number; r: string[]; head: boolean }> = []
+            if (start > 0 && sh.rows.length) shown.push({ ri: 0, r: sh.rows[0], head: true })
+            for (let i = start; i < end; i++) shown.push({ ri: i, r: sh.rows[i], head: false })
             return (
               <div ref={sheetBox} className="rounded-md border border-line bg-card p-1">
                 {sheets.length > 1 && (
@@ -4657,14 +4670,19 @@ export function Preview({
                 <div ref={sheetGrid} className="max-h-[42vh] overflow-auto">
                   <table className="w-full border-collapse text-[10px] leading-4">
                     <tbody>
-                      {rows.map((r, ri0) => {
-                        const ri = start + ri0
+                      {shown.map(({ ri, r, head }) => {
                         const isHitRow = ri === focus
                         return (
                           <tr
-                            key={ri}
+                            key={`${head ? 'h' : 'r'}${ri}`}
                             ref={isHitRow ? hitRowRef : undefined}
-                            className={isHitRow ? 'bg-card font-medium' : ''}
+                            className={
+                              head
+                                ? 'sticky top-0 z-10 bg-bg font-medium'
+                                : isHitRow
+                                  ? 'bg-card font-medium'
+                                  : ''
+                            }
                           >
                             {r.map((c, ci) => {
                               const cellHit = isHitRow && ci === hit.ci
@@ -4672,7 +4690,9 @@ export function Preview({
                                 <td
                                   key={ci}
                                   ref={cellHit ? hitCellRef : undefined}
-                                  className="max-w-[120px] truncate border border-line px-1 py-0.5 align-top"
+                                  className={`max-w-[120px] truncate border border-line px-1 py-0.5 align-top ${
+                                    ci === 0 ? `sticky left-0 ${head ? 'z-20 bg-bg' : 'z-10 bg-card'}` : ''
+                                  }`}
                                 >
                                   <HiText text={c} q={q} strong />
                                 </td>

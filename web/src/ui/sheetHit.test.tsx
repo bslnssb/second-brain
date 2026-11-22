@@ -7,6 +7,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { findSheetHit } from './panels'
+import { canInline } from './docview'
 import type { SheetTable } from './docview'
 
 const sheet = (name: string, rows: string[][]): SheetTable => {
@@ -49,5 +50,21 @@ describe('findSheetHit（第 401 项）', () => {
   it('大小写与空白不敏感', () => {
     const sheets = [sheet('A', [['Sangfor Technologies']])]
     expect(findSheetHit(sheets, 'sangFOR', '').ri).toBe(0)
+  })
+})
+
+describe('老格式也要能内嵌预览（第 401 项附带）', () => {
+  it('.xls / .et 走表格预览（以前白名单里只有 xlsx，选中就是一片空白）', () => {
+    expect(canInline('xls')).toBe(true)
+    expect(canInline('.XLS')).toBe(true)
+    expect(canInline('et')).toBe(true)
+    expect(canInline('xlsx')).toBe(true)
+    expect(canInline('docx')).toBe(true)
+  })
+
+  it('老 .doc / .ppt 仍不做前端版面预览（交给页图那套）', () => {
+    expect(canInline('doc')).toBe(false)
+    expect(canInline('ppt')).toBe(false)
+    expect(canInline('txt')).toBe(false)
   })
 })

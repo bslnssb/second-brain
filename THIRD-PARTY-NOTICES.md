@@ -29,7 +29,7 @@
 | pywin32 | 312 | PSF-2.0 | Win32 集成（钩子/托盘/剪贴板） | https://github.com/mhammond/pywin32 |
 | JSZip | — | MIT | 前端解析 docx/xlsx（vendor/jszip.min.js） | https://stuk.github.io/jszip/ |
 | docx-preview | — | Apache-2.0 | docx 版面预览（vendor/docx-preview.min.js） | https://github.com/VolodymyrBaydalka/docxjs |
-| SheetJS (xlsx) | — | Apache-2.0 | xlsx 版面预览（vendor/xlsx.mini.min.js） | https://sheetjs.com |
+| SheetJS (xlsx) | — | Apache-2.0 | xlsx 版面预览（vendor/xlsx.full.min.js） | https://sheetjs.com |
 
 ## 说明
 

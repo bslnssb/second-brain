@@ -76,7 +76,8 @@ class TestI18n(unittest.TestCase):
         # 863：第 369 项截图翻译三入口 +4 键（snip_trans_btn / snip_menu_pure / snip_menu_trans / snip_menu_hint）
         # 878：第 380 项关于页「开源组件」+15 键（oss_* 清单 / 列头 / 模型指纹 / 目录 / 复制）
         # 881：第 386 项详情栏「默认展开」+3 键（dtl_expand / _label / _tip）
-        self.assertEqual(881, len(self.D['ZH']))
+        # 882：第 401 项多表 xlsx 表头「命中行」+1 键（dtl_sheet_hit_row）
+        self.assertEqual(882, len(self.D['ZH']))
         for n in ('EN', 'ES', 'PT', 'HI'):
             self.assertEqual(len(self.D['ZH']), len(self.D[n]), n)
 

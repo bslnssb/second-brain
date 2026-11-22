@@ -47,7 +47,7 @@ async function ensureDocx(): Promise<void> {
 }
 
 async function ensureXlsx(): Promise<void> {
-  await loadScript('xlsx.mini.min.js')
+  await loadScript('xlsx.full.min.js')
 }
 
 export function docRawUrl(path: string): string {
@@ -65,7 +65,7 @@ export function canLayout(ext: string): boolean {
    跟 canLayout 分开是因为两件事不一样：
    · canLayout  = 能开「预览版面」大窗（版面渲染器真能画）；
    · canInline  = 选中即出小预览（有的格式只能出「内容」，出不了版面，比如 pptx）。 */
-export const INLINE_EXT = ['docx', 'xlsx', 'pptx']
+export const INLINE_EXT = ['docx', 'xlsx', 'pptx', 'xls', 'et']
 
 export function canInline(ext: string): boolean {
   return INLINE_EXT.includes(String(ext || '').replace(/^\./, '').toLowerCase())

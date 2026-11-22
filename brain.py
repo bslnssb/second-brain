@@ -9451,12 +9451,15 @@ def _py_rank(level, name, q):
 # 分页早就在抽取那一步丢了 —— 前端要画版面只能回头读原文件。
 # 只放行这三种「zip+xml」格式：老式 .doc/.xls 前端也能解析，但它们没有版式可画，
 # 放进来只是多一条读盘通道，没必要。
-_RAW_OK_EXT = ('docx', 'xlsx', 'pptx')
+# 第 401 项：老 Excel 也放行 —— 前端换成 xlsx.full 后能解析 .xls/.et 的 BIFF
+_RAW_OK_EXT = ('docx', 'xlsx', 'pptx', 'xls', 'et')
 
 _RAW_MIME = {
     'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'xls': 'application/vnd.ms-excel',
+    'et': 'application/vnd.ms-excel',
 }
 
 # 48MB：正常合同/报表远小于这个数，再大前端渲染也顶不住，直接不给。

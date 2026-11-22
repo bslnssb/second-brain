@@ -135,6 +135,8 @@ sync  web/tsconfig.json
 sync  web/vite.config.ts
 sync  web/README.md
 sync  web/src/
+# 401：前端运行时要用的第三方 JS（docx-preview / JSZip / SheetJS），以前只在 dist 里，源码版重建会缺
+sync  web/public/vendor/
 
 # ─────────────────────────── 图片资源 ───────────────────────────
 # 这三张在开发根 assets/ 里；二维码换了要同时改 brain.py 的 DONATE_SHA256
