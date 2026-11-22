@@ -4187,7 +4187,10 @@ export function Preview({
     let tries = 0
     let timer: number | null = null
     const ask = () => {
-      fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}&q=${encodeURIComponent(qNow)}`,
+      /* 第 398 项：把「命中的正文」那一段一起带上 —— 后端用它把命中页对齐到
+         片段所在的页，而不是「这份文档里第一个出现这个词的页」。 */
+      fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}&q=${encodeURIComponent(qNow)}` +
+        `&s=${encodeURIComponent((row.b || row.snip || '').replace(/<\/?mark>/gi, ''))}`,
         { headers: { 'Sec-Fetch-Site': 'same-origin' } })
         .then((r) => r.json())
         .then((j: { pages?: number; hit?: number; done?: boolean; state?: string }) => {
@@ -4220,7 +4223,7 @@ export function Preview({
       alive = false
       if (timer) window.clearTimeout(timer)
     }
-  }, [row.p, isPdf, qNow])
+  }, [row.p, isPdf, qNow, row.b, row.snip])
   useEffect(() => {
     if (!zoom) return
     const el = zoomRef.current

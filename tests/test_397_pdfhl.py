@@ -111,6 +111,40 @@ class TestPdfHitPage(unittest.TestCase):
         self.assertEqual(brain.pdf_hit_page(os.path.join(self.dir, 'a.docx'), 'x'), 0)
 
 
+class TestContextWindow(unittest.TestCase):
+    """第 398 项：命中页要与「命中的正文」对齐，而不是「第一个出现这个词的页」。"""
+
+    def test_window_from_marks(self):
+        s = '…天融信 \x01深信服\x02 型号 DAS-DBAuditor-A150…'
+        ctx = doc_render._context_window(s)
+        self.assertIn('深信服', ctx)
+        self.assertIn('DAS-DBAuditor', ctx)
+        self.assertNotIn(' ', ctx)          # PDF 抽出文本带换行/空格，上下文要抹掉空白
+        self.assertNotIn('…', ctx)
+
+    def test_no_marks(self):
+        self.assertEqual(doc_render._context_window('没有标记的一段'), '')
+
+    def test_too_short(self):
+        self.assertEqual(doc_render._context_window('…\x01服\x02…'), '')
+
+    def test_page_with_ctx(self):
+        pages = ['aaa', '天融信深信服型号DAS', 'bbb']
+        with mock.patch('pdf_engine.open', lambda path, password=None: _FakeDoc(pages)):
+            d = tempfile.mkdtemp(prefix='memex398-')
+            pdf = os.path.join(d, 'a.pdf')
+            open(pdf, 'wb').write(b'%PDF-1.4\n')
+            try:
+                self.assertEqual(
+                    doc_render._pdf_page_with_ctx(pdf, '天融信深信服型号DAS'), 2)
+                # 第二次走缓存（open 会炸也不影响）
+                with mock.patch('pdf_engine.open', side_effect=RuntimeError('boom')):
+                    self.assertEqual(
+                        doc_render._pdf_page_with_ctx(pdf, '天融信深信服型号DAS'), 2)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 class TestPdfFirstHit(unittest.TestCase):
     """导出后的 PDF 里补找命中页：Word 文本框 / PPT / Excel 全靠这一手。"""
 

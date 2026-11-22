@@ -13447,7 +13447,7 @@ def _shell_thumb_png(path, size=256):
 
 
 
-def pdf_hit_page(path, kw, max_pages=300):
+def pdf_hit_page(path, kw, max_pages=300, snip=''):
     """PDF 命中页（1 基，0 = 没找到/扫描件）。第 397 项：多关键词 + 整份扫。
 
     不再用 pypdf 逐页 extract_text（还只扫前 30 页 —— 31 页的培训大纲命中在第 31 页
@@ -13462,10 +13462,18 @@ def pdf_hit_page(path, kw, max_pages=300):
         mt = os.path.getmtime(pp)
     except OSError:
         return 0
-    key = ('hitpg', pp, int(mt), '|'.join(toks))
+    # 第 398 项：有「命中的正文」片段时，优先按片段上下文定页 —— 同一份 PDF 里
+    # 同一个词可能出现在很多页，第一个命中未必是用户看到的那一段。
+    _ctx = doc_render._context_window(snip)
+    key = ('hitpg', pp, int(mt), '|'.join(toks), _ctx)
     if key in _PAGE_CACHE:
         return _PAGE_CACHE[key] or 0
     page = 0
+    if _ctx:
+        page = doc_render._pdf_page_with_ctx(pp, _ctx)
+        if page:
+            _PAGE_CACHE[key] = page
+            return page
     try:
         import pdf_engine as pymupdf
         with pymupdf.open(pp) as doc:
@@ -24662,6 +24670,9 @@ def make_server(port=8765):
                 stt = 'none'
 
                 kw = (qs.get('q', [''])[0] or '').strip()
+                # 第 398 项：「命中的正文」那一小段（带 \x01/\x02 标记）—— 命中页要和它对齐：
+                # 同一份投标材料里品牌对比表每页都有「深信服」，按第一个命中会停在封面。
+                snip = (qs.get('s', [''])[0] or '').strip()
 
                 if p and _local_only(p) and os.path.exists(p):
 
@@ -24684,13 +24695,18 @@ def make_server(port=8765):
 
                         pgs = pdf_pages(p, kw)
                         # 第 390 项：详情栏要直接停在命中页（Word 转换时用 Find 定位好）
-                        hpg, hdn = doc_render.hit_info(p, app_dir(), kw)
+                        hpg, hdn = doc_render.hit_info(p, app_dir(), kw, snip)
                         # 第 397 项：PDF 以前没有命中页 —— pdfmeta 只问 Office，文档栏目
                         # 因此永远停在第 1 页，目录里的词自然一个高亮都没有。
                         # 这里只对 .pdf 走文本层定位（多关键词任一命中）；扫描件回来 0，
                         # 前端就知道「页面上没法标字」，给一句实话而不是空白。
                         if not hpg and p.lower().endswith('.pdf') and kw:
-                            hpg = pdf_hit_page(p, kw)
+                            hpg = pdf_hit_page(p, kw, snip=snip)
+                        elif hpg and p.lower().endswith('.pdf') and snip:
+                            # 有片段就以片段为准（先按词定位到的可能是封面那页）
+                            cp = pdf_hit_page(p, kw, snip=snip)
+                            if cp:
+                                hpg = cp
                         if not hdn and kw:
                             # 手里的那段是旧关键词定位的（或者还是旧版本缓存）：
                             # 这里踢一脚，让它按当前词重导那一段；前端会继续轮询到 done

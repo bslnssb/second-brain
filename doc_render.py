@@ -920,7 +920,62 @@ def _pdf_first_hit(pdf_path, tokens, max_pages=300):
     return 0
 
 
-def hit_info(path, base, q=''):
+def _context_window(snippet, width=16):
+    """「命中的正文」片段 → 一段可用的上下文（去空白，供在 PDF 里定位）。
+
+    片段形如 `…近日多家医院…\\x01深信服\\x02安全团队…`：取命中词左右各 width 个字，
+    再把所有空白抹掉 —— PDF 抽出来的文本有换行/空格，直接比原文匹配不上。
+    """
+    s = str(snippet or '')
+    if '\x01' not in s:
+        return ''
+    left, rest = s.split('\x01', 1)
+    if '\x02' in rest:
+        tok, right = rest.split('\x02', 1)
+    else:
+        tok, right = rest, ''
+    left = left.replace('…', '').strip()
+    right = right.replace('…', '').strip()
+    ctx = left[-width:] + tok + right[:width]
+    ctx = re.sub(r'\s+', '', ctx)
+    return ctx if len(ctx) >= 4 else ''
+
+
+_CTX_CACHE = {}
+
+
+def _pdf_page_with_ctx(pdf_path, ctx, max_pages=300):
+    """上下文落在第几页（1 基，0=没找到）。按 (路径, mtime, 上下文) 缓存。"""
+    if not ctx or not pdf_path or not os.path.exists(pdf_path):
+        return 0
+    try:
+        st = os.stat(pdf_path)
+    except OSError:
+        return 0
+    key = (os.path.normcase(pdf_path), int(st.st_mtime), ctx[:80])
+    if key in _CTX_CACHE:
+        return _CTX_CACHE[key]
+    page = 0
+    try:
+        import pdf_engine as pymupdf
+        with pymupdf.open(pdf_path) as doc:
+            for i in range(min(len(doc), int(max_pages or 300))):
+                try:
+                    txt = re.sub(r'\s+', '', doc[i].get_text() or '')
+                except Exception:                 # noqa: BLE001
+                    continue
+                if ctx in txt:
+                    page = i + 1
+                    break
+    except Exception:                             # noqa: BLE001
+        page = 0
+    if len(_CTX_CACHE) > 300:
+        _CTX_CACHE.clear()
+    _CTX_CACHE[key] = page
+    return page
+
+
+def hit_info(path, base, q='', snip=''):
     """(关键词命中的原始页码, 是否已按当前查询词算过)。
 
     `done=False` 表示 meta 里的 hit/段是按**别的查询词**（或者还是旧版本缓存）算的，
@@ -936,9 +991,55 @@ def hit_info(path, base, q=''):
     meta = _read_meta(path, base)
     if not meta:
         return 0, False
-    if (meta.get('q') or '') != ' '.join(_q_tokens(q)):
+    qn = ' '.join(_q_tokens(q))
+    if (meta.get('q') or '') != qn:
         return 0, False
-    return int(meta.get('hit') or 0), True
+    hit = int(meta.get('hit') or 0)
+    if not hit and qn:
+        # 第 398 项：Word 的 Find 搜不到表格/文本框里的字时 meta 的 hit 会是 0，
+        # 而「已经导出的那份 PDF 明明有文字层」。这里拿它在手上补一次（只扫到命中为止，
+        # 一般 ms 级），补到就写回 meta —— 之后每次问都是白读一个数字。
+        full, head, _m2 = _side_paths(path, base)
+        src = ''
+        is_full = False
+        if full and os.path.exists(full) and os.path.getsize(full) > 0:
+            src, is_full = full, True
+        elif head and os.path.exists(head) and os.path.getsize(head) > 0:
+            src = head
+        if src:
+            idx = _pdf_first_hit(src, _q_tokens(q))
+            if idx:
+                frm = int(meta.get('from') or 1)
+                head_pages = int(meta.get('head') or 0)
+                hit = idx if is_full else frm + idx - 1
+                if head_pages and not is_full:
+                    hit = min(hit, frm + head_pages - 1)
+                try:
+                    _write_meta(path, base, int(meta.get('pages') or 0), head_pages, frm, hit, qn)
+                except Exception:             # noqa: BLE001
+                    pass
+    # 第 398 项：命中页要跟「命中的正文」对齐 —— 同一份材料里品牌对比表每页都有
+    # 这个词，按「第一个命中」跳会停在目录/封面那张，用户看到的正文却在第 3 页。
+    # 有片段就用片段上下文在已经导出的 PDF 里再定一次（只扫到命中为止，结果带缓存）。
+    ctx = _context_window(snip)
+    if ctx:
+        full, head, _m3 = _side_paths(path, base)
+        src = ''
+        is_full = False
+        if full and os.path.exists(full) and os.path.getsize(full) > 0:
+            src, is_full = full, True
+        elif head and os.path.exists(head) and os.path.getsize(head) > 0:
+            src = head
+        if src:
+            idx = _pdf_page_with_ctx(src, ctx)
+            if idx:
+                frm = int(meta.get('from') or 1)
+                head_pages = int(meta.get('head') or 0)
+                cpg = idx if is_full else frm + idx - 1
+                if head_pages and not is_full:
+                    cpg = min(cpg, frm + head_pages - 1)
+                hit = cpg
+    return int(hit or 0), True
 
 
 def hit_page(path, base, q=''):
