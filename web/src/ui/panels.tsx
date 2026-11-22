@@ -4346,8 +4346,11 @@ export function Preview({
   /* 第 385 项：Excel 系（xls/xlsx/et）用「单元格表格」当主预览 —— 可读、可滚，
      不像 Page 图那样被打印分页切成一小块。其余（docx/pptx）先出页图，
      页图取不到时才回落到纯前端渲染。 */
-  const SHEET_EXT = ['xls', 'xlsx', 'et']
-  const INLINE_PRIMARY = SHEET_EXT
+  /* 第 405 项：CSV/TSV 也走「单元格表格」（以前只有 xls/xlsx/et，csv 连预览块都不出现）。
+     pptx 的幻灯片文字预览改成「主预览」：WPS 转页图要好几秒（60MB 的课件更久），
+     这期间详情栏以前是空的；现在先立刻铺文字，页图转好了再叠在上面。 */
+  const SHEET_EXT = ['xls', 'xlsx', 'et', 'csv', 'tsv']
+  const INLINE_PRIMARY = [...SHEET_EXT, 'pptx']
   const inlinePrimary = INLINE_PRIMARY.includes(inlineExt)
   const inlineOversize = !!(row.s && row.s > INLINE_MAX_BYTES)
   const canInlineView = row.t !== 'dir' && canInline(inlineExt) && !inlineOversize

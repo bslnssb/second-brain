@@ -112,7 +112,11 @@ class PreviewThumb312(unittest.TestCase):
         for e in ('xls', 'xlsx', 'et'):
             self.assertNotIn("'%s'" % e, body)
         # 第 386 项后 INLINE_PRIMARY 直接复用 SHEET_EXT（同一份 Excel 家族名单）
-        self.assertIn('const INLINE_PRIMARY = SHEET_EXT', src)
+        # 第 405 项再并进 pptx：幻灯片文字是主预览，页图转好后再叠上去
+        m0 = re.search(r'const INLINE_PRIMARY = \[(.*?)\]', src, re.S)
+        self.assertTrue(m0, 'INLINE_PRIMARY 不见了')
+        self.assertIn('...SHEET_EXT', m0.group(1))
+        self.assertIn("'pptx'", m0.group(1))
         m3 = re.search(r"const SHEET_EXT = \[(.*?)\]", src, re.S)
         self.assertTrue(m3, 'Excel 走表格的名单不见了')
         for e in ('xls', 'xlsx', 'et'):

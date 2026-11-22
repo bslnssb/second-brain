@@ -55,7 +55,7 @@ export function docRawUrl(path: string): string {
 }
 
 /** 支持「真版面」的扩展名。加进这个名单 = 详情栏里多一颗「预览版面」。 */
-export const LAYOUT_EXT = ['docx', 'xlsx', 'pptx']
+export const LAYOUT_EXT = ['docx', 'xlsx', 'csv', 'tsv', 'pptx']
 
 export function canLayout(ext: string): boolean {
   return LAYOUT_EXT.includes(String(ext || '').replace(/^\./, '').toLowerCase())
@@ -65,7 +65,7 @@ export function canLayout(ext: string): boolean {
    跟 canLayout 分开是因为两件事不一样：
    · canLayout  = 能开「预览版面」大窗（版面渲染器真能画）；
    · canInline  = 选中即出小预览（有的格式只能出「内容」，出不了版面，比如 pptx）。 */
-export const INLINE_EXT = ['docx', 'xlsx', 'pptx', 'xls', 'et']
+export const INLINE_EXT = ['docx', 'xlsx', 'pptx', 'xls', 'et', 'csv', 'tsv']
 
 export function canInline(ext: string): boolean {
   return INLINE_EXT.includes(String(ext || '').replace(/^\./, '').toLowerCase())
@@ -108,11 +108,98 @@ export async function renderDocx(path: string, el: HTMLElement, maxBytes = 48 * 
   return el.querySelectorAll('.docx-wrapper > section').length || el.querySelectorAll('section').length || 1
 }
 
+/** 第 405 项：CSV/TSV 解码。Excel 导出的中文 CSV 常是 GBK，UTF-8 解出替换字符时换 GBK。 */
+function decodeDelimited(buf: ArrayBuffer): string {
+  const u8 = new Uint8Array(buf)
+  const utf = new TextDecoder('utf-8', { fatal: false }).decode(u8)
+  if (utf.indexOf('\uFFFD') >= 0) {
+    try {
+      return new TextDecoder('gbk').decode(u8)
+    } catch {
+      /* 浏览器不支持 GBK 就退回 UTF-8 */
+    }
+  }
+  return utf.replace(/^\uFEFF/, '')
+}
+
+/** 第 405 项：最简 CSV 解析（引号、双引号转义、引号内换行都认）。 */
+export function parseDelimited(text: string, delim: string): string[][] {
+  const rows: string[][] = []
+  let row: string[] = []
+  let cell = ''
+  let quoted = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (quoted) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          cell += '"'
+          i++
+        } else quoted = false
+      } else cell += c
+    } else if (c === '"') quoted = true
+    else if (c === delim) {
+      row.push(cell)
+      cell = ''
+    } else if (c === '\n') {
+      row.push(cell)
+      rows.push(row)
+      row = []
+      cell = ''
+    } else if (c !== '\r') cell += c
+  }
+  if (cell || row.length) {
+    row.push(cell)
+    rows.push(row)
+  }
+  return rows
+}
+
+/** 第 405 项：CSV 的逗号/分号/制表符不是固定的（欧洲导出常用分号），按首行出现最多的算。 */
+function sniffDelim(text: string): string {
+  const first = text.split(/\r?\n/).find((l) => l.trim()) || ''
+  let best = ','
+  let n = 0
+  for (const d of [',', ';', '\t']) {
+    const c = first.split(d).length - 1
+    if (c > n) {
+      n = c
+      best = d
+    }
+  }
+  return best
+}
+
 export type SheetTable = { name: string; rows: string[][]; cols: number; cut: boolean }
 /** xlsx：把每个工作表读成字符串矩阵（只给文本，前端自己拼表格）。
  *  第 401 项：以前只读前 12 张表 —— 网安行业互助表这种 40+ 张表的文件，
  *  命中在别的表里就永远看不到。改成全部读（上限 40 张，防病态文件）。 */
 export async function readSheets(path: string, maxRows = 300, maxCols = 40): Promise<SheetTable[]> {
+  const ext = String(path.split('.').pop() || '').toLowerCase()
+  const shape = (raw: unknown[][], name: string): SheetTable => {
+    const rows = raw.slice(0, maxRows).map((r) => {
+      const cells = (Array.isArray(r) ? r : []).slice(0, maxCols)
+      const s: string[] = []
+      for (let i = 0; i < cells.length; i++) s.push(cells[i] == null ? '' : String(cells[i]))
+      return s
+    })
+    while (rows.length && rows[rows.length - 1].every((c) => !c)) rows.pop()
+    const cols = rows.reduce((m, r) => Math.max(m, r.length), 0)
+    for (const r of rows) while (r.length < cols) r.push('')
+    return { name, rows, cols, cut: raw.length > maxRows }
+  }
+
+  /* 第 405 项：csv/tsv 以前整块不支持（前端不认、/api/raw 也 204）。
+     这里直接按文本切，不用 SheetJS —— 省一次 vendor 加载，GBK 也更好处理。 */
+  if (ext === 'csv' || ext === 'tsv') {
+    const buf = await fetchBytes(path)
+    const text = decodeDelimited(buf)
+    const delim = ext === 'tsv' ? '\t' : sniffDelim(text)
+    const raw = parseDelimited(text, delim) as unknown[][]
+    const t = shape(raw, path.split(/[\\/]/).pop() || 'CSV')
+    return t.rows.length ? [t] : []
+  }
+
   await ensureXlsx()
   const buf = await fetchBytes(path)
   const w = window as AnyWin
@@ -121,17 +208,8 @@ export async function readSheets(path: string, maxRows = 300, maxCols = 40): Pro
   for (const name of wb.SheetNames.slice(0, 40)) {
     const ws = wb.Sheets[name]
     const raw = (w.XLSX!.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' }) || []) as unknown[][]
-    const rows = raw.slice(0, maxRows).map((r) => {
-      const cells = (Array.isArray(r) ? r : []).slice(0, maxCols)
-      const s: string[] = []
-      for (let i = 0; i < cells.length; i++) s.push(cells[i] == null ? '' : String(cells[i]))
-      return s
-    })
-    while (rows.length && rows[rows.length - 1].every((c) => !c)) rows.pop()
-    if (!rows.length) continue
-    const cols = rows.reduce((m, r) => Math.max(m, r.length), 0)
-    for (const r of rows) while (r.length < cols) r.push('')
-    out.push({ name, rows, cols, cut: raw.length > maxRows })
+    const t = shape(raw, name)
+    if (t.rows.length) out.push(t)
   }
   return out
 }
