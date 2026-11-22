@@ -3963,10 +3963,8 @@ export function Timeline({
  *  以前只有下面那段「命中的正文」会标红，表格单元格是原样文字 —— 用户要的「深信服」
  *  全在表格里，却得自己一行行找。规则和列表标题高亮一致：按空格拆词、去掉
  *  ext:/size:/dm:/content: 这类语法项和 - 排除项，大小写不敏感。 */
-export function HiText({ text, q, strong = false }: { text: string; q: string; strong?: boolean }) {
-  const raw = String(text ?? '')
-  if (!raw || !q) return <>{raw}</>
-  const toks = q
+export function qTokens(q: string): string[] {
+  return q
     .split(/\s+/)
     .map((s) => s.trim())
     .filter((s) => {
@@ -3975,6 +3973,12 @@ export function HiText({ text, q, strong = false }: { text: string; q: string; s
       if (/^(ext|type|size|dm|content|内容|c):/i.test(s)) return false
       return true
     })
+}
+
+export function HiText({ text, q, strong = false }: { text: string; q: string; strong?: boolean }) {
+  const raw = String(text ?? '')
+  if (!raw || !q) return <>{raw}</>
+  const toks = qTokens(q)
   if (!toks.length) return <>{raw}</>
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const parts = raw.split(new RegExp(`(${toks.map(esc).join('|')})`, 'gi'))
@@ -3991,6 +3995,40 @@ export function HiText({ text, q, strong = false }: { text: string; q: string; s
       )}
     </>
   )
+}
+
+/** 第 401 项：多表 xlsx 里定位命中位置。
+ *  以前详情只铺第 1 张表的前 25 行 × 14 列 —— 命中在第 2 张表、或第 81 行 / 第 25 列，
+ *  用户就永远看不见（「这个表在详情页看不到命中的，他是多表结构」）。
+ *  返回 {si: 表下标, ri: 行下标, ci: 列下标}；先按「命中的正文」片段整行比对，再按词。 */
+export type SheetHit = { si: number; ri: number; ci: number }
+
+export function findSheetHit(sheets: SheetTable[], q: string, ctx = ''): SheetHit {
+  const none: SheetHit = { si: 0, ri: -1, ci: -1 }
+  if (!sheets.length) return none
+  const flat = (s: string) => String(s ?? '').replace(/\s+/g, '').toLowerCase()
+  const c = flat(ctx)
+  if (c.length >= 6) {
+    for (let si = 0; si < sheets.length; si++) {
+      const rs = sheets[si].rows
+      for (let ri = 0; ri < rs.length; ri++) {
+        if (flat(rs[ri].join(' ')).includes(c)) return { si, ri, ci: -1 }
+      }
+    }
+  }
+  const toks = qTokens(q).map((t) => t.toLowerCase())
+  if (!toks.length) return none
+  for (let si = 0; si < sheets.length; si++) {
+    const rs = sheets[si].rows
+    for (let ri = 0; ri < rs.length; ri++) {
+      const row = rs[ri]
+      for (let ci = 0; ci < row.length; ci++) {
+        const cell = String(row[ci] ?? '').toLowerCase()
+        if (cell && toks.some((t) => cell.includes(t))) return { si, ri, ci }
+      }
+    }
+  }
+  return none
 }
 
 function Marked({ text }: { text: string }) {
@@ -4314,9 +4352,16 @@ export function Preview({
     why?: string
   }
   const [inline, setInline] = useState<InlinePreview>({ st: 'idle' })
+  /* 第 401 项：多表 xlsx 当前显示哪张表（null = 跟着命中走） */
+  const [sheetPick, setSheetPick] = useState<number | null>(null)
   const inlineBox = useRef<HTMLDivElement | null>(null)
+  const sheetBox = useRef<HTMLDivElement | null>(null)
+  const sheetGrid = useRef<HTMLDivElement | null>(null)
+  const hitRowRef = useRef<HTMLTableRowElement | null>(null)
+  const hitCellRef = useRef<HTMLTableCellElement | null>(null)
   useEffect(() => {
     setInline({ st: 'idle' })
+    setSheetPick(null)
     if (!canInlineView) return
     if (!inlinePrimary && !thumbBad) return   // 有页图就别再铺一份
     const el = inlineBox.current
@@ -4333,7 +4378,9 @@ export function Preview({
           const pages = await renderDocxInline(row.p, el, INLINE_MAX_BYTES)
           if (alive) setInline({ st: 'ok', pages })
         } else if (SHEET_EXT.includes(inlineExt)) {
-          const sheets = await readSheets(row.p, 60, 14)
+          /* 第 401 项：多表文件命中可能在别的表 / 靠后的行与列 —— 行给到 400、列 26，
+             全部工作表都读，前端再按命中位置切窗口显示。 */
+          const sheets = await readSheets(row.p, 400, 26)
           if (alive) setInline({ st: 'ok', sheets })
         } else if (inlineExt === 'pptx') {
           const slides = await readPptxSlides(row.p, 8, INLINE_MAX_BYTES)
@@ -4349,6 +4396,20 @@ export function Preview({
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [row.p, canInlineView, inlineExt, thumbBad, inlinePrimary])
+  /* 第 401 项：表格铺好后跳到命中单元格 —— 看起来就和「命中页」一样，不用自己翻。
+     只滚表格这个盒子（不 scrollIntoView，免得把整个详情栏/页面一起滚跑）。 */
+  useEffect(() => {
+    if (inline.st !== 'ok' || !inline.sheets) return
+    const timer = window.setTimeout(() => {
+      const box = sheetGrid.current
+      if (!box) return
+      const rowEl = hitRowRef.current
+      const cellEl = hitCellRef.current
+      if (rowEl) box.scrollTop = Math.max(0, rowEl.offsetTop - box.clientHeight / 3)
+      if (cellEl) box.scrollLeft = Math.max(0, cellEl.offsetLeft - box.clientWidth / 2)
+    }, 60)
+    return () => window.clearTimeout(timer)
+  }, [inline, sheetPick])
   // 第 312 项：Word/Excel/PPT 不显示图，改成进面板就把正文首段拉出来。
   // 只在这三类上自动拉；txt/pdf 这类本来就长，还是让用户自己点「读取正文」，
   // 免得选一下就扫全表（/api/peek 是按 path 查 docs）。
@@ -4555,28 +4616,77 @@ export function Preview({
               className="max-h-[46vh] overflow-auto rounded-md border border-line bg-card p-1"
             />
           )}
-          {inline.st === 'ok' && inline.sheets && inline.sheets.length > 0 && (
-            <div className="max-h-[46vh] overflow-auto rounded-md border border-line bg-card p-1">
-              {inline.sheets.slice(0, 1).map((sh) => (
-                <div key={sh.name}>
-                  <div className="mb-1 truncate px-1 text-[10px] text-sub">{sh.name}</div>
+          {inline.st === 'ok' && inline.sheets && inline.sheets.length > 0 && (() => {
+            const sheets = inline.sheets
+            const hit = findSheetHit(sheets, q, snip)
+            const si = sheetPick != null && sheetPick >= 0 && sheetPick < sheets.length ? sheetPick : hit.si
+            const sh = sheets[si]
+            const focus = si === hit.si ? hit.ri : -1
+            const start = focus >= 0 ? Math.max(0, focus - 12) : 0
+            const end = focus >= 0 ? Math.min(sh.rows.length, focus + 40) : Math.min(sh.rows.length, 60)
+            const rows = sh.rows.slice(start, end)
+            return (
+              <div ref={sheetBox} className="rounded-md border border-line bg-card p-1">
+                {sheets.length > 1 && (
+                  <div className="mb-1 flex max-h-[52px] flex-wrap gap-1 overflow-auto px-0.5">
+                    {sheets.map((s, i) => (
+                      <button
+                        key={s.name}
+                        onClick={() => setSheetPick(i)}
+                        title={s.name}
+                        className={`max-w-[110px] truncate rounded border px-1.5 py-0.5 text-[10px] ${
+                          i === si ? 'border-line bg-bg text-ink' : 'border-transparent text-sub hover:text-ink'
+                        }`}
+                      >
+                        {s.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div className="mb-1 flex items-center justify-between gap-2 px-1 text-[10px] text-sub">
+                  <span className="truncate">{sh.name}</span>
+                  {hit.ri >= 0 && hit.si === si && (
+                    <span className="shrink-0 tabular-nums">
+                      {t('dtl_sheet_hit_row')} {hit.ri + 1}
+                      {hit.ci >= 0 ? ` · ${hit.ci + 1}` : ''}
+                    </span>
+                  )}
+                </div>
+                {/* 第 401 项：命中行不一定在开头 —— 只铺命中附近的一段（命中行高亮，自动滚过去），
+                    其余行靠点表名/打开原件看；整表 400 行全铺会把详情栏卡住。 */}
+                <div ref={sheetGrid} className="max-h-[42vh] overflow-auto">
                   <table className="w-full border-collapse text-[10px] leading-4">
                     <tbody>
-                      {sh.rows.slice(0, 25).map((r, ri) => (
-                        <tr key={ri} className={ri === 0 ? 'bg-card font-medium' : ''}>
-                          {r.map((c, ci) => (
-                            <td key={ci} className="max-w-[120px] truncate border border-line px-1 py-0.5 align-top">
-                              <HiText text={c} q={q} strong />
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
+                      {rows.map((r, ri0) => {
+                        const ri = start + ri0
+                        const isHitRow = ri === focus
+                        return (
+                          <tr
+                            key={ri}
+                            ref={isHitRow ? hitRowRef : undefined}
+                            className={isHitRow ? 'bg-card font-medium' : ''}
+                          >
+                            {r.map((c, ci) => {
+                              const cellHit = isHitRow && ci === hit.ci
+                              return (
+                                <td
+                                  key={ci}
+                                  ref={cellHit ? hitCellRef : undefined}
+                                  className="max-w-[120px] truncate border border-line px-1 py-0.5 align-top"
+                                >
+                                  <HiText text={c} q={q} strong />
+                                </td>
+                              )
+                            })}
+                          </tr>
+                        )
+                      })}
                     </tbody>
                   </table>
                 </div>
-              ))}
-            </div>
-          )}
+              </div>
+            )
+          })()}
           {inline.st === 'ok' && inline.slides && inline.slides.length > 0 && (
             <div className="max-h-[46vh] space-y-1 overflow-auto">
               {inline.slides.map((sl) => (

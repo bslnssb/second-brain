@@ -109,14 +109,16 @@ export async function renderDocx(path: string, el: HTMLElement, maxBytes = 48 * 
 }
 
 export type SheetTable = { name: string; rows: string[][]; cols: number; cut: boolean }
-/** xlsx：把每个工作表读成字符串矩阵（只给文本，前端自己拼表格）。 */
+/** xlsx：把每个工作表读成字符串矩阵（只给文本，前端自己拼表格）。
+ *  第 401 项：以前只读前 12 张表 —— 网安行业互助表这种 40+ 张表的文件，
+ *  命中在别的表里就永远看不到。改成全部读（上限 40 张，防病态文件）。 */
 export async function readSheets(path: string, maxRows = 300, maxCols = 40): Promise<SheetTable[]> {
   await ensureXlsx()
   const buf = await fetchBytes(path)
   const w = window as AnyWin
   const wb = w.XLSX!.read(buf, { type: 'array' })
   const out: SheetTable[] = []
-  for (const name of wb.SheetNames.slice(0, 12)) {
+  for (const name of wb.SheetNames.slice(0, 40)) {
     const ws = wb.Sheets[name]
     const raw = (w.XLSX!.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' }) || []) as unknown[][]
     const rows = raw.slice(0, maxRows).map((r) => {
