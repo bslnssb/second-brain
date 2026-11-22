@@ -13447,6 +13447,44 @@ def _shell_thumb_png(path, size=256):
 
 
 
+def pdf_hit_page(path, kw, max_pages=300):
+    """PDF 命中页（1 基，0 = 没找到/扫描件）。第 397 项：多关键词 + 整份扫。
+
+    不再用 pypdf 逐页 extract_text（还只扫前 30 页 —— 31 页的培训大纲命中在第 31 页
+    就永远定位不到，详情栏停在首页，页面上自然一个高亮都没有）。改走 pdf_engine（PDFium）
+    的 textpage：只读文本不解码，500 页也就一两秒；任一关键词命中即算这一页。
+    """
+    pp = str(path or '')
+    toks = [t.lower() for t in doc_render._q_tokens(kw)]
+    if not pp.lower().endswith('.pdf') or not toks:
+        return 0
+    try:
+        mt = os.path.getmtime(pp)
+    except OSError:
+        return 0
+    key = ('hitpg', pp, int(mt), '|'.join(toks))
+    if key in _PAGE_CACHE:
+        return _PAGE_CACHE[key] or 0
+    page = 0
+    try:
+        import pdf_engine as pymupdf
+        with pymupdf.open(pp) as doc:
+            for i in range(min(len(doc), int(max_pages or 300))):
+                try:
+                    txt = (doc[i].get_text() or '').lower()
+                except Exception:
+                    continue
+                if any(t in txt for t in toks):
+                    page = i + 1
+                    break
+    except Exception:
+        page = 0
+    if len(_PAGE_CACHE) > 500:
+        _PAGE_CACHE.clear()
+    _PAGE_CACHE[key] = page
+    return page
+
+
 def pdf_pages(path, q=''):
     """PDF 总页数（拿不到就 0）。第 325 项：详情栏要显示「12 / 36」。
 
@@ -13508,7 +13546,11 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
 
     # 第 325 项：PDF 详情要能翻页、能把关键词在页面上标出来。
     # 缓存键要带上页码与高亮词：只按尺寸缓存的话，翻到第 12 页拿到的还是首页。
-    _hl = [t.lower() for t in re.split(r'\s+', str(q or '').strip()) if t][:5]
+    # 第 397 项：多关键词 —— 以前直接按空格切、连同 `ext:pdf` 这种语法词一起丢给
+    # `search_for`（白搜一遍还占名额）。改用 doc_render 的同一套分词（去语法、去 -排除），
+    # 最多 8 个词；每个词各自在页面上找，前端一次查询里有几个词就标几处。
+    _hl = doc_render._q_tokens(q)[:8]
+    _hl = [t.lower() for t in _hl]
     k = os.path.normcase(path) + '|%s|%dx%d|p%d|%s' % (
         stamp, max_w, max_h, int(page or 0), ','.join(_hl))
 
@@ -23628,7 +23670,7 @@ def make_server(port=8765):
 
                 kw = (qs.get('q', [''])[0] or '').strip()
 
-                body = json.dumps({'ok': True, 'page': pdf_page_for(pp, kw)},
+                body = json.dumps({'ok': True, 'page': pdf_hit_page(pp, kw) or None},
 
                                   ensure_ascii=False).encode()
 
@@ -24643,6 +24685,12 @@ def make_server(port=8765):
                         pgs = pdf_pages(p, kw)
                         # 第 390 项：详情栏要直接停在命中页（Word 转换时用 Find 定位好）
                         hpg, hdn = doc_render.hit_info(p, app_dir(), kw)
+                        # 第 397 项：PDF 以前没有命中页 —— pdfmeta 只问 Office，文档栏目
+                        # 因此永远停在第 1 页，目录里的词自然一个高亮都没有。
+                        # 这里只对 .pdf 走文本层定位（多关键词任一命中）；扫描件回来 0，
+                        # 前端就知道「页面上没法标字」，给一句实话而不是空白。
+                        if not hpg and p.lower().endswith('.pdf') and kw:
+                            hpg = pdf_hit_page(p, kw)
                         if not hdn and kw:
                             # 手里的那段是旧关键词定位的（或者还是旧版本缓存）：
                             # 这里踢一脚，让它按当前词重导那一段；前端会继续轮询到 done

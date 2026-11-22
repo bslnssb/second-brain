@@ -364,7 +364,7 @@ def _q_tokens(q):
             continue
         if t not in out:
             out.append(t)
-        if len(out) >= 4:
+        if len(out) >= 8:
             break
     return out
 
@@ -669,6 +669,13 @@ def _loop():
             head_pages = int(box.get('head_pages') or 0)
             frm = int(box.get('from') or 1)
             hit = int(box.get('hit') or 0)
+            # 第 397 项：Word 文本框 / PPT / Excel 用 Find 定不出页 → 拿导出的 PDF
+            # 再扫一遍文本层（便宜），把「命中页」补上；否则详情栏永远停在第 1 页，
+            # 页图上自然也一个高亮都没有。
+            if not hit and _q_tokens(q):
+                idx = _pdf_first_hit(out, _q_tokens(q))
+                if idx:
+                    hit = (frm + idx - 1) if mode == 'head' else idx
             if mode == 'head':
                 _finish_head(path, base, out, kind, pages, head_pages, frm, hit, qn)
             else:
@@ -886,6 +893,31 @@ def total_pages(path, base, q=''):
         return 0
     n = int(meta.get('pages') or 0)
     return n if n <= MAX_SANE_PAGES else 0
+
+
+def _pdf_first_hit(pdf_path, tokens, max_pages=300):
+    """在**已经导出**的 PDF 里找第一个命中页（1 基，0=没找到）。
+
+    第 397 项：Word 的 `Content.Find` 搜不到文本框/形状里的字，PPT/Excel 干脆没有
+    Find 这一步 —— 结果是 meta 里 hit 永远是 0，详情栏停在第 1 页，用户明明搜到了
+    却看不到任何标记。导出的 PDF 本身有文本层，扫它既准又便宜（PDFium 只读不解码）。
+    """
+    toks = [t.lower() for t in tokens]
+    if not toks or not pdf_path or not os.path.exists(pdf_path):
+        return 0
+    try:
+        import pdf_engine as pymupdf
+        with pymupdf.open(pdf_path) as doc:
+            for i in range(min(len(doc), int(max_pages or 300))):
+                try:
+                    txt = (doc[i].get_text() or '').lower()
+                except Exception:                 # noqa: BLE001
+                    continue
+                if any(t in txt for t in toks):
+                    return i + 1
+    except Exception:                             # noqa: BLE001
+        return 0
+    return 0
 
 
 def hit_info(path, base, q=''):

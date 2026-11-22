@@ -4090,6 +4090,13 @@ export function Preview({
   const [pages, setPages] = useState(0)
   /* 第 390 项：关键词命中第几页（0 = 不知道/没命中，Word 文本框里的字 Find 搜不到就会是 0） */
   const [hitPg, setHitPg] = useState(0)
+  /* 第 397 项：查询词变了要重新问「命中第几页」—— 但别每敲一个字就扫一遍 PDF 文本层，
+     停手 400ms 再问。 */
+  const [qNow, setQNow] = useState(q)
+  useEffect(() => {
+    const t = window.setTimeout(() => setQNow(q), 400)
+    return () => window.clearTimeout(t)
+  }, [q])
   /* 第 332 项：Word/Excel/PPT 没有分页图，正文按 900 字一块当「页」翻。
      textPage 1 基；textPages 由 /api/peek?pg= 返回。 */
   const [textPage, setTextPage] = useState(1)
@@ -4107,7 +4114,7 @@ export function Preview({
     /* 第 390 项：Office 页图也带 q —— 后端用它在 Word 里定出命中页、只导那几页。
        第 387 项当初去掉 q 是怕每敲一个字就重排一次转换；现在 key 按文件去重、
        已经排队没开工的任务只会把 q 换新，不会重复转换，所以可以带回来。 */
-    (isPdf ? `&q=${encodeURIComponent(q)}` : '') +
+    (isPdf ? `&q=${encodeURIComponent(qNow)}` : '') +
     /* 重试用：只用来打破浏览器对 204 的缓存，让同一个地址能真的重发 */
     (pgTry ? `&t=${pgTry}` : '')
 
@@ -4180,7 +4187,7 @@ export function Preview({
     let tries = 0
     let timer: number | null = null
     const ask = () => {
-      fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}&q=${encodeURIComponent(q)}`,
+      fetch(`/api/pdfmeta?p=${encodeURIComponent(row.p)}&q=${encodeURIComponent(qNow)}`,
         { headers: { 'Sec-Fetch-Site': 'same-origin' } })
         .then((r) => r.json())
         .then((j: { pages?: number; hit?: number; done?: boolean; state?: string }) => {
@@ -4213,7 +4220,7 @@ export function Preview({
       alive = false
       if (timer) window.clearTimeout(timer)
     }
-  }, [row.p, isPdf])
+  }, [row.p, isPdf, qNow])
   useEffect(() => {
     if (!zoom) return
     const el = zoomRef.current
@@ -4434,6 +4441,13 @@ export function Preview({
           >
             ›
           </button>
+        </div>
+      )}
+      {/* 第 397 项：扫描件（无文本层）页面上真的没法标字 —— 说句实话，
+          别让用户以为是漏标。OCR 出来的文字仍在下面「命中的正文」里标红。 */}
+      {isPdf && !isOfficePage && q && hitPg === 0 && pages > 0 && (
+        <div className="mb-1 text-center text-[10px] text-sub">
+          这份 PDF 没有文字层（扫描件），页面上标不出字；OCR 的文字在下面「命中的正文」里已标出
         </div>
       )}
       {zoom && !thumbBad && (
