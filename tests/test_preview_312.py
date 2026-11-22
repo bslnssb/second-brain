@@ -89,11 +89,13 @@ class PreviewThumb312(unittest.TestCase):
         """317：详情栏/灯箱要 900×1200 的大图，否则 PDF 首页小字看不清。
 
         第 390 项：Office 页图也要带页码和查询词（后端靠它在 Word 里定位命中页），
-        所以这里断言的是 `page=` / `q=` 两个参数在场，不再钉死调用字面。
+        所以这里断言的是 `page=` / `q=` / `hv=` 三个参数在场（第 403 项加了高亮数据版本），不再钉死大小。
         """
         src = _read('brain.py')
         self.assertIn("qs.get('big'", src)
-        self.assertIn('make_thumb(p, 900, 1200, page=pg0, q=hl)', src)
+        self.assertIn('make_thumb(p, 900, 1200, page=pg0, q=hl, hv=hv)', src)
+        # 第 403 项：前端要把高亮数据版本带上，否则扫描件那张「没框」的图会被浏览器缓存一整天
+        self.assertIn('&hv=', _read('web/src/ui/panels.tsx'))
 
     def test_frontend_preview_handles_office_by_text(self):
         src = _read(os.path.join('web', 'src', 'ui', 'panels.tsx'))

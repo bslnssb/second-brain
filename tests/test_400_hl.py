@@ -138,5 +138,22 @@ class TestOcrHelpers(unittest.TestCase):
             self.assertEqual(brain.ocr_hit_page('x.pdf', ['深信服']), (2, 1, 3, False))
 
 
+class TestThumbVersion(unittest.TestCase):
+    """第 403 项：扫描件第一张图常常在 OCR 跑完之前就发出去（没框），浏览器
+    还会按 max-age=86400 记住它 —— 之后 OCR 认出命中页也不会更新。把「高亮数据
+    版本」并进缓存键，有进展就是一个新 key，自然会重渲一张带框的。"""
+
+    def test_hv_changes_disk_key(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.pdf') as f:
+            f.write(b'%PDF-1.4\n')
+            f.flush()
+            a = brain._thumb_disk_path(f.name, 900, 1200, 0, ['陈雅彬'], '')
+            b = brain._thumb_disk_path(f.name, 900, 1200, 0, ['陈雅彬'], 'h1')
+            c = brain._thumb_disk_path(f.name, 900, 1200, 0, ['陈雅彬'], 'o1')
+            self.assertNotEqual(a, b)
+            self.assertNotEqual(b, c)
+
+
 if __name__ == '__main__':
     unittest.main()

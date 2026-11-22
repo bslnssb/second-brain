@@ -13043,13 +13043,18 @@ THUMB_SCHEME = 'v2'
 
 
 
-def _thumb_disk_path(path, max_w, max_h, page=0, hl=()):
+def _thumb_disk_path(path, max_w, max_h, page=0, hl=(), hv=''):
 
     """路径 + 修改时间 + 大小 + 尺寸（+ 第 326 项：页码、高亮词）→ 缓存文件名。
 
 
 
-    带上 mtime/size，文件换了内容自然就换 key，不需要额外失效逻辑。"""
+    带上 mtime/size，文件换了内容自然就换 key，不需要额外失效逻辑。
+
+    第 403 项：`hv` 是「高亮数据版本」（前端按 OCR 已识别页数传进来）——
+    扫描件第一次请求时 OCR 还没跑到这一页，画不出框；那张「没框」的图会被
+    磁盘 + 浏览器（max-age=86400）一起记住，之后 OCR 认出命中页也不会更新。
+    把 hv 并进缓存键，OCR 有进展就是一个新 key，自然重渲一张带框的。"""
 
     try:
 
@@ -13061,9 +13066,9 @@ def _thumb_disk_path(path, max_w, max_h, page=0, hl=()):
 
         stamp = 'na'
 
-    raw = ('%s|%s|%dx%d|p%d|%s|%s' % (os.path.normcase(path), stamp, max_w, max_h,
-                                      int(page or 0), ','.join(hl or ()),
-                                      THUMB_SCHEME)).encode('utf-8', 'replace')
+    raw = ('%s|%s|%dx%d|p%d|%s|%s|%s' % (os.path.normcase(path), stamp, max_w, max_h,
+                                        int(page or 0), ','.join(hl or ()),
+                                        THUMB_SCHEME, hv or '')).encode('utf-8', 'replace')
 
     import hashlib
 
@@ -13078,6 +13083,8 @@ THUMB_MAX_BYTES = 500 * 1024 * 1024   # 缓存总量上限；超了按最旧删
 THUMB_MAX_AGE = 30 * 86400            # 30 天没被读过就删
 
 THUMB_FAIL = {}                       # 路径|尺寸 → 失败时间：解不开的文件别每次重试
+
+_THUMB_ERR = {'n': 0}                 # 第 403 项：静默失败的排查计数（只记前 50 条）
 
 
 
@@ -13733,7 +13740,7 @@ def _ocr_line_rects(path, page, tokens):
     return out
 
 
-def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
+def make_thumb(path, max_w=320, max_h=400, page=0, q='', hv=''):
 
     """图片/PDF → 缩略图 PNG 字节。失败返回 None，前端回落到系统图标。
 
@@ -13770,8 +13777,8 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
     # 最多 8 个词；每个词各自在页面上找，前端一次查询里有几个词就标几处。
     _hl = doc_render._q_tokens(q)[:8]
     _hl = [t.lower() for t in _hl]
-    k = os.path.normcase(path) + '|%s|%dx%d|p%d|%s' % (
-        stamp, max_w, max_h, int(page or 0), ','.join(_hl))
+    k = os.path.normcase(path) + '|%s|%dx%d|p%d|%s|%s' % (
+        stamp, max_w, max_h, int(page or 0), ','.join(_hl), hv or '')
 
     with THUMB_LOCK:
 
@@ -13790,7 +13797,7 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
     # 每种变体都能落盘，翻回上一页就是读文件。
     use_disk = True
 
-    disk = _thumb_disk_path(path, max_w, max_h, page, _hl)
+    disk = _thumb_disk_path(path, max_w, max_h, page, _hl, hv)
 
     hit = _thumb_from_disk(disk) if use_disk else None
 
@@ -13994,6 +14001,16 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q=''):
                         png = buf.getvalue()
 
     except Exception:
+
+        # 第 403 项排查：缩略图失败以前是全静默的（前端只看到 204），
+        # 结果「详情栏一片空白」只能靠猜。把前 50 条的 traceback 落进 debug.log。
+        try:
+            if _THUMB_ERR['n'] < 50:
+                _THUMB_ERR['n'] += 1
+                import traceback
+                _log_file('thumb fail %s\n%s' % (path, traceback.format_exc()[:800]))
+        except Exception:
+            pass
 
         png = None
 
@@ -25118,6 +25135,10 @@ def make_server(port=8765):
 
                 xl = (qs.get('xl', [''])[0] or '') == '1'
 
+                # 第 403 项：高亮数据版本（扫描件按 OCR 已识别页数传进来，只用来换缓存键）
+                hv = ''.join(ch for ch in (qs.get('hv', [''])[0] or '')
+                             if ch.isalnum())[:16]
+
                 png = b''
 
                 pages = 0
@@ -25168,13 +25189,13 @@ def make_server(port=8765):
 
                         if xl:
 
-                            png = make_thumb(p, 1600, 2200, page=pg0, q=hl)
+                            png = make_thumb(p, 1600, 2200, page=pg0, q=hl, hv=hv)
 
                         elif big:
 
                             # 第 390 项：Office 也要传页码 + 查询词 —— 缓存里可能只有
                             # 「命中页 ±1」那一段，靠 q 才能定位/高亮到对的那一页
-                            png = make_thumb(p, 900, 1200, page=pg0, q=hl)
+                            png = make_thumb(p, 900, 1200, page=pg0, q=hl, hv=hv)
 
                         elif small:
 
@@ -25182,7 +25203,7 @@ def make_server(port=8765):
 
                         else:
 
-                            png = make_thumb(p, page=pg0, q=hl)
+                            png = make_thumb(p, page=pg0, q=hl, hv=hv)
 
                         png = png or b''
 
