@@ -13039,10 +13039,27 @@ THUMB_DIR = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~
 
 # 第 400 项：画框方式变了（search_for 按行分组、扫描件走 OCR 框）。旧缓存图是按老算法
 # 画的，key 里加个版本号，让它自然失效，不用用户手动清缓存。
-THUMB_SCHEME = 'v2'
+THUMB_SCHEME = 'v3'
 
 
 
+
+
+def _ocr_ver(path, hl=()):
+    """第 406 项：这份文件的页框 OCR 数据「版本」（json 的 mtime+大小）。
+
+    缓存键带上它，OCR 每识别完一页就自然换 key —— 不再依赖前端记得把 hv 改掉。
+    Word/PPT 转出来的 PDF 每次重导都会变，所以这里只认**原始文档**的 OCR 缓存。"""
+    if not hl:
+        return ''
+    try:
+        _k, fp = _ocr_side(path)
+        if _k and os.path.exists(fp):
+            st = os.stat(fp)
+            return '%d:%d' % (int(st.st_mtime), st.st_size)
+    except Exception:
+        pass
+    return ''
 
 
 def _thumb_disk_path(path, max_w, max_h, page=0, hl=(), hv=''):
@@ -13068,9 +13085,10 @@ def _thumb_disk_path(path, max_w, max_h, page=0, hl=(), hv=''):
 
         stamp = 'na'
 
-    raw = ('%s|%s|%dx%d|p%d|%s|%s|%s' % (os.path.normcase(path), stamp, max_w, max_h,
-                                        int(page or 0), ','.join(hl or ()),
-                                        THUMB_SCHEME, hv or '')).encode('utf-8', 'replace')
+    raw = ('%s|%s|%dx%d|p%d|%s|%s|%s|%s' % (os.path.normcase(path), stamp, max_w, max_h,
+                                         int(page or 0), ','.join(hl or ()),
+                                         THUMB_SCHEME, hv or '',
+                                         _ocr_ver(path, hl))).encode('utf-8', 'replace')
 
     import hashlib
 
@@ -13625,14 +13643,18 @@ def _lower_current_thread():
         pass
 
 
-def _ocr_run(path, k):
-    """后台逐页 OCR（只跑用户当前点开的那一份）。"""
+def _ocr_run(path, k, src=None):
+    """后台逐页 OCR（只跑用户当前点开的那一份）。
+
+    第 406 项：`src` 是真正要识别的 PDF —— Word/PPT 里贴的扫描图得先由 doc_render
+    转成 PDF 才能逐页渲；缓存键/落盘仍按**原始文档**（path）走，这样源文件换了
+    或重新转了一次 PDF 都不会把识别结果变成孤儿。"""
     _lower_current_thread()
     m = _ocr_load(path) or {'pages': {}, 'total': 0, 'done': False}
     t0 = time.time()
     try:
         import pdf_engine as pymupdf
-        with pymupdf.open(str(path)) as doc:
+        with pymupdf.open(str(src or path)) as doc:
             n = len(doc)
             m['total'] = n
             ocr = _get_ocr()
@@ -13685,28 +13707,32 @@ def _ocr_run(path, k):
             _OCR_JOBS.pop(k, None)
 
 
-def ocr_hit_page(path, tokens, ctx=''):
-    """扫描件的命中页：(页号, 已识别页数, 总页数, 是否还在跑)。没找到就先在后台排上。"""
+def ocr_hit_page(path, tokens, ctx='', src=None):
+    """扫描件的命中页：(页号, 已识别页数, 总页数, 是否还在跑, 是否已识别完)。
+
+    第 406 项：多回一个「整份都识别完了」—— 前端据此决定是显示进度，
+    还是承认「这份确实是图片、页面上没有这个词」，别再拿一句「标不出字」糊住用户。
+    `src` 同 `_ocr_run`：Office 传转换后的 PDF，缓存仍挂在原始文档上。"""
     k, _fp = _ocr_side(path)
     if not k:
-        return 0, 0, 0, False
+        return 0, 0, 0, False, False
     m = _ocr_load(path) or {'pages': {}, 'total': 0, 'done': False}
     hit = _ocr_map_search(m, tokens, ctx)
     done = len(m.get('pages') or {})
     total = int(m.get('total') or 0)
     if hit or m.get('done'):
-        return hit, done, total, False
+        return hit, done, total, False, bool(m.get('done'))
     with _OCR_LOCK:
         _OCR_ACTIVE['key'] = k
         _OCR_ACTIVE['ts'] = time.time()
         _OCR_TARGET[k] = ([str(t).lower() for t in tokens or []], str(ctx or ''))
         th = _OCR_JOBS.get(k)
         if th is None:
-            th = threading.Thread(target=_ocr_run, args=(path, k), daemon=True,
+            th = threading.Thread(target=_ocr_run, args=(path, k, src), daemon=True,
                                   name='ocr-%s' % k[:6])
             _OCR_JOBS[k] = th
             th.start()
-    return 0, done, total, True
+    return 0, done, total, True, False
 
 
 def _ocr_line_rects(path, page, tokens):
@@ -13779,8 +13805,8 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q='', hv=''):
     # 最多 8 个词；每个词各自在页面上找，前端一次查询里有几个词就标几处。
     _hl = doc_render._q_tokens(q)[:8]
     _hl = [t.lower() for t in _hl]
-    k = os.path.normcase(path) + '|%s|%dx%d|p%d|%s|%s' % (
-        stamp, max_w, max_h, int(page or 0), ','.join(_hl), hv or '')
+    k = os.path.normcase(path) + '|%s|%dx%d|p%d|%s|%s|%s' % (
+        stamp, max_w, max_h, int(page or 0), ','.join(_hl), hv or '', _ocr_ver(path, _hl))
 
     with THUMB_LOCK:
 
@@ -13817,6 +13843,10 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q='', hv=''):
 
     ext = os.path.splitext(path)[1].lower()
 
+    # 第 406 项：页框 OCR 的缓存键始终用原始文档（Office 也一样），后面 path 会被
+    # 替换成转换出来的 PDF，只有它记得住「这份 docx 的框画在哪」。
+    _ocr_orig = path
+
     # 第 385 项：Word/Excel/PPT 借 Office/WPS 先转 PDF，再走下面同一个 PDF 分支出页图。
     # 转不出来（没装 Office/WPS、或者转换超时）就记一次失败冷却，前端会回落到纯文本。
     if doc_render.is_office(path):
@@ -13829,6 +13859,8 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q='', hv=''):
             _mw = int(max_w)
         except Exception:
             _mw = 320
+        # 第 406 项：OCR 缓存（识别页框）挂在**原始文档**上，画框时也得按原始路径去读，
+        # 别拿转换后的 PDF 路径当键 —— 那 PDF 每次重导 mtime 都变，框就永远对不上。
         if _mw < 600:
             _pdf, _idx = doc_render.pdf_page_cached(path, app_dir(), page, q)
         else:
@@ -13979,7 +14011,7 @@ def make_thumb(path, max_w=320, max_h=400, page=0, q='', hv=''):
                                     try:
                                         W, Hh = im.size
                                         for _a, _b, _c, _d in _ocr_line_rects(
-                                                str(path), int(pg) + 1, _hl)[:200]:
+                                                str(_ocr_orig), int(pg) + 1, _hl)[:200]:
                                             dr.rectangle([_a * W, _b * Hh, _c * W, _d * Hh],
                                                          fill=(255, 214, 0, 120))
                                             marked = True
@@ -24963,18 +24995,34 @@ def make_server(port=8765):
                                 hpg = cp
                         # 第 399 项：扫描件没有文本层 → 后台逐页 OCR 定命中页（单线程、
                         # BELOW_NORMAL、每页落盘）。没找完就让前端继续轮询、显示进度。
+                        # 第 406 项：Word/PPT 里贴的身份证、证书扫描图也一样没文本层 ——
+                        # docx 转出来的 PDF 搜不到词，页面就永远不标。这类文件把 OCR 跑在
+                        # **转换后的 PDF** 上（缓存键也跟着 PDF 走，make_thumb 画框时用的
+                        # 就是这个 PDF 路径，天然对得上）。
                         ocr_prog = None
-                        if not hpg and p.lower().endswith('.pdf') and kw:
+                        ocr_done = False
+                        if not hpg and kw:
+                            _ocr_src = ''
                             try:
-                                oh, od, ot, obusy = ocr_hit_page(
-                                    p, doc_render._q_tokens(kw),
-                                    doc_render._context_window(snip))
-                                hpg = oh
-                                if not oh and obusy:
-                                    ocr_prog = [od, ot]   # ot 先可能是 0（刚起跑）
-                                    hdn = False           # 还没算完，前端别停
+                                if p.lower().endswith('.pdf'):
+                                    _ocr_src = p
+                                elif doc_render.is_office(p):
+                                    _ocr_src = doc_render.pdf_page_source(
+                                        p, app_dir(), 0, kw)[0] or ''
                             except Exception:
-                                ocr_prog = None
+                                _ocr_src = ''
+                            if _ocr_src:
+                                try:
+                                    oh, od, ot, obusy, odone = ocr_hit_page(
+                                        p, doc_render._q_tokens(kw),
+                                        doc_render._context_window(snip), src=_ocr_src)
+                                    hpg = oh
+                                    ocr_done = odone
+                                    if not oh and obusy:
+                                        ocr_prog = [od, ot]   # ot 先可能是 0（刚起跑）
+                                        hdn = False           # 还没算完，前端别停
+                                except Exception:
+                                    ocr_prog = None
                         if not hdn and kw:
                             # 手里的那段是旧关键词定位的（或者还是旧版本缓存）：
                             # 这里踢一脚，让它按当前词重导那一段；前端会继续轮询到 done
@@ -24986,7 +25034,8 @@ def make_server(port=8765):
                 body = json.dumps({'ok': bool(pgs), 'pages': pgs, 'hit': hpg, 'done': hdn,
                                    'state': stt,
                                    # 第 399 项：扫描件的 OCR 进度 [已识别页, 总页数]
-                                   'ocr': ocr_prog},
+                                   # 第 406 项：ocr_done = 整份识别完（前端据此停止无限等待）
+                                   'ocr': ocr_prog, 'ocr_done': bool(ocr_done)},
                                   ensure_ascii=False).encode()
 
                 ctype = 'application/json; charset=utf-8'

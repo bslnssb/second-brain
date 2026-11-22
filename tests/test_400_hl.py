@@ -125,7 +125,7 @@ class TestOcrHelpers(unittest.TestCase):
         with mock.patch.object(brain, '_ocr_side', lambda p: ('k3', None)), \
                 mock.patch.object(brain, '_ocr_load', lambda p: m), \
                 mock.patch.object(brain.threading, 'Thread', lambda *a, **k: mock.Mock()):
-            hit, done, total, busy = brain.ocr_hit_page('x.pdf', ['深信服'])
+            hit, done, total, busy, _full = brain.ocr_hit_page('x.pdf', ['深信服'])
             self.assertEqual((hit, done), (0, 0))
             self.assertTrue(busy)
             brain._OCR_JOBS.clear()
@@ -135,7 +135,7 @@ class TestOcrHelpers(unittest.TestCase):
              'pages': {'2': {'lines': [[0.1, 0.2, 0.9, 0.25, '这里提到 深信服']]}}}
         with mock.patch.object(brain, '_ocr_side', lambda p: ('k4', None)), \
                 mock.patch.object(brain, '_ocr_load', lambda p: m):
-            self.assertEqual(brain.ocr_hit_page('x.pdf', ['深信服']), (2, 1, 3, False))
+            self.assertEqual(brain.ocr_hit_page('x.pdf', ['深信服']), (2, 1, 3, False, False))
 
 
 class TestThumbVersion(unittest.TestCase):

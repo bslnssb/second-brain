@@ -4130,6 +4130,8 @@ export function Preview({
   const [hitPg, setHitPg] = useState(0)
   /* 第 399 项：扫描件没有文本层，命中页由后台逐页 OCR 定位；这里显示 [已识别页, 总页数] */
   const [ocrProg, setOcrProg] = useState<[number, number] | null>(null)
+  /* 第 406 项：整份 OCR 已经识别完（还没命中就是真的没有，别再让用户干等） */
+  const [ocrDone, setOcrDone] = useState(false)
   /* 第 397 项：查询词变了要重新问「命中第几页」—— 但别每敲一个字就扫一遍 PDF 文本层，
      停手 400ms 再问。 */
   const [qNow, setQNow] = useState(q)
@@ -4229,6 +4231,7 @@ export function Preview({
     setPages(0)
     setHitPg(0)
     setOcrProg(null)
+    setOcrDone(false)
     jumpedHit.current = false
     if (!isPdf) return
     let alive = true
@@ -4241,7 +4244,7 @@ export function Preview({
         `&s=${encodeURIComponent((row.b || row.snip || '').replace(/<\/?mark>/gi, ''))}`,
         { headers: { 'Sec-Fetch-Site': 'same-origin' } })
         .then((r) => r.json())
-        .then((j: { pages?: number; hit?: number; done?: boolean; state?: string; ocr?: [number, number] | null }) => {
+        .then((j: { pages?: number; hit?: number; done?: boolean; state?: string; ocr?: [number, number] | null; ocr_done?: boolean }) => {
           if (!alive || !j) return
           /* 第 391 项：后台明确说「这份转不出来」（卡死/失败冷却中），就别再转圈了 ——
              直接停掉重试、显示失败提示（还能用「打开」看原件）。 */
@@ -4251,6 +4254,7 @@ export function Preview({
           }
           const op = j.ocr ? [Number(j.ocr[0]), Number(j.ocr[1])] as [number, number] : null
           setOcrProg(op)
+          setOcrDone(!!j.ocr_done)
           const p = Number(j.pages || 0)
           if (p) setPages(p)
           const hit = Number(j.hit || 0)
@@ -4531,15 +4535,16 @@ export function Preview({
           </button>
         </div>
       )}
-      {/* 第 397/399 项：扫描件（无文本层）—— 后台按页 OCR 找命中页；
-          找的期间给进度，没找到才说「页面上标不出字」。 */}
-      {isPdf && !isOfficePage && q && hitPg === 0 && pages > 0 && (
+      {/* 第 397/399 项：扫描件的命中页靠后台 OCR 找，识别期间给进度。
+          第 406 项：Word/PPT 里贴的扫描图也一样（这时 isOfficePage 为真，也要显示）；
+          而且只有「OCR 真的跑过」才提示 —— 普通文字 PDF 搜不到词不该看见这句话。 */}
+      {q && hitPg === 0 && pages > 0 && (ocrProg || ocrDone) && (
         <div className="mb-1 text-center text-[10px] text-sub">
           {ocrProg
             ? (ocrProg[1] > 0
-              ? `扫描件：正在识别第 ${ocrProg[0]} / ${ocrProg[1]} 页，找到命中词就跳过去…`
-              : `扫描件：正在识别第 ${ocrProg[0]} 页，找到命中词就跳过去…`)
-            : '这份 PDF 没有文字层（扫描件），页面上标不出字；OCR 的文字在下面「命中的正文」里已标出'}
+              ? `图片型页面：正在识别第 ${ocrProg[0]} / ${ocrProg[1]} 页，找到命中词就跳过去…`
+              : `图片型页面：正在识别第 ${ocrProg[0]} 页，找到命中词就跳过去…`)
+            : '这份文件里是图片，OCR 已识别完，页面上没找到这个词；文字内容见下面「命中的正文」'}
         </div>
       )}
       {zoom && !thumbBad && (
