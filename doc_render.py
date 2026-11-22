@@ -303,26 +303,31 @@ def _write_meta(path, base, pages, head, frm=1, hit=0, q=''):
 
 
 def _sweep(base, keep=200, max_age_days=7):
-    """缓存自清：太久没人看、或者文件数太多时，删最老的那批（转换产物，删了能再转）。"""
+    """缓存自清：太久没人看、或者文件数太多时，删最老的那批（转换产物，删了能再转）。
+
+    第 407 项：`.ocr.json`（逐页 OCR 行框，约 2.4 KB/页）以前没人清，会永久堆在
+    preview_cache 里。它和 PDF 转换产物一样是可再生的，同样按「过期 + 超量」清。
+    """
     d = cache_dir(base)
     if not d:
         return
-    try:
-        items = [(os.path.getmtime(os.path.join(d, f)), os.path.join(d, f))
-                 for f in os.listdir(d) if f.lower().endswith('.pdf')]
-    except OSError:
-        return
-    items.sort()
-    cutoff = time.time() - max_age_days * 86400
-    victims = [p for (t, p) in items if t < cutoff]
-    extra = len(items) - keep
-    if extra > 0:
-        victims += [p for (_t, p) in items[:extra] if p not in victims]
-    for p in victims:
+    for suffix in ('.pdf', '.ocr.json'):
         try:
-            os.remove(p)
+            items = [(os.path.getmtime(os.path.join(d, f)), os.path.join(d, f))
+                     for f in os.listdir(d) if f.lower().endswith(suffix)]
         except OSError:
-            pass
+            continue
+        items.sort()
+        cutoff = time.time() - max_age_days * 86400
+        victims = [p for (t, p) in items if t < cutoff]
+        extra = len(items) - keep
+        if extra > 0:
+            victims += [p for (_t, p) in items[:extra] if p not in victims]
+        for p in victims:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def _co():

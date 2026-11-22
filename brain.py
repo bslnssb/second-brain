@@ -24958,6 +24958,10 @@ def make_server(port=8765):
                 hdn = True
                 stt = 'none'
                 ocr_prog = None
+                # 第 407 项：OCR 三态（进度 / 是否识别完 / 已识别页数）必须在分支外先有初值 ——
+                # 文本 PDF 走不到 OCR 那段，否则响应那行会 UnboundLocalError（已真机 500 过）。
+                ocr_done = False
+                ocr_n = 0
 
                 kw = (qs.get('q', [''])[0] or '').strip()
                 # 第 398 项：「命中的正文」那一小段（带 \x01/\x02 标记）—— 命中页要和它对齐：

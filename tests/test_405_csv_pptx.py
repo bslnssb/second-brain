@@ -44,6 +44,33 @@ class TestCsvRaw(unittest.TestCase):
         # 第 407 项：hv 必须带已识别页数，命中页之后的页也能重渲出框
         self.assertIn("`&hv=${(hitPg ? 'h' + hitPg : 'o')}-${ocrN}`", panel)
 
+    def test_ocr_fields_initialized(self):
+        """文本 PDF 根本走不到 OCR 那段，三个 OCR 字段必须在分支外就有初值（真机 500 过）。"""
+        src = io.open(os.path.join(ROOT, 'brain.py'), encoding='utf-8').read()
+        i_m = src.index("startswith('/api/pdfmeta')")
+        i_def = src.index('ocr_done = False', i_m)
+        i_loc = src.index('if p and _local_only(p)', i_m)
+        # 初值要在「文件存在且已索引」那个分支之前，否则文本 PDF 一进 pdfmeta 就 500
+        self.assertLess(i_def, i_loc)
+        self.assertIn('ocr_prog = None', src[i_m:i_def])
+        self.assertIn('ocr_n = 0', src[i_def:i_loc])
+
+    def test_ocr_json_is_swept(self):
+        """OCR 行框缓存也要能自清（2.4 KB/页，不能永久堆积）。"""
+        import tempfile, time as _t
+        import doc_render
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, 'preview_cache')
+            os.makedirs(sub, exist_ok=True)
+            old = _t.time() - 30 * 86400
+            for name in ('a.pdf', 'a.ocr.json'):
+                p = os.path.join(sub, name)
+                io.open(p, 'w', encoding='utf-8').write('{}')
+                os.utime(p, (old, old))
+            doc_render._sweep(d)
+            left = [f for f in os.listdir(sub)]
+            self.assertEqual(left, [])
+
     def test_ocr_data_changes_thumb_key(self):
         """OCR 每识别完一页，页图缓存就该换 key —— 否则「没框」的图会一直顶着。"""
         import tempfile
