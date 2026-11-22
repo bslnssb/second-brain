@@ -923,6 +923,18 @@ const ZH: Dict = {
   trans_auto_opt: '自动（译成界面语言）',
   snip_lines: '{n} 行文字',
   err_render_crash: '界面渲染崩溃',
+  perf_title: '性能监控',
+  perf_cpu: 'CPU',
+  perf_mem: '内存',
+  perf_proc: '本程序',
+  perf_sys: '整机',
+  perf_threads: '线程',
+  perf_handles: '句柄',
+  perf_uptime: '运行',
+  perf_used: '已用',
+  perf_total: '总',
+  perf_cores: '核心',
+  perf_hint: '每 2 秒刷新一次',
 }
 
 const EN: Dict = {
@@ -1816,6 +1828,18 @@ const EN: Dict = {
   trans_auto_opt: 'Auto (into your UI language)',
   snip_lines: '{n} text lines',
   err_render_crash: 'The UI crashed while rendering',
+  perf_title: 'Performance',
+  perf_cpu: 'CPU',
+  perf_mem: 'Memory',
+  perf_proc: 'This app',
+  perf_sys: 'System',
+  perf_threads: 'Threads',
+  perf_handles: 'Handles',
+  perf_uptime: 'Uptime',
+  perf_used: 'Used',
+  perf_total: 'Total',
+  perf_cores: 'cores',
+  perf_hint: 'Refreshes every 2 s',
 }
 
 const ES: Dict = {
@@ -2708,6 +2732,18 @@ const ES: Dict = {
   trans_auto_opt: 'Automático (a tu idioma de interfaz)',
   snip_lines: '{n} líneas de texto',
   err_render_crash: 'La interfaz falló al dibujarse',
+  perf_title: 'Rendimiento',
+  perf_cpu: 'Procesador',
+  perf_mem: 'Memoria',
+  perf_proc: 'Esta app',
+  perf_sys: 'Sistema',
+  perf_threads: 'Hilos',
+  perf_handles: 'Identificadores',
+  perf_uptime: 'En marcha',
+  perf_used: 'Usado',
+  perf_total: 'Capacidad total',
+  perf_cores: 'núcleos',
+  perf_hint: 'Se actualiza cada 2 s',
 }
 
 const PT: Dict = {
@@ -3600,6 +3636,18 @@ const PT: Dict = {
   trans_auto_opt: 'Automático (para o idioma da interface)',
   snip_lines: '{n} linhas de texto',
   err_render_crash: 'A interface falhou ao renderizar',
+  perf_title: 'Desempenho',
+  perf_cpu: 'Processador',
+  perf_mem: 'Memória',
+  perf_proc: 'Este app',
+  perf_sys: 'Sistema',
+  perf_threads: 'Linhas de execução',
+  perf_handles: 'Identificadores',
+  perf_uptime: 'Em execução',
+  perf_used: 'Usado',
+  perf_total: 'Capacidade total',
+  perf_cores: 'núcleos',
+  perf_hint: 'Atualiza a cada 2 s',
 }
 
 // 印地语：只覆盖最常看的界面词，没翻译的会回落到中文（总比空白好）
@@ -4493,6 +4541,18 @@ const HI: Dict = {
   trans_auto_opt: 'स्वतः (आपकी इंटरफ़ेस भाषा में)',
   snip_lines: '{n} पंक्तियाँ',
   err_render_crash: 'इंटरफ़ेस रेंडर करते समय क्रैश हो गया',
+  perf_title: 'प्रदर्शन',
+  perf_cpu: 'प्रोसेसर',
+  perf_mem: 'मेमोरी',
+  perf_proc: 'यह ऐप',
+  perf_sys: 'सिस्टम',
+  perf_threads: 'थ्रेड',
+  perf_handles: 'हैंडल',
+  perf_uptime: 'चालू समय',
+  perf_used: 'उपयोग',
+  perf_total: 'कुल',
+  perf_cores: 'कोर',
+  perf_hint: 'हर 2 सेकंड में अपडेट',
 }
 
 const DICTS: Record<Lang, Dict> = { zh: ZH, en: EN, es: ES, pt: PT, hi: HI }

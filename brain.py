@@ -23586,6 +23586,16 @@ def make_server(port=8765):
 
                 ctype = 'application/json; charset=utf-8'
 
+            elif self.path.startswith('/api/perf'):
+                # 第 404 项：标签栏那枚表盘 —— CPU / 内存（本程序 + WebView2 子进程）。
+                # 只读、只在本机；服务端不采样线程，靠前端每 2 秒轮一次算出百分比。
+                try:
+                    body = json.dumps(perf_snapshot(), ensure_ascii=False).encode()
+                except Exception as _e:
+                    body = json.dumps({'ok': False, 'msg': str(_e)[:80]},
+                                      ensure_ascii=False).encode()
+                ctype = 'application/json; charset=utf-8'
+
             elif self.path.startswith('/api/metrics'):
 
                 # 第 277 项：本机功能计数（调用数 / 失败率 / p95 / 最近错误摘要）。
@@ -27733,6 +27743,191 @@ def make_server(port=8765):
 
     return QuietServer(('127.0.0.1', port), H)
 
+
+
+# ------------------ 第 404 项：性能监控（标签栏那枚表盘） ------------------
+# 只用 Win32 API，不引 psutil：打包体积和兼容性都不值得。
+# WebView2 的渲染进程是 Memex.exe 的子进程，内存算「本程序」时必须一起算，
+# 否则面板上永远只看到几十 MB，跟任务管理器对不上（用户第一反应就是「你这数是假的」）。
+
+_PERF_PREV = {'ts': 0.0, 'proc': 0.0, 'sys': None}
+
+
+def _perf_walk_pids():
+    """返回 [(pid, 线程数)]：自己 + 所有后代。拿不到快照就只报自己。"""
+    try:
+        import ctypes.wintypes as wt
+
+        class PE32(ctypes.Structure):
+            _fields_ = [('dwSize', wt.DWORD), ('cntUsage', wt.DWORD),
+                        ('th32ProcessID', wt.DWORD),
+                        ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
+                        ('th32ModuleID', wt.DWORD), ('cntThreads', wt.DWORD),
+                        ('th32ParentProcessID', wt.DWORD), ('pcPriClassBase', ctypes.c_long),
+                        ('dwFlags', wt.DWORD), ('szExeFile', ctypes.c_wchar * 260)]
+
+        k32 = ctypes.windll.kernel32
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+        snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if not snap or int(snap) == -1:
+            return [(os.getpid(), 0)]
+        info = {}
+        try:
+            k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            pe = PE32()
+            pe.dwSize = ctypes.sizeof(PE32)
+            ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+            while ok:
+                info[int(pe.th32ProcessID)] = (int(pe.th32ParentProcessID),
+                                               int(pe.cntThreads))
+                ok = k32.Process32NextW(snap, ctypes.byref(pe))
+        finally:
+            k32.CloseHandle(snap)
+        own = os.getpid()
+        pids = [own]
+        for _ in range(6):
+            more = [p for p, (pp, _t) in info.items() if pp in pids and p not in pids]
+            if not more:
+                break
+            pids += more
+        return [(p, info.get(p, (0, 0))[1]) for p in pids]
+    except Exception:
+        return [(os.getpid(), 0)]
+
+
+def _perf_proc_stats(pid):
+    """单个进程：工作集 / 私有提交 / CPU 秒 / 句柄数 / 创建时间。"""
+    try:
+        import ctypes.wintypes as wt
+
+        class PMC(ctypes.Structure):
+            _fields_ = [('cb', wt.DWORD), ('PageFaultCount', wt.DWORD),
+                        ('PeakWorkingSetSize', ctypes.c_size_t),
+                        ('WorkingSetSize', ctypes.c_size_t),
+                        ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                        ('PagefileUsage', ctypes.c_size_t),
+                        ('PeakPagefileUsage', ctypes.c_size_t)]
+
+        k32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        h = k32.OpenProcess(0x0410, False, int(pid))     # QUERY_INFORMATION | VM_READ
+        if not h:
+            h = k32.OpenProcess(0x1000, False, int(pid))  # LIMITED（至少能读内存以外）
+        if not h:
+            return None
+        try:
+            pmc = PMC()
+            pmc.cb = ctypes.sizeof(PMC)
+            mem_ok = psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), ctypes.sizeof(PMC))
+            created, exited, kern, usr = (wt.FILETIME(), wt.FILETIME(),
+                                          wt.FILETIME(), wt.FILETIME())
+            k32.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(exited),
+                                ctypes.byref(kern), ctypes.byref(usr))
+
+            def _ft(v):
+                return (v.dwHighDateTime * 4294967296 + v.dwLowDateTime) / 1e7
+
+            handles = wt.DWORD(0)
+            k32.GetProcessHandleCount(h, ctypes.byref(handles))
+            return {'ws': float(pmc.WorkingSetSize) if mem_ok else 0.0,
+                    'private': float(pmc.PagefileUsage) if mem_ok else 0.0,
+                    'peak': float(pmc.PeakWorkingSetSize) if mem_ok else 0.0,
+                    'cpu': _ft(kern) + _ft(usr),
+                    'created': _ft(created) - 11644473600.0,
+                    'handles': int(handles.value)}
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return None
+
+
+def perf_snapshot():
+    """首页性能面板的数据：一次调用算「自上次调用以来」的 CPU 占比。"""
+    now = time.time()
+    pids = _perf_walk_pids()
+    ws = private = peak = cpu = 0.0
+    threads = handles = 0
+    created = 0.0
+    for pid, th in pids:
+        s = _perf_proc_stats(pid)
+        if not s:
+            continue
+        ws += s['ws']
+        private += s['private']
+        peak = max(peak, s['peak'])
+        cpu += s['cpu']
+        threads += int(th or 0)
+        handles += s['handles']
+        if pid == os.getpid():
+            created = s['created']
+
+    sys_total = sys_avail = 0.0
+    sys_pct = 0.0
+    idle = kern = user = 0.0
+    try:
+        import ctypes.wintypes as wt
+
+        class MSEX(ctypes.Structure):
+            _fields_ = [('dwLength', wt.DWORD), ('dwMemoryLoad', wt.DWORD),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+
+        k32 = ctypes.windll.kernel32
+        m = MSEX()
+        m.dwLength = ctypes.sizeof(MSEX)
+        if k32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            sys_total = m.ullTotalPhys / 1048576.0
+            sys_avail = m.ullAvailPhys / 1048576.0
+            sys_pct = float(m.dwMemoryLoad)
+
+        i2, k2, u2 = wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
+        if k32.GetSystemTimes(ctypes.byref(i2), ctypes.byref(k2), ctypes.byref(u2)):
+            def _ft(v):
+                return (v.dwHighDateTime * 4294967296 + v.dwLowDateTime) / 1e7
+            idle, kern, user = _ft(i2), _ft(k2), _ft(u2)
+    except Exception:
+        pass
+
+    prev = _PERF_PREV
+    proc_pct = 0.0
+    sys_now_pct = 0.0
+    if prev['ts'] and now - prev['ts'] > 0.2:
+        wall = now - prev['ts']
+        cores = os.cpu_count() or 1
+        proc_pct = max(0.0, min(999.0, (cpu - prev['proc']) / wall * 100.0 / cores))
+        if prev['sys']:
+            d_idle = idle - prev['sys'][0]
+            d_total = (kern - prev['sys'][1]) + (user - prev['sys'][2])
+            if d_total > 0:
+                sys_now_pct = max(0.0, min(100.0, (1.0 - d_idle / d_total) * 100.0))
+    _PERF_PREV.update({'ts': now, 'proc': cpu, 'sys': (idle, kern, user)})
+
+    return {
+        'ok': True,
+        'ts': round(now, 1),
+        'cores': os.cpu_count() or 1,
+        'cpu': {'proc': round(proc_pct, 1), 'sys': round(sys_now_pct, 1)},
+        'mem': {'proc_mb': round(ws / 1048576.0, 1),
+                'private_mb': round(private / 1048576.0, 1),
+                'peak_mb': round(peak / 1048576.0, 1),
+                'proc_pct': round(ws / 1048576.0 / max(sys_total, 1) * 100.0, 1),
+                'sys_used_mb': round(max(0.0, sys_total - sys_avail), 1),
+                'sys_total_mb': round(sys_total, 1),
+                'sys_pct': round(sys_pct, 1)},
+        'proc': {'threads': threads, 'handles': handles,
+                 'uptime_s': int(max(0.0, now - created)) if created else 0,
+                 'pids': len(pids)},
+    }
 
 
 def serve(port=8765):

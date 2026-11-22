@@ -292,6 +292,15 @@ export const IconClipboard = (p: IconProps) => (
   </Svg>
 )
 
+/* 第 404 项：性能监控（表盘 + 指针） */
+export const IconGauge = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M3.2 14.6a7.6 7.6 0 0 1 13.6 0" />
+    <path d="M10 13.2 13.2 8.4" />
+    <circle cx="10" cy="13.4" r="1.1" />
+  </Svg>
+)
+
 /* 聚合翻译图标 */
 export const IconTranslate = (p: IconProps) => (
   <Svg {...p}>

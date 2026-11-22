@@ -5,6 +5,7 @@ import { DiagnosticsModal, Preview, SettingsDrawer, SupportModal, WhyNotFoundMod
 import { useColResize } from './ui/useColResize'
 import { TitleBar } from './ui/titlebar'
 import { OcrBatchModal } from './ui/ocrbatch'
+import { PerfPopover } from './ui/perf'
 import { SnipModal, type SnipResultData } from './ui/snipmodal'
 import { ClipboardModal } from './ui/ClipboardModal'
 import { TranslateModal } from './ui/TranslateModal'
@@ -38,6 +39,7 @@ import {
   IconTranslate,
   IconVideo,
   IconAudio,
+  IconGauge,
 } from './ui/icons'
 
 type Stats = { files: number; docs: number }
@@ -375,6 +377,8 @@ export default function App() {
   const [diagOpen, setDiagOpen] = useState(false)
   /** 赞助弹窗（第 185 项）：打赏从「关于」里独立出来，标题栏/顶栏一个键直达 */
   const [supportOpen, setSupportOpen] = useState(false)
+  /** 第 404 项：性能监控小浮层（只在打开时轮询，关掉就一点不占） */
+  const [perfOpen, setPerfOpen] = useState(false)
   /** 屏幕截图识字结果弹层与数据 */
   const [snipOpen, setSnipOpen] = useState(false)
   const [snipResult, setSnipResult] = useState<SnipResultData | null>(null)
@@ -1715,6 +1719,18 @@ export default function App() {
         >
           <IconGear size={15} />
         </button>
+        {/* 第 404 项：性能监控。放在齿轮左边，点开是个小浮层（不跳设置、不弹大窗） */}
+        <div className="relative">
+          <button
+            className={`grid h-9 w-9 place-items-center rounded-lg border border-line ${perfOpen ? 'text-accent' : 'text-sub'} hover:text-ink`}
+            onClick={() => setPerfOpen((v) => !v)}
+            title={t('perf_title')}
+            aria-label={t('perf_title')} data-act="perf"
+          >
+            <IconGauge size={15} />
+          </button>
+          {perfOpen && <PerfPopover onClose={() => setPerfOpen(false)} />}
+        </div>
         </div>
       </header>
 
